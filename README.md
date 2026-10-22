@@ -173,3 +173,8 @@ reclaims transferred device storage; Uomi keeps the imported local copy. Serial
 metadata is optional; a normalized Bluetooth address is the fallback identity.
 There is no firmware or application updater. See `docs/verification.md` for the
 checks performed and the limits of physical-device/live-service verification.
+
+## License
+
+[MIT](LICENSE). Third-party components retain their own licenses; see
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
