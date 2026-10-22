@@ -1,0 +1,40 @@
+{
+  "name": "uomi",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "type": "module",
+  "scripts": {
+    "dev": "bun run --cwd apps/client dev",
+    "start": "bun run --cwd apps/client start",
+    "android": "bun run --cwd apps/client android",
+    "linux": "bun run --cwd apps/client linux",
+    "linux:package": "bun run --cwd apps/client linux:package",
+    "build:web": "bun run --cwd apps/client build:web",
+    "build": "bun run build:web && bun run --cwd apps/transcriber build",
+    "test": "bun run --cwd apps/client test && bun test packages/audio/tests packages/notion/tests apps/transcriber/tests",
+    "typecheck": "tsc --noEmit -p apps/client && tsc --noEmit -p packages/notion && tsc --noEmit -p apps/transcriber && tsc --noEmit -p packages/audio",
+    "check": "vp check && bun run typecheck && bun run test && bun run build",
+    "format": "vp fmt . --write",
+    "transcriber": "bun run --cwd apps/transcriber start",
+    "linux:check": "cargo check --manifest-path apps/client/src-tauri/Cargo.toml",
+    "android:release": "bun run --cwd apps/client android:release"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.2",
+    "@types/node": "^24.0.0",
+    "tsx": "^4.20.0",
+    "typescript": "^6.0.3",
+    "vite": "npm:@voidzero-dev/vite-plus-core@1.3.0",
+    "vite-plus": "1.3.0"
+  },
+  "overrides": {
+    "vite": "npm:@voidzero-dev/vite-plus-core@1.3.0"
+  },
+  "packageManager": "bun@1.4.2",
+  "patchedDependencies": {
+    "@nakasyou/ntranscribe@github:nakasyou/ntransctibe#7b15b53": "patches/@nakasyou%2Fntranscribe@github%3Anakasyou%2Fntransctibe#7b15b53.patch"
+  }
+}

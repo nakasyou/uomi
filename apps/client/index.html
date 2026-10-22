@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#f8faf6" />
+    <link rel="icon" href="data:," />
+    <title>Uomi — Your audio, on your terms</title>
+    <style>
+      html,
+      body,
+      #root {
+        height: 100%;
+        margin: 0;
+      }
+      #root {
+        display: flex;
+      }
+      body {
+        background: #f8faf6;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      ::selection {
+        background: #d1e8d4;
+        color: #102f22;
+      }
+      :focus-visible {
+        outline: 3px solid #436650;
+        outline-offset: 3px;
+      }
+      input {
+        caret-color: #326342;
+      }
+      ::-webkit-scrollbar {
+        width: 9px;
+      }
+      ::-webkit-scrollbar-thumb {
+        background: #b9c6ba;
+        border-radius: 8px;
+      }
+      ::-webkit-scrollbar-track {
+        background: transparent;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/web.tsx"></script>
+  </body>
+</html>

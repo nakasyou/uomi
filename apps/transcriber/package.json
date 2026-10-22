@@ -1,0 +1,15 @@
+{
+  "name": "@uomi/transcriber",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bun src/index.ts",
+    "build": "vp pack"
+  },
+  "dependencies": {
+    "@nakasyou/ntranscribe": "github:nakasyou/ntransctibe#7b15b53b216163dcb2c49556c99f9b7716b0baad",
+    "@uomi/audio": "workspace:*",
+    "@uomi/notion": "workspace:*"
+  }
+}

@@ -1,0 +1,49 @@
+{
+  "name": "@uomi/client",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A local-first Omi client: React Native Android and Tauri Linux",
+  "scripts": {
+    "start": "react-native start",
+    "android": "react-native run-android",
+    "android:release": "cd android && ./gradlew assembleRelease",
+    "dev": "vp dev --host 127.0.0.1",
+    "build:web": "vp build",
+    "linux": "tauri dev",
+    "linux:package": "tauri build",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test tests/*.test.ts",
+    "check": "bun run typecheck && bun run test && bun run build:web",
+    "test:receiver": "python3 -m unittest discover -s tests -p '*_test.py'",
+    "linux:check": "cargo check --manifest-path src-tauri/Cargo.toml"
+  },
+  "dependencies": {
+    "@react-native-vector-icons/material-design-icons": "^12.4.0",
+    "@react-native/assets-registry": "0.88.0",
+    "@tauri-apps/api": "^2.12.4",
+    "@uomi/audio": "workspace:*",
+    "@uomi/notion": "workspace:*",
+    "buffer": "^6.0.3",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "react-native": "0.88.0",
+    "react-native-paper": "^5.15.3",
+    "react-native-safe-area-context": "^5.7.0",
+    "react-native-web": "^0.21.2"
+  },
+  "devDependencies": {
+    "@babel/core": "^7.29.0",
+    "@react-native-community/cli": "20.2.0",
+    "@react-native-community/cli-platform-android": "20.2.0",
+    "@react-native/babel-preset": "0.88.0",
+    "@react-native/metro-config": "0.88.0",
+    "@react-native/typescript-config": "0.88.0",
+    "@tauri-apps/cli": "^2.12.3",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@types/react-native-web": "^0.19.2",
+    "@vitejs/plugin-react": "^6.1.2",
+    "esbuild": "^0.25.0",
+    "vite-plus": "1.3.0"
+  }
+}

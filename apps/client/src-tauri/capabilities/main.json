@@ -1,0 +1,6 @@
+{
+  "identifier": "main",
+  "description": "Local Uomi window: events and app-owned sync commands only.",
+  "windows": ["main"],
+  "permissions": ["core:event:default"]
+}
