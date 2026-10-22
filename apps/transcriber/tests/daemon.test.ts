@@ -64,7 +64,7 @@ test('daemon verifies audio, runs ffmpeg, writes transcript to Notion and ignore
     store,
     {
       secret: 'test',
-      provider: 'chrome-recognition',
+      provider: 'chrome-recognizetion',
       splitSeconds: 900,
       language: 'ja',
       stateDir: join(dir, 'state'),
@@ -73,7 +73,7 @@ test('daemon verifies audio, runs ffmpeg, writes transcript to Notion and ignore
     },
     async (file, options) => {
       expect(options?.splitSeconds).toBe(900)
-      expect(options?.provider).toBe('chrome-recognition')
+      expect(options?.provider).toBe('chrome-recognizetion')
       calls++
       expect((await readFile(file)).length).toBeGreaterThan(0)
       return { text: 'Test transcript' }
@@ -92,4 +92,43 @@ test('daemon verifies audio, runs ffmpeg, writes transcript to Notion and ignore
     server.stop(true)
     await rm(dir, { recursive: true, force: true })
   }
+})
+
+test('recovery queries stay within Notion nesting limits and defer future retries', async () => {
+  const fake = new FakeNotion()
+  let query: any
+  const future = {
+    id: '44444444444444444444444444444444',
+    properties: {
+      Status: { select: { name: 'Failed' } },
+      'Retry after': { date: { start: new Date(Date.now() + 86400000).toISOString() } },
+      Audio: { files: [{}] },
+      Manifest: { files: [{}] },
+    },
+  }
+  const store = new NotionStore(async (request) => {
+    if (request.path.endsWith('/query')) {
+      query = (request.body as any).filter
+      const depth = (filter: any): number =>
+        filter.and || filter.or ? 1 + Math.max(...(filter.and ?? filter.or).map(depth)) : 0
+      expect(depth(query)).toBeLessThanOrEqual(2)
+      return { results: [future], has_more: false }
+    }
+    return fake.transport(request)
+  }, SOURCE)
+  const daemon = new Daemon(store, {
+    secret: 'test',
+    provider: 'chrome-recognizetion',
+    language: 'ja',
+    stateDir: '/unused',
+    requestWaitMs: 0,
+    timeoutMs: 300000,
+  })
+  expect(await daemon.recover()).toBe(0)
+  expect(query.and[0].or.map((entry: any) => entry.select.equals)).toEqual([
+    'Pending',
+    'Processing',
+    'Failed',
+  ])
+  await daemon.close()
 })

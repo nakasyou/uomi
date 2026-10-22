@@ -78,23 +78,13 @@ export class Daemon {
     let accepted = 0
     try {
       const due = {
-        or: [
-          ...['Pending', 'Processing'].map((name) => ({
-            property: 'Status',
-            select: { equals: name },
-          })),
-          {
-            and: [
-              { property: 'Status', select: { equals: 'Failed' } },
-              {
-                or: [
-                  { property: 'Retry after', date: { is_empty: true } },
-                  { property: 'Retry after', date: { on_or_before: new Date().toISOString() } },
-                ],
-              },
-            ],
-          },
-        ],
+        // queryPages adds an outer AND for pagination windows. Keep this OR
+        // flat to stay within Notion's two compound-filter nesting levels.
+        // Failed-job retry dates are checked below before admission.
+        or: ['Pending', 'Processing', 'Failed'].map((name) => ({
+          property: 'Status',
+          select: { equals: name },
+        })),
       }
       for await (const pages of this.store.queryPages(due))
         for (const page of pages) {

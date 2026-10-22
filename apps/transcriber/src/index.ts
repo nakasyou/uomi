@@ -108,7 +108,9 @@ try {
       }
     },
   })
-  await daemon.recover()
+  await daemon
+    .recover()
+    .catch(() => console.error('Notion recovery paused; retrying on the next interval.'))
 } catch (error) {
   await rm(lockPath, { force: true })
   throw error
