@@ -64,13 +64,16 @@ test('daemon verifies audio, runs ffmpeg, writes transcript to Notion and ignore
     store,
     {
       secret: 'test',
-      provider: 'codex',
+      provider: 'chrome-recognition',
+      splitSeconds: 900,
       language: 'ja',
       stateDir: join(dir, 'state'),
       requestWaitMs: 0,
       timeoutMs: 300000,
     },
-    async (file) => {
+    async (file, options) => {
+      expect(options?.splitSeconds).toBe(900)
+      expect(options?.provider).toBe('chrome-recognition')
       calls++
       expect((await readFile(file)).length).toBeGreaterThan(0)
       return { text: 'Test transcript' }

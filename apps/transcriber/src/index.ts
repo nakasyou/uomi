@@ -8,7 +8,7 @@ import { authorized, Daemon } from './daemon'
 
 if (process.argv.includes('--help')) {
   console.log(
-    'Uomi transcriber\nNOTION_TOKEN, NOTION_DATABASE_ID, UOMI_WEBHOOK_SECRET are required.\nTRANSCRIBER_PROVIDER=codex | chrome-recognition\nHOST=127.0.0.1 PORT=8787 LANGUAGE=ja REQUEST_WAIT_SECONDS=10\nPending/Processing/Failed pages are recovered automatically at startup and every minute.\nRequires ffmpeg on PATH. Codex credentials stay on this machine.',
+    'Uomi transcriber\nNOTION_TOKEN, NOTION_DATABASE_ID, UOMI_WEBHOOK_SECRET are required.\nTRANSCRIBER_PROVIDER=codex | chrome-recognition\nHOST=127.0.0.1 PORT=8787 LANGUAGE=ja REQUEST_WAIT_SECONDS=10 TRANSCRIBER_SPLIT_SECONDS=600\nPending/Processing/Failed pages are recovered automatically at startup and every minute.\nRequires ffmpeg on PATH. Codex credentials stay on this machine.',
   )
   process.exit(0)
 }
@@ -51,9 +51,21 @@ async function acquireLock() {
 await acquireLock()
 const wait = Number(process.env.REQUEST_WAIT_SECONDS ?? 10)
 const port = Number(process.env.PORT ?? 8787)
-if (!Number.isFinite(wait) || wait < 10 || !Number.isInteger(port) || port < 1 || port > 65535) {
+const splitSeconds = Number(process.env.TRANSCRIBER_SPLIT_SECONDS ?? 600)
+if (
+  !Number.isFinite(wait) ||
+  wait < 10 ||
+  !Number.isInteger(port) ||
+  port < 1 ||
+  port > 65535 ||
+  !Number.isInteger(splitSeconds) ||
+  splitSeconds < 1 ||
+  splitSeconds > 1800
+) {
   await rm(lockPath)
-  throw Error('Invalid PORT or REQUEST_WAIT_SECONDS (minimum 10).')
+  throw Error(
+    'Invalid PORT, REQUEST_WAIT_SECONDS (minimum 10), or TRANSCRIBER_SPLIT_SECONDS (1–1800).',
+  )
 }
 const store = new NotionStore(httpTransport(token), database)
 const daemon = new Daemon(store, {
@@ -63,6 +75,7 @@ const daemon = new Daemon(store, {
   stateDir,
   requestWaitMs: wait * 1000,
   timeoutMs: 300000,
+  splitSeconds,
 })
 let server: ReturnType<typeof Bun.serve>
 try {
@@ -74,7 +87,7 @@ try {
     async fetch(request) {
       const url = new URL(request.url)
       if (request.method === 'GET' && url.pathname === '/health')
-        return Response.json({ status: 'ok' })
+        return Response.json({ status: 'ok', provider: daemon.config.provider, splitSeconds })
       if (request.method !== 'POST' || !['/webhook', '/reserve'].includes(url.pathname))
         return new Response('Not found', { status: 404 })
       if (!authorized(request.headers.get('authorization'), secret))

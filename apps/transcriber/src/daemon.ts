@@ -14,6 +14,7 @@ export interface Config {
   stateDir: string
   requestWaitMs: number
   timeoutMs: number
+  splitSeconds?: number
 }
 export function authorized(header: string | null, secret: string): boolean {
   const a = Buffer.from(header ?? '')
@@ -247,12 +248,14 @@ export class Daemon {
     await mkdir(this.config.stateDir, { recursive: true, mode: 0o700 })
     const checkpoint = join(this.config.stateDir, `${id}.json`)
     let previous: {
+      splitSeconds?: number
       inputTransform?: string
       audioHash: string
       provider: string
       language: string
       chunks: Transcription[]
     } = {
+      splitSeconds: this.config.splitSeconds ?? 600,
       inputTransform: manifest.gaps?.length ? 'synthetic-gaps-removed-v1' : 'original-v1',
       audioHash: manifest.sha256,
       provider: this.config.provider,
@@ -266,7 +269,8 @@ export class Daemon {
           (!saved.inputTransform && !manifest.gaps?.length)) &&
         saved.audioHash === manifest.sha256 &&
         saved.provider === this.config.provider &&
-        saved.language === this.config.language
+        saved.language === this.config.language &&
+        (saved.splitSeconds ?? 600) === previous.splitSeconds
       )
         previous = saved
     } catch {
@@ -299,7 +303,7 @@ export class Daemon {
           '-f',
           'segment',
           '-segment_time',
-          '600',
+          String(this.config.splitSeconds ?? 600),
           '-reset_timestamps',
           '1',
           join(directory, 'chunk-%06d.flac'),
@@ -316,11 +320,12 @@ export class Daemon {
         const wait = this.nextRequest - Date.now()
         if (wait > 0) await Bun.sleep(wait)
         try {
-          // Chrome's own default is 600s; each file here is already at most 600s.
+          // Disable the provider's separate default boundary by using our checkpointed split.
           const result = await this.recognize(join(directory, files[i]), {
             provider: this.config.provider,
             language: this.config.language,
             timeoutMs: this.config.timeoutMs,
+            splitSeconds: this.config.splitSeconds ?? 600,
           })
           previous.chunks.push(result)
           const temp = checkpoint + '.tmp'
