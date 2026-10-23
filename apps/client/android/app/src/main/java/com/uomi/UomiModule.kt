@@ -418,7 +418,7 @@ class UomiModule(private val context: ReactApplicationContext) :
     @ReactMethod
     fun credential(name: String, value: String?, p: Promise) =
         operation(p) {
-            require(name in listOf("webhook", "notion", "transcriber"))
+            require(name in listOf("webhook", "notion", "transcriber", "sites-api", "sites-access"))
             val storageKey = if (name == "webhook") "secret" else "credential:$name"
             if (value != null) {
                 require(!value.contains('\r') && !value.contains('\n'))
@@ -1197,7 +1197,7 @@ class UomiModule(private val context: ReactApplicationContext) :
                         else DeflaterOutputStream(out).use { it.write(raw) }
                         out.toByteArray()
                     }
-            val secret = getSecret()
+            val secret = getSecret("sites-api")
             check(secret.isNotEmpty()) { "Set a webhook secret in Settings." }
             val connection = url.openConnection() as HttpURLConnection
             try {
@@ -1210,6 +1210,8 @@ class UomiModule(private val context: ReactApplicationContext) :
                 if (compression != "none")
                     connection.setRequestProperty("Content-Encoding", compression)
                 connection.setRequestProperty(header, secret)
+                val access = getSecret("sites-access")
+                if (access.isNotEmpty()) connection.setRequestProperty("OAI-Sites-Authorization", "Bearer $access")
                 connection.setRequestProperty("Idempotency-Key", id)
                 connection.setRequestProperty("X-Uomi-Schema", "1")
                 connection.setFixedLengthStreamingMode(bytes.size)
@@ -1218,7 +1220,7 @@ class UomiModule(private val context: ReactApplicationContext) :
                 check(status in 200..299) {
                     "Webhook returned HTTP $status. Audio stays queued; sync again to retry."
                 }
-                null
+                JSONObject(connection.inputStream.bufferedReader().readText()).optBoolean("notion_saved", false)
             } finally {
                 connection.disconnect()
             }

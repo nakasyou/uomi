@@ -37,3 +37,7 @@ src-tauri/gen/schemas/
 .impeccable/
 .env.*
 !.env.example
+
+.void/
+.wrangler/
+.void-wrangler.jsonc

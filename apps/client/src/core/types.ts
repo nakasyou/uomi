@@ -16,13 +16,13 @@ export interface Settings {
   deviceAddress: string
 }
 export const defaults: Settings = {
-  deleteAfterUpload: true,
+  deleteAfterUpload: false,
   notionSource: '',
   transcriberEndpoint: '',
   mode: 'manual',
   endpoint: '',
   secretHeader: 'X-Uomi-Secret',
-  compression: 'gzip',
+  compression: 'none',
   segmentSeconds: 600,
   intervalHours: 6,
   deviceAddress: '',
@@ -185,7 +185,7 @@ export interface Port {
     body: string,
     compression: Compression,
     id: string,
-  ): Promise<void>
+  ): Promise<boolean | void>
 }
 export function validateSettings(s: Settings): void {
   if (!['manual', 'realtime', 'periodic'].includes(s.mode)) throw Error('Choose a valid sync mode.')
@@ -213,6 +213,6 @@ export function validateSettings(s: Settings): void {
     if (u.protocol !== 'https:' || u.username || u.password || u.hash)
       throw Error('Use an HTTPS transcriber URL without credentials or fragment.')
   }
-  if (s.mode !== 'manual' && !s.endpoint && !s.notionSource)
-    throw Error('Set a Notion database before enabling automatic sync.')
+  if (s.mode !== 'manual' && !s.endpoint)
+    throw Error('Set a Sites upload URL before enabling automatic sync.')
 }

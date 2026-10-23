@@ -1,10 +1,3 @@
-import {
-  NotionStore,
-  notionId,
-  validateManifest,
-  type AudioManifest,
-  type RemoteRecording,
-} from '@uomi/notion'
 import { oggOpus, oggFrames } from './playback'
 import {
   recordIndex,
@@ -17,7 +10,6 @@ import {
   planningLabel,
 } from './catalog'
 import { forEachBounded, runPipeline, type PipelineProgress } from './pipeline'
-import { reconciliationQueries } from './notion-sync'
 import type { AudioSegment } from './segments'
 import { LiveAssembler } from './live'
 import { Buffer } from 'buffer'
@@ -209,7 +201,7 @@ export class Engine {
     const generation = ++this.refreshGeneration
     const recordings: Recording[] = []
     const catalog: RecordIndex[] = []
-    const target = this.notionTarget()
+    const target = this.snapshot.settings.endpoint
     if (this.port.catalogEntries) {
       let after = ''
       for (;;) {
@@ -218,7 +210,7 @@ export class Engine {
         if (!entries.length) break
         for (const { value } of entries) {
           const record: RecordIndex = JSON.parse(value)
-          if (this.port.notion && record.notionTarget !== target) record.uploaded = 0
+          if (record.notionTarget !== target) record.uploaded = 0
           catalog.push(record)
         }
         const next = entries.at(-1)!.key
@@ -238,7 +230,7 @@ export class Engine {
       for await (const value of this.storedValues('record:')) {
         if (generation !== this.refreshGeneration) return
         const record: Recording = JSON.parse(value)
-        if (this.port.notion && record.notionTarget !== target) record.uploaded = 0
+        if (record.notionTarget !== target) record.uploaded = 0
         recordings.push(record)
         if (recordings.length % 256 === 0)
           report?.({
@@ -265,14 +257,6 @@ export class Engine {
             ? 1
             : 0),
     )
-    const remoteRecordings: RemoteRecording[] = []
-    if (!this.port.mirrorEntries)
-      for await (const value of this.storedValues('notion:remote:')) {
-        if (value) {
-          const remote = JSON.parse(value)
-          if (remote.target === this.notionTarget()) remoteRecordings.push(remote)
-        }
-      }
     if (generation !== this.refreshGeneration) return
     const localPlans = this.port.catalogEntries
       ? await (this.port.planAudio ?? cooperativePlans)(
@@ -288,12 +272,10 @@ export class Engine {
       localPlans,
       recordings,
       catalog: this.port.catalogEntries ? catalog : undefined,
-      remoteRecordings,
+      remoteRecordings: [],
       loadingRecords: undefined,
       wifi,
     })
-    if (this.port.mirrorEntries && this.snapshot.settings.notionSource && this.snapshot.hasSecret)
-      await this.refreshRemote()
   }
   private async *storedValues(prefix: string) {
     if (!this.port.entries) {
@@ -370,7 +352,7 @@ export class Engine {
     const frames: AudioSegment['frames'] = []
     for (const range of plan.ranges) {
       const raw = values.get(range.key)
-      if (!raw) throw Error('This local audio is no longer available. Its saved copy is in Notion.')
+      if (!raw) throw Error('This local audio is no longer available. Its saved copy is in Sites.')
       const record: Recording = JSON.parse(raw)
       frames.push(...silenceFrames(range.gapMs, `${range.key}:${range.from}`))
       for (let i = range.from; i < range.to; i++) {
@@ -392,24 +374,13 @@ export class Engine {
   }
   async save(settings: Settings, secret?: string, transcriberSecret?: string) {
     if (this.monitoring) throw Error('Stop live monitoring before changing settings.')
-    this.storeCache = undefined
-    this.lastMirrorRun = 0
     validateSettings(settings)
-    if (transcriberSecret !== undefined && transcriberSecret.length < 24)
-      throw Error('Use a transcriber webhook secret of at least 24 characters.')
-    if (
-      settings.transcriberEndpoint &&
-      this.port.transcriberSecret &&
-      !(transcriberSecret ?? (await this.port.transcriberSecret()))
-    )
-      throw Error('Set a transcriber webhook secret before enabling notifications.')
     if (secret !== undefined && /[\r\n]/.test(secret))
       throw Error('The secret cannot contain line breaks.')
     const hasSecretAfter = secret === undefined ? this.snapshot.hasSecret : secret.length > 0
     if (settings.mode !== 'manual' && !hasSecretAfter)
-      throw Error('Set a Notion token before enabling automatic sync.')
+      throw Error('Set a Sites API key before enabling automatic sync.')
     if (this.snapshot.busy) throw Error('Wait for the current sync before changing settings.')
-    if (settings.notionSource) notionId(settings.notionSource)
     if (transcriberSecret !== undefined) await this.port.transcriberSecret?.(transcriberSecret)
     if (secret !== undefined) await this.port.secret(secret)
     const previous = this.snapshot.settings
@@ -565,13 +536,12 @@ export class Engine {
       throw Error('Pair an Omi before importing recordings.')
     return this.sync('manual', 'device')
   }
-  async syncNotion() {
-    await this.sync('manual', 'notion')
-    if (!this.snapshot.error) await this.refreshNotion()
+  async syncCloud() {
+    await this.sync('manual', 'cloud')
   }
   async sync(
     reason: 'manual' | 'realtime' | 'periodic' = 'manual',
-    scope: 'all' | 'device' | 'notion' = 'all',
+    scope: 'all' | 'device' | 'cloud' = 'all',
   ) {
     if (this.snapshot.busy || this.snapshot.checkingNotion || this.pairing || this.monitoring)
       return
@@ -595,32 +565,21 @@ export class Engine {
       phase:
         scope === 'device'
           ? 'Preparing Omi import'
-          : scope === 'notion'
-            ? 'Preparing Notion sync'
+          : scope === 'cloud'
+            ? 'Preparing Sites sync'
             : 'Preparing sync',
     })
     let syncFailed = false
     try {
       // Explicit manual actions are isolated; scheduled sync still runs both stages.
       if (scope !== 'device') {
-        if (scope === 'notion') {
-          this.update({
-            progress: {
-              stage: 'prepare',
-              completed: 0,
-              total: 0,
-              detail: 'Checking Notion database configuration',
-            },
-          })
-          await this.notionStore().setup()
-        }
         try {
           await this.upload()
         } catch (e) {
-          if (scope === 'notion' || !s.deviceAddress) throw e
+          if (scope === 'cloud' || !s.deviceAddress) throw e
         }
       }
-      if (scope !== 'notion' && s.deviceAddress) {
+      if (scope !== 'cloud' && s.deviceAddress) {
         await this.port.connect(s.deviceAddress)
         const device = await this.identify(s.deviceAddress)
         this.update({ device, phase: 'Saving device recordings' })
@@ -636,11 +595,14 @@ export class Engine {
         this.update({ lastSync: await this.port.get('lastSync') })
       }
       this.update({
-        phase: scope === 'device' ? 'Omi recordings saved locally' : 'Notion is up to date',
+        phase:
+          scope === 'device'
+            ? 'Omi recordings saved locally'
+            : 'Sync pass finished; queued audio is retained until Notion confirms save',
       })
     } catch (e) {
       syncFailed = true
-      if (scope !== 'notion') {
+      if (scope !== 'cloud') {
         try {
           await this.liveUnsubscribe?.()
         } catch {}
@@ -656,10 +618,10 @@ export class Engine {
       })
     } finally {
       try {
-        if (scope !== 'notion' && (s.mode !== 'realtime' || !this.liveUnsubscribe))
+        if (scope !== 'cloud' && (s.mode !== 'realtime' || !this.liveUnsubscribe))
           await this.closeLink()
       } catch {}
-      if (syncFailed && scope === 'notion') {
+      if (syncFailed && scope === 'cloud') {
         // The pipeline has drained before reaching here. A read-only catalog
         // rebuild must not keep Retry/Settings disabled after the failure.
         this.update({ busy: false, progress: null })
@@ -966,1087 +928,73 @@ export class Engine {
     ])
   }
   private async upload() {
-    if (this.port.notion) return this.uploadNotion()
     await this.refresh()
-    const records = this.snapshot.recordings.filter((r) => r.uploaded < r.frames.length)
-    if (!records.length) return
     const s = this.snapshot.settings
     if (!s.endpoint || !this.snapshot.hasSecret)
-      throw Error('Audio is saved locally. Add a webhook URL and secret in Settings to send it.')
-    const totalFrames = records.reduce((n, r) => n + r.frames.length - r.uploaded, 0)
-    let sentFrames = 0
-    this.update({
-      progress: { stage: 'upload', completed: 0, total: totalFrames },
-    })
-    for (const segment of segments(this.snapshot.recordings, s.segmentSeconds)) {
-      if (this.syncReason === 'periodic' && !(await this.port.wifi()))
-        throw Error('Wi-Fi disconnected. Sync is paused until Wi-Fi returns.')
+      throw Error('Add your Sites upload URL and API key in Settings. Audio stays local.')
+    const indexes = this.inventory()
+    const plans = await (this.port.planAudio ?? cooperativePlans)(indexes, s.segmentSeconds, true)
+    const total = plans.reduce((n, p) => n + p.sourceFrames - p.deliveredFrames, 0)
+    let completed = 0
+    for (const plan of plans) {
       if (Date.now() > this.deadline)
-        throw Error('Sync paused at its background time limit. Audio stays queued.')
-      this.update({
-        phase: `Sending ${(segment.durationMs / 1000).toFixed(1)} seconds of audio`,
-      })
+        throw Error('Background time limit reached. Sync again to resume.')
+      if (this.syncReason === 'periodic' && !(await this.port.wifi()))
+        throw Error('Wi-Fi disconnected. Audio stays local.')
+      const frames = await this.loadLocalChunk(plan)
+      // Source-only chunks keep the wire contract simple; wall-clock gaps stay in packet metadata.
+      const originals = frames.filter((f) => f.timing !== 'synthetic-silence')
+      if (!originals.length) continue
       const id = await this.port.hash(
-        Buffer.from(JSON.stringify(segment.frames.map((f) => f.id))).toString('base64'),
+        Buffer.from(JSON.stringify(originals.map((f) => f.id))).toString('base64'),
       )
-      await this.port.post(
+      const segment = {
+        schema: 'uomi.audio.v1',
+        codec: 'opus',
+        sampleRate: 16000,
+        channels: 1,
+        deviceId: plan.deviceId,
+        durationMs: originals.reduce((n, f) => n + f.durationMs, 0),
+        frames: originals,
+        segmentId: id,
+      }
+      this.update({
+        phase: 'Saving audio to Sites',
+        progress: { stage: 'upload', completed, total, detail: 'Saving one audio chunk' },
+      })
+      const canonical = await this.port.post(
         s.endpoint,
         s.secretHeader,
-        JSON.stringify({ ...segment, segmentId: id }),
+        JSON.stringify(segment),
         s.compression,
         id,
       )
-      const accepted = new Set(segment.frames.map((f) => f.id))
-      for (const r of records) {
-        let uploaded = r.uploaded
-        while (uploaded < r.frames.length && accepted.has(r.frames[uploaded].id)) uploaded++
-        if (uploaded !== r.uploaded) {
-          r.uploaded = uploaded
-          await this.port.put(r.key, JSON.stringify(r))
-        }
+      if (canonical !== true) {
+        this.update({ phase: 'Cached on Sites; waiting for Notion save. Sync again to confirm.' })
+        continue
       }
-      sentFrames += segment.frames.length
-      this.update({
-        progress: {
-          stage: 'upload',
-          completed: sentFrames,
-          total: totalFrames,
-        },
-      })
-    }
-  }
-  private notionTarget() {
-    const source = this.snapshot.settings.notionSource
-    return source ? notionId(source) : 'unconfigured'
-  }
-  private storeCache?: { target: string; store: NotionStore }
-  private notionStore() {
-    if (!this.port.notion || !this.snapshot.settings.notionSource || !this.snapshot.hasSecret)
-      throw Error('Audio is kept locally. Add a Notion token and database in Settings to sync.')
-    const target = this.notionTarget()
-    if (this.storeCache?.target !== target)
-      this.storeCache = {
-        target,
-        store: new NotionStore(this.port.notion, this.snapshot.settings.notionSource),
-      }
-    return this.storeCache.store
-  }
-  private lastMirrorRun = 0
-  private async syncMirror(store: NotionStore, force = false) {
-    if (!force && Date.now() - this.lastMirrorRun < 1000) return
-    const target = this.notionTarget()
-    const cursorKey = `notion:mirror-cursor:${target}`
-    const cursor = await this.port.get(cursorKey)
-    let watermark = Number(cursor ?? 0)
-    const filter = cursor
-      ? {
-          timestamp: 'last_edited_time',
-          last_edited_time: {
-            on_or_after: new Date(Math.max(0, Number(cursor) - 120000)).toISOString(),
-          },
-        }
-      : undefined
-    let count = 0
-    for await (const pages of store.queryPages(filter)) {
-      for (const page of pages) {
-        const edited = Date.parse(page.last_edited_time ?? page.created_time ?? '')
-        if (Number.isFinite(edited)) watermark = Math.max(watermark, edited)
-      }
-      const puts = pages.map((page) => ({
-        key: `notion:page:${target}:${page.id}`,
-        value: JSON.stringify(page),
-      }))
-      if (puts.length) await this.writeBatch(puts)
-      count += pages.length
-      this.update({
-        progress: {
-          stage: 'refresh',
-          completed: count,
-          total: 0,
-          unit: 'pages',
-          detail: cursor ? 'Reading changed Notion recordings' : 'Building Notion recording index',
-        },
-      })
-    }
-    if (cursor)
-      for await (const pages of store.queryPages(filter, true)) {
-        const removes: string[] = []
-        for (const page of pages) {
-          removes.push(`notion:page:${target}:${page.id}`)
-          const id = (page.properties['Recording ID']?.rich_text ?? [])
-            .map((v: any) => v.plain_text ?? v.text?.content ?? '')
-            .join('')
-          if (id) removes.push(`notion:remote:${target}:${id}`)
-        }
-        if (removes.length) await this.writeBatch([], removes)
-      }
-    await this.port.put(cursorKey, String(watermark))
-    this.lastMirrorRun = Date.now()
-  }
-  private async *mirrorPages(query: { devices?: string[]; from?: number; until?: number } = {}) {
-    const target = this.notionTarget()
-    if (this.port.mirrorEntries) {
-      let offset = 0
-      for (;;) {
-        const values = await this.port.mirrorEntries({ target, ...query, limit: 100, offset })
-        if (!values.length) break
-        for (const value of values) yield JSON.parse(value)
-        offset += values.length
-      }
-    } else
-      for await (const value of this.storedValues(`notion:page:${target}:`)) {
-        const page = JSON.parse(value)
-        const remote = this.notionStore().remotePage(page, target)
-        if (query.devices && !query.devices.includes(remote.deviceId)) continue
-        const start = Date.parse(remote.capturedAt ?? '')
-        if (
-          Number.isFinite(start) &&
-          query.from !== undefined &&
-          start + remote.durationMs < query.from
+      // A 2xx response means R2 and D1 are durable. Never acknowledge before it.
+      const accepted = new Set(originals.map((f) => f.id))
+      const puts: { key: string; value: string }[] = []
+      for (const range of plan.ranges) {
+        const raw = await this.port.get(range.key)
+        if (!raw) throw Error('Local audio disappeared before acknowledgement.')
+        const record: Recording = JSON.parse(raw)
+        if (record.notionTarget !== s.endpoint) record.uploaded = 0
+        while (
+          record.uploaded < record.frames.length &&
+          accepted.has(record.frames[record.uploaded].id)
         )
-          continue
-        if (Number.isFinite(start) && query.until !== undefined && start > query.until) continue
-        yield page
+          record.uploaded++
+        record.notionTarget = s.endpoint
+        puts.push({ key: record.key, value: JSON.stringify(record) })
       }
-  }
-  private async *matchingMirrorPages(queries: ReturnType<typeof reconciliationQueries>) {
-    const seen = new Set<string>()
-    for (const query of queries)
-      for await (const page of this.mirrorPages(query)) {
-        if (seen.has(page.id)) continue
-        seen.add(page.id)
-        yield page
-      }
-  }
-  private manifestSignature(page: any) {
-    return ['Audio', 'Manifest']
-      .map((property) => {
-        const file = page.properties[property]?.files?.[0]
-        if (!file) return ''
-        const url = file.file?.url ?? file.external?.url ?? ''
-        try {
-          return `${file.name}:${new URL(url).pathname}`
-        } catch {
-          return `${file.name}:${url}`
-        }
-      })
-      .join('|')
-  }
-  private async manifestFor(store: NotionStore, page: any, force = false): Promise<AudioManifest> {
-    const key = `notion:manifest:${this.notionTarget()}:${page.id}`
-    const signature = this.manifestSignature(page)
-    const cached = await this.port.get(key)
-    if (!force && cached) {
-      const saved = JSON.parse(cached)
-      if (saved.signature === signature) {
-        validateManifest(saved.manifest)
-        await store.ensureSilence(page, saved.manifest)
-        return saved.manifest
-      }
-    }
-    if (!this.port.notionFile) throw Error('This app cannot read saved audio manifests.')
-    let text: string
-    try {
-      text = await this.port.notionFile(page.id, 'Manifest', store.fileUrl(page, 'Manifest'))
-    } catch {
-      const fresh = await store.page(page.id)
-      text = await this.port.notionFile(fresh.id, 'Manifest', store.fileUrl(fresh, 'Manifest'))
-    }
-    const manifest: AudioManifest = JSON.parse(text)
-    validateManifest(manifest)
-    await store.ensureSilence(page, manifest)
-    await this.port.put(key, JSON.stringify({ signature, manifest }))
-    return manifest
-  }
-  private async verifiedManifest(
-    store: NotionStore,
-    pageId: string,
-    expected?: AudioManifest,
-    checkSource?: (manifest: AudioManifest, audio: string) => Promise<void>,
-  ) {
-    if (!this.port.verifyNotionAudio)
-      throw Error('This app cannot verify uploaded audio. Local audio is retained.')
-    const page = await store.page(pageId)
-    if (page.archived || page.in_trash)
-      throw Error('The saved page is unavailable. Local audio is retained.')
-    const manifest = await this.manifestFor(store, page, true)
-    const fingerprint = (m: AudioManifest) =>
-      JSON.stringify([
-        m.id,
-        m.deviceId,
-        m.capturedAt,
-        m.durationMs,
-        m.sha256,
-        m.frameIds,
-        m.timing.map((t) => [
-          t.sequence,
-          t.ringId,
-          t.timestamp,
-          t.capturedAt,
-          t.firstFrame,
-          t.frames,
-        ]),
-        (m.gaps ?? []).map((g) => [g.beforeFrame, g.durationMs, g.offsetMs ?? null]),
-      ])
-    if (expected && fingerprint(manifest) !== fingerprint(expected))
-      throw Error('Saved audio metadata differs from this upload. Local audio is retained.')
-    if (checkSource) {
-      if (!this.port.readNotionAudio)
-        throw Error(
-          'This app cannot compare saved audio with its local originals. Local audio is retained.',
-        )
-      const audio = await this.port.readNotionAudio(store.fileUrl(page, 'Audio'), manifest.sha256)
-      await checkSource(manifest, audio)
-    } else await this.port.verifyNotionAudio(store.fileUrl(page, 'Audio'), manifest.sha256)
-    return { page, manifest }
-  }
-  private async cacheRemote(remote: RemoteRecording) {
-    const key = `notion:remote:${remote.target}:${remote.id}`
-    if (
-      remote.notificationError === undefined &&
-      ['Pending', 'Uploading', 'Failed'].includes(remote.status)
-    ) {
-      const existing = await this.port.get(key)
-      if (existing) remote.notificationError = JSON.parse(existing).notificationError
-    }
-    await this.port.put(key, JSON.stringify(remote))
-  }
-  async refreshNotion() {
-    if (this.snapshot.busy || this.snapshot.checkingNotion) return
-    this.update({
-      checkingNotion: true,
-      phase: 'Refreshing Notion recordings',
-      progress: {
-        stage: 'refresh',
-        completed: 0,
-        total: 0,
-        detail: 'Reading changed Notion recordings',
-      },
-    })
-    try {
-      const store = this.notionStore()
-      await store.setup()
-      await this.syncMirror(store)
-      await this.refreshRemote()
-    } finally {
-      this.update({ checkingNotion: false, progress: null })
-    }
-  }
-  private remoteOffset = 0
-  private remoteSearch = ''
-  private remoteGeneration = 0
-  async moreRemote() {
-    this.remoteOffset += 50
-    await this.refreshRemote()
-  }
-  async previousRemote() {
-    this.remoteOffset = Math.max(0, this.remoteOffset - 50)
-    await this.refreshRemote()
-  }
-  async searchRemote(query: string) {
-    this.remoteSearch = query.slice(0, 200)
-    this.remoteOffset = 0
-    await this.refreshRemote()
-  }
-  private async refreshRemote() {
-    const generation = ++this.remoteGeneration
-    const store = this.notionStore()
-    const pages: any[] = []
-    if (this.port.mirrorEntries) {
-      for (const value of await this.port.mirrorEntries({
-        target: this.notionTarget(),
-        limit: 51,
-        offset: this.remoteOffset,
-        ...(this.remoteSearch ? { search: this.remoteSearch } : {}),
-      }))
-        pages.push(JSON.parse(value))
-    } else {
-      for await (const page of this.mirrorPages()) {
-        if (
-          !this.remoteSearch ||
-          JSON.stringify(page).toLowerCase().includes(this.remoteSearch.toLowerCase())
-        )
-          pages.push(page)
-      }
-      pages.sort((a, b) =>
-        (b.properties['Recorded at']?.date?.start ?? '').localeCompare(
-          a.properties['Recorded at']?.date?.start ?? '',
-        ),
-      )
-    }
-    const visible = pages
-      .slice(
-        this.port.mirrorEntries ? 0 : this.remoteOffset,
-        (this.port.mirrorEntries ? 0 : this.remoteOffset) + 50,
-      )
-      .filter(
-        (page) => page.properties.Audio?.files?.length && page.properties.Manifest?.files?.length,
-      )
-    const remoteKeys = visible.map(
-      (page) =>
-        `notion:remote:${this.notionTarget()}:${store.remotePage(page, this.notionTarget()).id}`,
-    )
-    const savedRemotes = await this.readMany(remoteKeys)
-    const remotes = visible.map((page, i) => {
-      const saved = savedRemotes.get(remoteKeys[i])
-      return store.remotePage(page, this.notionTarget(), saved ? JSON.parse(saved) : undefined)
-    })
-    if (generation !== this.remoteGeneration) return
-    this.update({
-      remoteRecordings: remotes,
-      remoteHasPrevious: this.remoteOffset > 0,
-      remotePage: Math.floor(this.remoteOffset / 50) + 1,
-      remoteHasMore: this.port.mirrorEntries
-        ? pages.length > 50
-        : pages.length > this.remoteOffset + 50,
-      ...(this.snapshot.checkingNotion
-        ? {
-            progress: {
-              stage: 'refresh' as const,
-              completed: remotes.length,
-              total: remotes.length,
-              detail: 'Notion recording list updated',
-            },
-          }
-        : {}),
-    })
-  }
-  async loadRemoteAudio(pageId: string): Promise<Frame[]> {
-    if (!this.port.readNotionAudio)
-      throw Error('Remote playback is unavailable in this app version.')
-    const store = this.notionStore()
-    const page = await store.page(pageId)
-    const manifest = await this.manifestFor(store, page)
-    const audio = await this.port.readNotionAudio(store.fileUrl(page, 'Audio'), manifest.sha256)
-    return oggFrames(audio)
-  }
-  async loadTranscript(pageId: string): Promise<string> {
-    const remote = this.snapshot.remoteRecordings.find((r) => r.pageId === pageId)
-    if (!remote) throw Error('This recording has not been synced to this Notion destination.')
-    if (!this.port.notionFile) return remote.transcript
-    const result = JSON.parse(await this.port.notionFile(pageId, 'Transcript'))
-    if (typeof result.text !== 'string') throw Error('Invalid transcript attachment.')
-    return result.text
-  }
-  async retryTranscription(pageId: string) {
-    const remote = this.snapshot.remoteRecordings.find((r) => r.pageId === pageId)
-    if (!remote) throw Error('Unknown recording.')
-    const store = this.notionStore()
-    if (remote.status === 'Failed') await store.status(pageId, 'Pending')
-    await this.sendNotification({
-      ...remote,
-      status: remote.status === 'Failed' ? 'Pending' : remote.status,
-      error: remote.status === 'Failed' ? '' : remote.error,
-    })
-    this.lastMirrorRun = 0
-    await this.refreshNotion()
-  }
-  private async sendNotification(remote: RemoteRecording) {
-    const endpoint = this.snapshot.settings.transcriberEndpoint
-    if (!endpoint || !this.port.notifyTranscriber) return
-    try {
-      await this.port.notifyTranscriber(endpoint, remote.pageId)
-      remote.notificationError = ''
-    } catch {
-      remote.notificationError = 'Saved in Notion. Transcriber not reached; retry notification.'
-    }
-    await this.cacheRemote(remote)
-  }
-  private async uploadNotion() {
-    this.update({
-      phase: 'Preparing Notion sync',
-      progress: { stage: 'prepare', completed: 0, total: 0, detail: 'Reading local audio index' },
-    })
-    await this.refresh((value) => this.update({ progress: value }))
-    const indexes = this.inventory()
-    const store = this.notionStore()
-    await store.setup()
-    await this.syncMirror(store, true)
-    const target = this.notionTarget()
-    const byKey = new Map(indexes.map((record) => [record.key, record]))
-    const byPrefix = new Map<string, RecordIndex>()
-    const byId = new Map<string, { record: RecordIndex; index: number }>()
-    for (const [index, record] of indexes.entries()) {
-      if (index % 1024 === 0) {
-        this.update({
-          progress: {
-            stage: 'check',
-            detail: 'Indexing source frame IDs',
-            unit: 'recordings',
-            completed: index,
-            total: indexes.length,
-          },
-        })
-        await new Promise<void>((resolve) => setTimeout(resolve, 0))
-      }
-      if (record.idPrefix) byPrefix.set(record.idPrefix, record)
-      else record.frameIds?.forEach((id, index) => byId.set(id, { record, index }))
-    }
-    const locate = (id: string) => {
-      const direct = byId.get(id)
-      if (direct) return direct
-      const suffix = id.match(/^(.*\D)(\d+)$/)
-      const record = suffix ? byPrefix.get(suffix[1]) : undefined
-      const index = Number(suffix?.[2])
-      return record &&
-        Number.isInteger(index) &&
-        index >= 0 &&
-        index < record.frameCount &&
-        frameId(record, index) === id
-        ? { record, index }
-        : undefined
-    }
-    const known = new Set<string>()
-    const verified = new Set<string>()
-    const shouldDelete =
-      this.snapshot.settings.deleteAfterUpload !== false && !!this.port.verifyNotionAudio
-    const total = indexes.reduce((n, r) => n + r.frameCount - r.uploaded, 0)
-    let completed = 0,
-      chunksCompleted = 0
-    const guard = async () => {
-      if (this.syncReason === 'periodic' && !(await this.port.wifi()))
-        throw Error('Wi-Fi disconnected. Local audio is retained.')
-      if (Date.now() > this.deadline) throw Error('Sync paused. Local audio is retained.')
-    }
-    // Query disjoint candidate page-start windows per device. Unknown clocks
-    // retain an unbounded device query so deduplication remains conservative.
-    const matchQueries = reconciliationQueries(indexes)
-    let matchingTotal = 0
-    if (indexes.length && this.port.mirrorCount) {
-      try {
-        for (const query of matchQueries) {
-          const count = await this.port.mirrorCount({ target, ...query })
-          if (typeof count === 'number' && Number.isFinite(count)) matchingTotal += count
-        }
-      } catch {
-        /* Older native backends still report completed counts. */
-      }
-    }
-    let checked = 0
-    this.update({
-      progress: {
-        stage: 'check',
-        completed: 0,
-        total: matchingTotal,
-        unit: 'pages',
-        detail: 'Checking matching audio manifests',
-      },
-    })
-    await forEachBounded(this.matchingMirrorPages(matchQueries), async (page) => {
-      try {
-        if (!page.properties.Audio?.files?.length || !page.properties.Manifest?.files?.length)
-          return
-        await guard()
-        this.update({
-          phase: 'Checking audio saved in Notion',
-          progress: {
-            stage: 'check',
-            completed: checked,
-            total: matchingTotal,
-            unit: 'pages',
-            detail: 'Checking matching audio manifests',
-          },
-        })
-        let manifest = await this.manifestFor(store, page)
-        const localIds = manifest.frameIds.filter((id) => locate(id))
-        if (!localIds.length) return
-        if (shouldDelete) {
-          this.update({
-            progress: {
-              stage: 'check',
-              completed: checked,
-              total: matchingTotal,
-              unit: 'pages',
-              detail: `Verifying saved audio for page ${checked + 1}`,
-            },
-          })
-          const result = await this.verifiedManifest(
-            store,
-            page.id,
-            manifest,
-            async (saved, audio) => {
-              const frames = oggFrames(audio)
-              const needed = [
-                ...new Set(
-                  saved.frameIds
-                    .map((id) => locate(id)?.record.key)
-                    .filter((key): key is string => !!key),
-                ),
-              ]
-              const sources = await this.readMany(needed)
-              const records = new Map<string, Recording>()
-              let cursor = 0
-              let timingIndex = 0
-              const gaps = new Map(
-                (saved.gaps ?? []).map((gap) => [gap.beforeFrame, gap.durationMs]),
-              )
-              for (let i = 0; i < saved.frameIds.length; i++) {
-                const gap = gaps.get(i)
-                if (gap)
-                  for (const silence of silenceFrames(gap, saved.frameIds[i])) {
-                    if (frames[cursor++]?.data !== silence.data)
-                      throw Error(
-                        'Saved silence differs from its manifest. Local audio is retained.',
-                      )
-                  }
-                const packet = frames[cursor++]
-                if (!packet)
-                  throw Error('Saved audio has missing source packets. Local audio is retained.')
-                const local = locate(saved.frameIds[i])
-                if (!local) continue
-                let record = records.get(local.record.key)
-                if (!record) {
-                  const raw = sources.get(local.record.key)
-                  if (!raw) throw Error('Cannot read original audio for verification.')
-                  record = JSON.parse(raw)
-                  records.set(local.record.key, record!)
-                }
-                while (
-                  timingIndex < saved.timing.length &&
-                  i >= saved.timing[timingIndex].firstFrame + saved.timing[timingIndex].frames
-                )
-                  timingIndex++
-                const timing = saved.timing[timingIndex]
-                if (
-                  !timing ||
-                  timing.sequence !== record!.sequence ||
-                  timing.ringId !== record!.ringId ||
-                  timing.timestamp !== record!.timestampRaw
-                )
-                  throw Error(
-                    'Saved packet timing differs from its local source. Local audio is retained.',
-                  )
-                if (i === timing.firstFrame) {
-                  const captured = record!.capturedAt
-                    ? new Date(
-                        Date.parse(record!.capturedAt) + record!.frames[local.index].offsetMs,
-                      ).toISOString()
-                    : null
-                  if (
-                    captured === null
-                      ? timing.capturedAt !== null
-                      : Date.parse(captured) !== Date.parse(timing.capturedAt ?? '')
-                  )
-                    throw Error(
-                      'Saved capture time differs from its local source. Local audio is retained.',
-                    )
-                }
-                if (record!.frames[local.index]?.data !== packet.data)
-                  throw Error(
-                    'Saved audio differs from its local source packets. Local audio is retained.',
-                  )
-              }
-              if (cursor !== frames.length)
-                throw Error('Saved audio has unexpected packets. Local audio is retained.')
-            },
-          )
-          manifest = result.manifest
-          localIds.forEach((id) => verified.add(id))
-        }
-        localIds.forEach((id) => known.add(id))
-        if (page.properties.Status?.select?.name === 'Uploading') {
-          await store.status(page.id, 'Pending')
-          page.properties.Status = { select: { name: 'Pending' } }
-          await this.sendNotification(store.remote(page, manifest, target))
-          await this.port.put(`notion:page:${target}:${page.id}`, JSON.stringify(page))
-        } else await this.cacheRemote(store.remote(page, manifest, target))
-      } finally {
-        checked++
-        this.update({
-          progress: {
-            stage: 'check',
-            completed: checked,
-            total: matchingTotal,
-            unit: 'pages',
-            detail: 'Checking matching audio manifests',
-          },
-        })
-      }
-    })
-    // Index-based acknowledgements and deletion use one transaction per batch.
-    const acknowledged = (record: RecordIndex) => {
-      let count = record.uploaded
-      while (count < record.frameCount && known.has(frameId(record, count))) count++
-      return count
-    }
-    const loaded = new Map<string, Recording>()
-    const persistAcknowledgements = async (records: RecordIndex[], report = false) => {
-      const changed = records.filter(
-        (index) =>
-          byKey.has(index.key) &&
-          (acknowledged(index) !== index.uploaded ||
-            (shouldDelete && index.frameCount > 0 && index.uploaded === index.frameCount)),
-      )
-      for (let start = 0; start < changed.length; start += 256) {
-        const batch = changed.slice(start, start + 256)
-        const removable = new Set(
-          batch
-            .filter(
-              (index) =>
-                shouldDelete &&
-                index.frameCount > 0 &&
-                acknowledged(index) === index.frameCount &&
-                Array.from({ length: index.frameCount }, (_, i) => frameId(index, i)).every((id) =>
-                  verified.has(id),
-                ),
-            )
-            .map((index) => index.key),
-        )
-        const originals = await this.readMany(
-          batch
-            .filter((index) => !removable.has(index.key) && !loaded.has(index.key))
-            .map((index) => index.key),
-        )
-        const puts: { key: string; value: string }[] = []
-        const removes: string[] = []
-        for (const index of batch) {
-          const count = acknowledged(index)
-          if (removable.has(index.key)) {
-            puts.push({ key: `seen:${index.key}`, value: index.key })
-            removes.push(index.key)
-          } else {
-            const raw =
-              loaded.get(index.key) ??
-              (originals.has(index.key) ? JSON.parse(originals.get(index.key)!) : undefined)
-            if (!raw) throw Error('Local audio disappeared before its save was recorded.')
-            raw.uploaded = count
-            raw.notionTarget = target
-            puts.push({ key: index.key, value: JSON.stringify(raw) })
-          }
-        }
-        await this.writeBatch(puts, removes)
-        if (report)
-          this.update({
-            progress: {
-              stage: 'check',
-              detail: 'Updating verified local copies',
-              unit: 'recordings',
-              completed: Math.min(start + batch.length, changed.length),
-              total: changed.length,
-            },
-          })
-        for (const index of batch) {
-          index.uploaded = acknowledged(index)
-          if (removable.has(index.key)) {
-            byKey.delete(index.key)
-            loaded.delete(index.key)
-          }
-        }
-      }
-    }
-    for (const index of indexes)
-      for (let i = index.uploaded; i < index.frameCount; i++)
-        if (known.has(frameId(index, i))) completed++
-    await persistAcknowledgements(indexes, true)
-    type Checkpoint = {
-      manifest: AudioManifest
-      pageId: string
-      audioId?: string
-      metadataId?: string
-    }
-    type Job = {
-      number: number
-      plan?: ChunkPlan
-      manifest?: AudioManifest
-      checkpoint?: Checkpoint
-      segment?: AudioSegment
-      audio?: Uint8Array
-      audioHashVerified?: boolean
-      page?: any
-      key?: string
-      records: RecordIndex[]
-    }
-    const jobPrefix = `notion:job:${target}:`
-    const checkpoints: Checkpoint[] = []
-    const claimed = new Set<string>()
-    this.update({
-      phase: 'Restoring unfinished uploads',
-      progress: {
-        stage: 'prepare',
-        completed: 0,
-        total: 0,
-        unit: 'checkpoints',
-        detail: 'Finding upload checkpoints',
-      },
-    })
-    const checkpointKeys = await this.port.list(jobPrefix)
-    this.update({
-      progress: {
-        stage: 'prepare',
-        completed: 0,
-        total: checkpointKeys.length,
-        unit: 'checkpoints',
-        detail: 'Restoring upload checkpoints',
-      },
-    })
-    for (let start = 0; start < checkpointKeys.length; start += 256) {
-      const values = await this.readMany(checkpointKeys.slice(start, start + 256))
-      for (let i = start; i < Math.min(start + 256, checkpointKeys.length); i++) {
-        const value = values.get(checkpointKeys[i])
-        if (value) {
-          const checkpoint: Checkpoint = JSON.parse(value)
-          validateManifest(checkpoint.manifest)
-          if (checkpoint.manifest.frameIds.every((id) => known.has(id)))
-            await this.port.remove(checkpointKeys[i])
-          else {
-            checkpoints.push(checkpoint)
-            checkpoint.manifest.frameIds.forEach((id) => claimed.add(id))
-          }
-        }
-        this.update({
-          progress: {
-            stage: 'prepare',
-            completed: i + 1,
-            total: checkpointKeys.length,
-            unit: 'checkpoints',
-            detail: 'Restoring upload checkpoints',
-          },
-        })
-      }
-      await new Promise<void>((resolve) => setTimeout(resolve, 0))
-    }
-    // Plans contain source ranges only: audio is loaded by two preparation jobs,
-    // not retained in the UI or materialized for the entire sync.
-    const plans = await (this.port.planAudio ?? cooperativePlans)(
-      indexes.filter((record) => byKey.has(record.key)),
-      this.snapshot.settings.segmentSeconds,
-      true,
-      (value) =>
-        this.update({
-          phase: 'Planning Notion upload chunks',
-          progress: { stage: 'prepare', ...this.planProgress(value) },
-        }),
-    )
-    const jobs: Job[] = []
-    for (const [index, checkpoint] of checkpoints.entries()) {
-      this.update({
-        phase: 'Restoring unfinished uploads',
-        progress: {
-          stage: 'prepare',
-          completed: index,
-          total: checkpoints.length,
-          unit: 'checkpoints',
-          detail: 'Restoring upload jobs',
-        },
-      })
-      await new Promise<void>((resolve) => setTimeout(resolve, 0))
-      const records = new Map<string, RecordIndex>()
-      for (const id of checkpoint.manifest.frameIds) {
-        const found = locate(id)
-        if (!found || !byKey.has(found.record.key))
-          throw Error(
-            'An unfinished upload needs missing local audio. The Notion page is retained.',
-          )
-        records.set(found.record.key, found.record)
-      }
-      jobs.push({
-        number: jobs.length + 1,
-        checkpoint,
-        manifest: checkpoint.manifest,
-        records: [...records.values()],
-      })
-      this.update({
-        progress: {
-          stage: 'prepare',
-          completed: index + 1,
-          total: checkpoints.length,
-          unit: 'checkpoints',
-          detail: 'Restoring upload jobs',
-        },
-      })
-    }
-    for (const [index, plan] of plans.entries()) {
-      this.update({
-        phase: 'Planning Notion upload chunks',
-        progress: {
-          stage: 'prepare',
-          completed: index,
-          total: plans.length,
-          unit: 'chunks',
-          detail: 'Queuing audio chunks',
-          plannedChunks: jobs.length,
-        },
-      })
-      await new Promise<void>((resolve) => setTimeout(resolve, 0))
-      const ranges = plan.ranges.filter((range) => {
-        const record = byKey.get(range.key)!
-        return Array.from({ length: range.to - range.from }, (_, i) =>
-          frameId(record, range.from + i),
-        ).some((id) => !known.has(id) && !claimed.has(id))
-      })
-      if (ranges.length)
-        jobs.push({
-          number: jobs.length + 1,
-          plan: { ...plan, ranges },
-          records: [...new Set(ranges.map((r) => byKey.get(r.key)!))],
-        })
-    }
-    this.update({
-      progress: {
-        stage: 'prepare',
-        completed: plans.length,
-        total: plans.length,
-        unit: 'chunks',
-        detail: 'Upload plan ready',
-        plannedChunks: jobs.length,
-      },
-    })
-    let pipeline: PipelineProgress | undefined
-    let currentChunk = 0
-    const publish = (detail: string) =>
-      this.update({
-        progress: {
-          stage: 'upload',
-          completed,
-          total,
-          chunksCompleted,
-          chunksTotal: jobs.length,
-          chunkIndex: currentChunk,
-          detail,
-          pipeline,
-        },
-      })
-    const saveCheckpoint = async (job: Job) =>
-      this.port.put(job.key!, JSON.stringify(job.checkpoint))
-    let commit: Promise<void> = Promise.resolve()
-    const activeRecords = new Map<string, number>()
-    const loadRecords = async (job: Job) => {
-      for (const record of job.records)
-        activeRecords.set(record.key, (activeRecords.get(record.key) ?? 0) + 1)
-      const values = await this.readMany(
-        job.records.filter((r) => !loaded.has(r.key)).map((r) => r.key),
-      )
-      for (const [key, value] of values) if (!loaded.has(key)) loaded.set(key, JSON.parse(value))
-    }
-    const sourceFrame = (index: RecordIndex, i: number): AudioSegment['frames'][number] => {
-      const record = loaded.get(index.key)
-      const frame = record?.frames[i]
-      if (!frame)
-        throw Error('An unfinished chunk needs missing local audio. No audio was removed.')
-      return {
-        ...frame,
-        capturedAt: record.capturedAt
-          ? new Date(Date.parse(record.capturedAt) + frame.offsetMs).toISOString()
-          : null,
-        recordTimestamp: record.timestampRaw,
-        timing: record.timing,
-        sequence: record.sequence,
-        ringId: record.ringId,
-      }
-    }
-    this.update({ phase: 'Syncing audio to Notion' })
-    try {
-      await runPipeline(
-        jobs,
-        {
-          prepare: async (job) => {
-            await guard()
-            currentChunk = job.number
-            publish(`Preparing audio chunk ${job.number} / ${jobs.length}`)
-            await loadRecords(job)
-            const frames: AudioSegment['frames'] = []
-            const gaps: NonNullable<AudioManifest['gaps']> = []
-            let sourceCount = 0
-            let elapsedMs = 0
-            if (job.checkpoint) {
-              for (let i = 0; i < job.manifest!.frameIds.length; i++) {
-                for (const gap of job.manifest!.gaps ?? [])
-                  if (gap.beforeFrame === i)
-                    frames.push(...silenceFrames(gap.durationMs, job.manifest!.frameIds[i]))
-                const found = locate(job.manifest!.frameIds[i])!
-                frames.push(sourceFrame(found.record, found.index))
-              }
-            } else
-              for (const range of job.plan!.ranges) {
-                const index = byKey.get(range.key)!
-                const actual = []
-                for (let i = range.from; i < range.to; i++) {
-                  const id = frameId(index, i)
-                  if (!known.has(id) && !claimed.has(id)) actual.push(sourceFrame(index, i))
-                }
-                if (!actual.length) continue
-                if (range.gapMs && frames.length) {
-                  gaps.push({
-                    beforeFrame: sourceCount,
-                    durationMs: range.gapMs,
-                    offsetMs: elapsedMs,
-                  })
-                  frames.push(...silenceFrames(range.gapMs, actual[0].id))
-                  elapsedMs += range.gapMs
-                }
-                frames.push(...actual)
-                sourceCount += actual.length
-                elapsedMs += actual.reduce((n, frame) => n + frame.durationMs, 0)
-              }
-            if (!frames.length) throw Error('No source audio remains in this chunk.')
-            job.segment = {
-              schema: 'uomi.audio.v1',
-              deviceId: job.manifest?.deviceId ?? job.plan!.deviceId,
-              codec: 'opus',
-              sampleRate: 16000,
-              channels: 1,
-              durationMs: frames.reduce((n, f) => n + f.durationMs, 0),
-              frames,
-            }
-            if (!job.manifest) {
-              job.audio = this.port.muxAudio ? await this.port.muxAudio(frames) : oggOpus(frames)
-              const originals = frames.filter((f) => f.timing !== 'synthetic-silence')
-              const ids = originals.map((f) => f.id)
-              const identity = gaps.length ? { frameIds: ids, gaps } : ids
-              const id = await this.port.hash(
-                Buffer.from(JSON.stringify(identity)).toString('base64'),
-              )
-              const timing: AudioManifest['timing'] = []
-              originals.forEach((frame, i) => {
-                const previous = timing.at(-1)
-                if (
-                  previous &&
-                  previous.sequence === frame.sequence &&
-                  previous.ringId === frame.ringId &&
-                  previous.timestamp === frame.recordTimestamp
-                )
-                  previous.frames++
-                else
-                  timing.push({
-                    sequence: frame.sequence,
-                    ringId: frame.ringId,
-                    timestamp: frame.recordTimestamp,
-                    capturedAt: frame.capturedAt,
-                    firstFrame: i,
-                    frames: 1,
-                  })
-              })
-              job.manifest = {
-                schema: 'uomi.notion.v1',
-                id,
-                deviceId: job.segment.deviceId,
-                capturedAt: originals[0].capturedAt,
-                durationMs: job.segment.durationMs,
-                sha256: await this.port.hash(Buffer.from(job.audio).toString('base64')),
-                frameIds: ids,
-                timing,
-                ...(gaps.length ? { gaps } : {}),
-              }
-            }
-            if (!job.checkpoint) job.audioHashVerified = true
-            job.key = `${jobPrefix}${job.manifest.id}`
-            const reservationKey = `notion:reservation:${target}:${job.manifest.id}`
-            const saved = job.checkpoint?.pageId ?? (await this.port.get(reservationKey))
-            job.page = saved
-              ? await store.page(saved)
-              : this.port.reserveNotion && this.snapshot.settings.transcriberEndpoint
-                ? await store.page(
-                    await this.port.reserveNotion(
-                      this.snapshot.settings.transcriberEndpoint!,
-                      job.manifest,
-                      await store.source(),
-                    ),
-                  )
-                : await store.reserve(job.manifest)
-            await this.port.put(reservationKey, job.page.id)
-            job.checkpoint ??= { manifest: job.manifest, pageId: job.page.id }
-            await saveCheckpoint(job)
-          },
-          audio: async (job) => {
-            await guard()
-            publish('Uploading audio')
-            if (job.page.properties.Audio?.files?.length) {
-              job.audio = undefined
-              return
-            }
-            if (!(await store.reusableUpload(job.checkpoint!.audioId))) {
-              job.audio ??= this.port.muxAudio
-                ? await this.port.muxAudio(job.segment!.frames)
-                : oggOpus(job.segment!.frames)
-              // A resumed checkpoint must reproduce the exact original Ogg, including gaps.
-              if (
-                !job.audioHashVerified &&
-                (await this.port.hash(Buffer.from(job.audio).toString('base64'))) !==
-                  job.manifest!.sha256
-              )
-                throw Error('The resumed audio hash differs. Local audio is retained.')
-              job.checkpoint!.audioId = await store.upload(
-                `${job.manifest!.id}.ogg`,
-                'audio/ogg',
-                job.audio,
-              )
-              await saveCheckpoint(job)
-            }
-            job.audio = undefined
-          },
-          metadata: async (job) => {
-            await guard()
-            publish('Uploading audio metadata')
-            if (job.page.properties.Manifest?.files?.length) return
-            if (!(await store.reusableUpload(job.checkpoint!.metadataId))) {
-              job.checkpoint!.metadataId = await store.upload(
-                `${job.manifest!.id}.json`,
-                'application/json',
-                Buffer.from(JSON.stringify(job.manifest)),
-              )
-              await saveCheckpoint(job)
-            }
-          },
-          attach: async (job) => {
-            await guard()
-            publish('Attaching files to Notion')
-            job.page = await store.attachAudio(
-              job.manifest!,
-              job.page,
-              job.checkpoint!.audioId,
-              job.checkpoint!.metadataId,
-            )
-          },
-          verify: async (job) => {
-            let page = job.page
-            if (shouldDelete) {
-              publish('Verifying uploaded audio before local removal')
-              page = (await this.verifiedManifest(store, page.id, job.manifest)).page
-            }
-            const remote = store.remote(page, job.manifest!, target)
-            const acknowledgement = commit.then(async () => {
-              await this.cacheRemote(remote)
-              await this.port.put(`notion:page:${target}:${page.id}`, JSON.stringify(page))
-              await this.port.put(
-                `notion:manifest:${target}:${page.id}`,
-                JSON.stringify({ signature: this.manifestSignature(page), manifest: job.manifest }),
-              )
-              for (const id of job.manifest!.frameIds) {
-                if (!known.has(id)) completed++
-                known.add(id)
-                if (shouldDelete) verified.add(id)
-              }
-              await persistAcknowledgements(job.records)
-              await this.port.remove(job.key!)
-              chunksCompleted++
-              publish('Audio chunk saved in Notion')
-            })
-            commit = acknowledgement.catch(() => {})
-            await acknowledgement
-            job.page = page
-          },
-          notify: async (job) => {
-            await this.sendNotification(store.remote(job.page, job.manifest!, target))
-            job.segment = undefined
-            for (const record of job.records) {
-              const count = (activeRecords.get(record.key) ?? 1) - 1
-              if (count === 0) {
-                activeRecords.delete(record.key)
-                loaded.delete(record.key)
-              } else activeRecords.set(record.key, count)
-            }
-          },
-        },
-        (value) => {
-          pipeline = value
-          publish('Processing audio upload queue')
-        },
-      )
-    } finally {
-      activeRecords.clear()
-      loaded.clear()
+      await this.writeBatch(puts)
+      completed += originals.length
+      this.update({ progress: { stage: 'upload', completed, total } })
     }
     await this.refresh()
+    // Retention stays conservative: remove only after explicit user action.
   }
   // Explicit deletion remains available independently of verified auto-removal.
   async clearDelivered() {

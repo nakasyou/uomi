@@ -176,6 +176,7 @@ export function silenceProperties(manifest: AudioManifest): Record<string, unkno
 }
 export const schema = {
   Name: { title: {} },
+  Starred: { checkbox: {} },
   'Recording ID': { rich_text: {} },
   Device: { rich_text: {} },
   'Recorded at': { date: {} },
@@ -623,7 +624,7 @@ export function httpTransport(token: string, fetcher: typeof fetch = fetch): Tra
       method: request.method,
       headers,
       body,
-      redirect: 'error',
+      redirect: 'manual',
       signal: AbortSignal.timeout(120000),
     })
     if (!response.ok) {

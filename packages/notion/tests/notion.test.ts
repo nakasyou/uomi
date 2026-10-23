@@ -70,6 +70,17 @@ test('HTTP errors never expose response bodies or connection tokens', async () =
   }
 })
 
+test('HTTP redirects are rejected without following or forwarding credentials at the edge', async () => {
+  let requests = 0
+  const transport = httpTransport('private-token', (async (_url, init) => {
+    requests++
+    expect(init?.redirect).toBe('manual')
+    return new Response(null, { status: 302, headers: { location: 'https://example.org' } })
+  }) as typeof fetch)
+  await expect(transport({ path: '/users/me', method: 'GET' })).rejects.toThrow('Notion HTTP 302')
+  expect(requests).toBe(1)
+})
+
 test('record_finished_at includes fractional seconds and stays unset without a device time', async () => {
   const fake = new FakeNotion()
   const store = new NotionStore(fake.transport, SOURCE)
