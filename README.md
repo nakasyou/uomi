@@ -50,8 +50,9 @@ Notion-save retries are available per recording. See [Web API and operations](ap
 
 The existing daemon remains a separate processing service. It reads audio and
 manifests from Notion, verifies hashes, transcribes temporary ffmpeg copies and
-writes the full transcript JSON back to Notion. The web cache imports the result
-on source resync. No model or provider credentials run in Sites.
+writes the full transcript JSON back to Notion. After Notion save is verified, Sites notifies the daemon. A durable completion
+outbox refreshes the D1 transcript from Notion automatically, with minute-level
+retry across restarts. Source resync remains available as a repair path. No model or provider credentials run in Sites.
 
 Copy `apps/transcriber/.env.example` to an untracked `.env`. Configure
 `NOTION_TOKEN`, `NOTION_DATABASE_ID`, and `UOMI_WEBHOOK_SECRET` (24+ characters).
@@ -82,3 +83,24 @@ JavaScript checks do not replace physical Omi/Android/Linux verification.
 ## License
 
 [MIT](LICENSE). See [third-party notices](THIRD_PARTY_NOTICES.md).
+
+### Connect the transcriber to Sites
+
+Sites runtime secrets: `TRANSCRIBER_WEBHOOK_URL` (public HTTPS `/webhook` endpoint)
+and `UOMI_WEBHOOK_SECRET` (same 24+ character secret as the daemon). The daemon
+needs `SITES_URL` (the private Site origin) and `SITES_ACCESS_TOKEN` (that Site's
+service token). No secrets go in Git or browser bundles. Restart the daemon after
+configuring it. Until configured, its Notion polling still works, but automatic
+completion delivery is disabled and Sites index_status reports configured=false.
+
+Sites journals notifications in D1, uses waitUntil after canonical persistence,
+and retries due entries during API/index-status activity. Notion polling is the
+independent fallback when Sites is idle or a webhook is lost. The daemon keeps
+completion events on disk before committing Notion Completed, and retries every
+recovery cycle. Failed callbacks never mark successful transcription as Failed.
+
+`POST /api/transcriber/completed` authenticates both private Sites service access
+and the shared webhook secret, then reads the canonical page/transcript and
+commits normalized text/FTS. It returns saved=true only after D1 commits; duplicate
+callbacks are safe. `POST /api/recordings/:id/transcribe` manually retries a daemon
+notification. Existing backup retry also resumes notification after save.

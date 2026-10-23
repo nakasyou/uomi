@@ -44,10 +44,19 @@ test('daemon verifies audio, runs ffmpeg, writes transcript to Notion and ignore
     timing: [],
   }
   const page = await store.saveAudio(manifest, audio)
+  let callbacks = 0
   const server = Bun.serve({
     port: 0,
     hostname: '127.0.0.1',
-    fetch(req) {
+    async fetch(req) {
+      if (new URL(req.url).pathname === '/api/transcriber/completed') {
+        callbacks++
+        expect(req.headers.get('X-Uomi-Webhook-Secret')).toBe('test')
+        const payload = await req.json() as {pageId:string}
+        expect(payload.pageId).toBe(page.id.replaceAll('-',''))
+        expect((await store.page(page.id)).properties.Status.select.name).toBe('Completed')
+        return Response.json({saved:true})
+      }
       const id = new URL(req.url).pathname.slice(1)
       const bytes = fake.files.get(id)
       return bytes ? new Response(new Uint8Array(bytes)) : new Response('', { status: 404 })
@@ -64,6 +73,7 @@ test('daemon verifies audio, runs ffmpeg, writes transcript to Notion and ignore
     store,
     {
       secret: 'test',
+      sitesCallback: {url:`http://127.0.0.1:${server.port}/api/transcriber/completed`,accessToken:'test-site-token'},
       provider: 'chrome-recognizetion',
       splitSeconds: 900,
       language: 'ja',
@@ -83,11 +93,14 @@ test('daemon verifies audio, runs ffmpeg, writes transcript to Notion and ignore
     expect(await daemon.accept(page.id)).toEqual({ accepted: true })
     await daemon.close()
     expect(calls).toBe(1)
+    expect(callbacks).toBe(1)
     expect((await store.page(page.id)).properties.Status.select.name).toBe('Completed')
     expect(JSON.parse(await fake.attachment(page.id, 'Transcript')).text).toBe('Test transcript')
     const restarted = new Daemon(store, daemon.config)
     expect(await restarted.accept(page.id)).toEqual({ accepted: false, completed: true })
     await restarted.close()
+    expect(callbacks).toBe(2)
+    expect(calls).toBe(1)
   } finally {
     server.stop(true)
     await rm(dir, { recursive: true, force: true })

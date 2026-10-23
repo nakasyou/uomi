@@ -1,3 +1,4 @@
+import { CompletionOutbox, type SitesCallback } from './callbacks'
 import { stripSyntheticGaps } from '@uomi/audio'
 import { createHash, timingSafeEqual } from 'node:crypto'
 import { mkdir, readFile, writeFile, mkdtemp, rm } from 'node:fs/promises'
@@ -14,6 +15,7 @@ export interface Config {
   stateDir: string
   requestWaitMs: number
   timeoutMs: number
+  sitesCallback?: SitesCallback
   splitSeconds?: number
 }
 export function authorized(header: string | null, secret: string): boolean {
@@ -38,11 +40,12 @@ export class Daemon {
   private coordinator?: ReservationCoordinator
   private recovering = false
   private readonly queueLimit = 32
+  private callbacks: CompletionOutbox
   constructor(
     readonly store: NotionStore,
     readonly config: Config,
     private recognize: typeof transcribe = transcribe,
-  ) {}
+  ) { this.callbacks = new CompletionOutbox(join(config.stateDir,'completion-outbox'),config.sitesCallback,config.secret) }
   async reserve(value: unknown): Promise<{ pageId: string }> {
     if (this.closing) throw Error('Daemon is shutting down.')
     this.coordinator ??= new ReservationCoordinator(this.store, this.config.stateDir)
@@ -58,7 +61,11 @@ export class Daemon {
     if (!(await this.store.owns(page)))
       throw Error('Page does not belong to the configured Uomi database.')
     const status = page.properties.Status?.select?.name
-    if (status === 'Completed') return { accepted: false, completed: true }
+    if (status === 'Completed') {
+      await this.callbacks.enqueue(id)
+      void this.callbacks.flush(1).catch(() => console.error('Completion callback recovery paused'))
+      return { accepted: false, completed: true }
+    }
     if (!['Pending', 'Failed', 'Processing'].includes(status))
       throw Error('Audio has not finished uploading.')
     // Validate attachments before acknowledging. Notion remains the durable job record.
@@ -77,6 +84,7 @@ export class Daemon {
     this.recovering = true
     let accepted = 0
     try {
+      await this.callbacks.flush()
       const due = {
         // queryPages adds an outer AND for pagination windows. Keep this OR
         // flat to stay within Notion's two compound-filter nesting levels.
@@ -117,6 +125,7 @@ export class Daemon {
     this.closing = true
     await this.coordinator?.close()
     await this.drainPromise
+    await this.callbacks.flush()
   }
   private async attachment(page: any, property: string): Promise<Uint8Array> {
     const url = this.store.fileUrl(page, property)
@@ -147,6 +156,7 @@ export class Daemon {
       for (const id of this.jobs) {
         try {
           await this.process(id)
+          await this.callbacks.flush(1).catch(() => console.error('Completion outbox unavailable; retry on recovery'))
           console.log(JSON.stringify({ pageId: id, status: 'Completed' }))
         } catch {
           // Provider errors may include sensitive remote metadata. Keep public diagnostics bounded.
@@ -193,6 +203,8 @@ export class Daemon {
     const page = await this.store.page(id)
     if (page.properties.Status?.select?.name === 'Completed') return
     if (!(await this.store.owns(page))) throw Error('Wrong Notion database.')
+    // Persist before committing Completed, so a crash after Notion save cannot lose the callback.
+    await this.callbacks.enqueue(pageId(id))
     await this.store.status(id, 'Processing')
     const manifest: AudioManifest = JSON.parse(
       Buffer.from(await this.attachment(page, 'Manifest')).toString(),
@@ -233,6 +245,8 @@ export class Daemon {
       if ((await this.store.page(canonical.id)).properties.Status?.select?.name !== 'Completed')
         throw Error('Canonical transcription is not complete.')
       await this.store.archive(page.id)
+      await this.callbacks.enqueue(pageId(canonical.id))
+      await this.callbacks.discard(pageId(page.id))
       return
     }
     await mkdir(this.config.stateDir, { recursive: true, mode: 0o700 })

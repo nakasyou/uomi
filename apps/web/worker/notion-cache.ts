@@ -8,7 +8,7 @@ const text = (values: any[]) =>
 async function hash(value: BufferSource) {
   return Buffer.from(await crypto.subtle.digest('SHA-256', value)).toString('hex')
 }
-async function attachment(url: string, max: number) {
+export async function attachment(url: string, max: number) {
   if (new URL(url).protocol !== 'https:') throw Error('Invalid attachment URL')
   const response = await fetch(url, { redirect: 'manual', signal: AbortSignal.timeout(12000) })
   if (!response.ok || !response.body) throw Error(`Notion attachment HTTP ${response.status}`)

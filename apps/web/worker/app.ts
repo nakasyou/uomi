@@ -1,3 +1,4 @@
+import { notifyTranscriber, flushNotifications, refreshTranscript, webhookAuthorized } from './transcriber.ts'
 import { searchCondition } from './search.js'
 import { optimizeCache } from './maintenance.ts'
 import { loadManifest, saveManifest } from './manifest.ts'
@@ -261,7 +262,8 @@ export async function backup(env: any, id: string) {
   let row = await env.DB.prepare('SELECT * FROM recordings WHERE id=? AND audio_key IS NOT NULL')
     .bind(id)
     .first()
-  if (!row || row.backup_step === 'done' || row.backup_step === 'uncertain') return
+  if (!row || row.backup_step === 'uncertain') return
+  if (row.backup_step === 'done') { await notifyTranscriber(env,id); return }
   const lock = await env.DB.prepare(
     'UPDATE recordings SET backup_lease=?,backup_until=? WHERE id=? AND backup_until<?',
   )
@@ -343,6 +345,8 @@ export async function backup(env: any, id: string) {
         if (row.status === 'Completed')
           await store.saveTranscript(row.backup_page, row.text, 'uomi-web')
         await checkpoint('done', { backup_revision: revision })
+        await env.DB.prepare('INSERT OR IGNORE INTO transcriber_notifications(recording_id) VALUES(?)').bind(row.rid).run()
+        if (Date.now() < deadline - 4000) await notifyTranscriber(env,id)
         break
       } else break
     }
@@ -421,12 +425,17 @@ async function api(request: Request, env: any, ctx: any, role: string) {
     })
   }
   const match = path.match(
-    /^\/api\/recordings\/([a-zA-Z0-9-]+)(?:\/(audio|backup|transcript|resync))?$/,
+    /^\/api\/recordings\/([a-zA-Z0-9-]+)(?:\/(audio|backup|transcript|resync|transcribe))?$/,
   )
   if (match) {
     const [, id, action] = match
     let row = await env.DB.prepare('SELECT * FROM recordings WHERE id=?').bind(id).first()
     if (!row) return json({ error: 'Recording not found' }, 404)
+    if (action === 'transcribe' && method === 'POST') {
+      if (!env.TRANSCRIBER_WEBHOOK_URL || !env.UOMI_WEBHOOK_SECRET) return json({error:'Configure TRANSCRIBER_WEBHOOK_URL and UOMI_WEBHOOK_SECRET in Sites'},503)
+      ctx.waitUntil(notifyTranscriber(env,id,true))
+      return json({accepted:true},202)
+    }
     if (action === 'resync' && method === 'POST') {
       const store = new NotionStore(httpTransport(env.NOTION_TOKEN), env.NOTION_DATA_SOURCE_ID)
       const page = await store.page(row.backup_page ?? id)
@@ -562,12 +571,18 @@ export default {
   async fetch(request: Request, env: any, ctx: any): Promise<Response> {
     try {
       const path = new URL(request.url).pathname
+      if (path === '/api/transcriber/completed' && request.method === 'POST') {
+        if (!(await webhookAuthorized(request,env.UOMI_WEBHOOK_SECRET))) return json({error:'Authentication required'},401)
+        const data = await body(request,4096)
+        return json(await refreshTranscript(env,data.pageId))
+      }
       if (path === '/health') return json({ ok: true })
       if (path === '/mcp') {
         if (request.method === 'POST' && visitor(request)) {
           const rpc: any = await request.clone().json()
           if (rpc.method === 'tools/call' && rpc.params?.name === 'search_transcripts') await requireSearchReady(env)
           if (rpc.method === 'tools/call' && rpc.params?.name === 'index_status') {
+            ctx.waitUntil(flushNotifications(env))
             const count = await env.DB.prepare(
               "SELECT count(*) AS recordings,sum(audio_key IS NOT NULL) AS cached_audio,sum(backup_step NOT IN ('done','legacy')) AS pending_notion_saves FROM recordings",
             ).first()
@@ -608,6 +623,10 @@ export default {
                       ...count,
                       sync: state,
                       optimization,
+                      transcriber: {
+                        configured: !!(env.TRANSCRIBER_WEBHOOK_URL && env.UOMI_WEBHOOK_SECRET),
+                        ...(await env.DB.prepare('SELECT count(*) AS pending_notifications FROM transcriber_notifications WHERE delivered_at IS NULL').first()),
+                      },
                       storage: {
                         database_bytes: storage.meta?.size_after ?? null,
                         ...storage.results[0],
@@ -652,6 +671,7 @@ export default {
         if (origin && origin !== new URL(request.url).origin)
           return json({ error: 'Cross-origin write rejected' }, 403)
       }
+      ctx.waitUntil(flushNotifications(env))
       return await api(request, env, ctx, role)
     } catch (e) {
       return json({ error: String((e as Error).message).slice(0, 1000) }, 400)

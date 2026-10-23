@@ -99,3 +99,24 @@ Public search is explicit about incomplete migration instead of dropping rows.
 Clear a legacy blob only after an R2 readback/hash check succeeds. Deleted objects
 can be restored through Notion resync. Freed SQLite pages may remain allocated
 for reuse; a smaller payload does not imply an immediately smaller database file.
+
+## Automatic transcription handoff
+
+Configure `TRANSCRIBER_WEBHOOK_URL` and `UOMI_WEBHOOK_SECRET` in Sites secrets.
+Use an HTTPS daemon `/webhook` endpoint and the daemon's existing 24+ character
+shared secret. Never put them in the hosting manifest or client bundle.
+After Notion verification, D1 journals a notification and waitUntil attempts a
+short authenticated webhook call. Due notifications retry during subsequent
+API/index-status activity; the daemon's Notion polling is the independent idle
+fallback. `index_status.transcriber` reports configuration and pending deliveries.
+`POST /api/recordings/:id/transcribe` manually retries notification.
+
+Configure the daemon with the Site origin in `SITES_URL` and its private service
+token in `SITES_ACCESS_TOKEN`. Completion callbacks use this token plus the shared
+secret. The URL is trusted local configuration, never a webhook-supplied target.
+The daemon persists a completion event before writing Notion Completed and
+retries from disk every recovery cycle, including after restart. Sites reads
+Notion's canonical transcript and commits normalized text/FTS before returning
+`saved:true`; it does not wait for another full audio resync. Duplicate callbacks
+are idempotent. The original audio cache and source range claims are preserved.
+Failed completion delivery does not mark successful transcription as Failed.
