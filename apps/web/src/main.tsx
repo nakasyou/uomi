@@ -853,10 +853,9 @@ function App() {
                         <h2>
                           {active(currentJob)
                             ? 'Transcription in progress'
-                            : currentJob?.status === 'completed' ||
-                                (selected.status === 'Completed' && view === 'standard')
+                            : currentJob?.status === 'completed'
                               ? 'No speech detected'
-                              : 'No transcript yet'}
+                              : 'No transcript available'}
                         </h2>
                         {!selected.has_audio && (
                           <p>Import the audio to transcribe this recording.</p>
