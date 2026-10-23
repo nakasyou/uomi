@@ -50,8 +50,18 @@ x86_64. It uses the existing development certificate, not a production signing
 key. The keystore was not changed. APK v2/v3 signatures and 16 KB ZIP alignment
 were verified.
 
-- Size: 57,775,232 bytes.
-- SHA-256: `bd5cecc50233da084627a2c36465de26dc71d4d66aba4eebf7b4dd55120e46b3`.
+The exact APK installed during the emulator smoke is retained as
+`apps/client/android/app/build/outputs/apk/release/uomi-native-qa-tested.apk`
+(SHA-256 `bd5cecc50233da084627a2c36465de26dc71d4d66aba4eebf7b4dd55120e46b3`).
+
+The current `uomi-local-release.apk` was rebuilt afterward with one logging-only
+change: a failed/cancelled ring import now logs a secondary stop-command failure
+without replacing the original import error or changing packet commits. This
+newer artifact passed the release build, signature, Hermes and alignment checks;
+it was not installed in another emulator run.
+
+- Current size: 57,775,232 bytes.
+- Current SHA-256: `f44a8ee070ee4ae7f352d77cc6250eb9be365fbd520a6b5a9fde2b708ec11533`.
 
 Credential-free screenshots and result summaries are retained locally in
 `/tmp/uomi-native-qa-evidence/`. The temporary emulator and its private app data,

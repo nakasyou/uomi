@@ -1018,7 +1018,9 @@ class UomiModule(private val context: ReactApplicationContext) :
                     if (!success) {
                         try {
                             send(byteArrayOf(3))
-                        } catch (_: Exception) {}
+                        } catch (stopError: Exception) {
+                            android.util.Log.w("Uomi", "Stopping failed or cancelled ring import failed; preserving committed packets", stopError)
+                        }
                         // Preserve fully assembled packets even on cancellation or an incomplete
                         // DONE.
                         commit()

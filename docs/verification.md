@@ -290,3 +290,28 @@ wrapping. Credential redaction, bounded stream cancellation and real ffmpeg chun
 error propagation have regressions. All 21 transcriber tests, its typecheck/build,
 and repository formatting/lint pass. Remote Nix applies this same repository patch;
 activation of that next pinned source is recorded separately after verification.
+
+Provider diagnostics activation was verified on 2026-10-24 at 00:01 JST. Mac mini's
+Nix package pins `084fd8dbddcfd4a40399b2734f6966d50f30d131`, with unpacked source
+hash `1pwlgwb678wqaip30c77c8iwyiqnykfq6a17fqdbvd5mrxxxfxvs`. The full declarative
+mac-mini system closure built successfully at `~/dotfiles/result-uomi-api-diagnostics`.
+Its generated user LaunchAgent was installed and reloaded; the previous plist and
+private credentials remain backed up. Unrelated dotfiles changes were preserved.
+
+The observed running daemon PID was 94578, executing
+`/nix/store/jdaici78m37m3lmf6fqy3z711l7za0j0-uomi-transcriber-2026-10-23-084fd8d/lib/uomi-transcriber/transcriber.mjs`.
+Launchd reported program `/nix/store/g1a3cgb9ih25wsb2i45vdzaq0052lphw-uomi-transcriber-launch`.
+The compiled artifact independently contains the bounded error reader, request-ID
+and redaction markers, chunk cause propagation, and `/api/jobs/claim`. `/health`
+returned `status: ok`, `active: 0`, `concurrency: 2`, `error: null`, and a successful
+poll at `2026-10-23T15:01:03.907Z`. This verifies the actual activated package,
+rather than only the edited declaration or successful local tests.
+
+The repair importer PID 87941 continued independently throughout the daemon update.
+At the activation check it had processed 180 source pages: 168 cached, 11 unchanged,
+one primary-owned skip, and 167 audio copies imported during this pass. Its one
+historical missing-audio warning identified source page
+`401f60d4-5c99-8169-9aca-d9e3c4031db1`, whose Audio and Manifest attachments were both
+absent. `has_more` remained true; these observations do not establish exhaustive
+migration or final unresolved counts. Later hydration can resolve earlier warnings,
+so final source IDs must be reconciled with authoritative storage after exhaustion.
