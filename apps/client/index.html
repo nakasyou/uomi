@@ -3,7 +3,9 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="theme-color" content="#f8faf6" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#fffbfe" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#1c1b1f" media="(prefers-color-scheme: dark)" />
     <link rel="icon" href="data:," />
     <title>Uomi — Your audio, on your terms</title>
     <style>
@@ -16,28 +18,48 @@
       #root {
         display: flex;
       }
+      :root {
+        color-scheme: light dark;
+        --background: #fffbfe;
+        --foreground: #1c1b1f;
+        --primary: #6750a4;
+        --selection: #eaddff;
+        --on-selection: #21005d;
+        --outline: #79747e;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --background: #1c1b1f;
+          --foreground: #e6e1e5;
+          --primary: #d0bcff;
+          --selection: #4f378b;
+          --on-selection: #eaddff;
+          --outline: #938f99;
+        }
+      }
       body {
-        background: #f8faf6;
+        background: var(--background);
+        color: var(--foreground);
       }
       * {
         box-sizing: border-box;
       }
       ::selection {
-        background: #d1e8d4;
-        color: #102f22;
+        background: var(--selection);
+        color: var(--on-selection);
       }
       :focus-visible {
-        outline: 3px solid #436650;
+        outline: 3px solid var(--primary);
         outline-offset: 3px;
       }
       input {
-        caret-color: #326342;
+        caret-color: var(--primary);
       }
       ::-webkit-scrollbar {
         width: 9px;
       }
       ::-webkit-scrollbar-thumb {
-        background: #b9c6ba;
+        background: var(--outline);
         border-radius: 8px;
       }
       ::-webkit-scrollbar-track {

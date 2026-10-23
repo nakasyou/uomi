@@ -2,6 +2,7 @@ import React, { useEffect, useState, useSyncExternalStore } from 'react'
 import { View, ScrollView, StyleSheet, Linking, useColorScheme } from 'react-native'
 import {
   PaperProvider,
+  useTheme,
   MD3DarkTheme,
   MD3LightTheme,
   Text,
@@ -29,6 +30,7 @@ export default function App() {
   )
 }
 function SyncApp() {
+  const theme = useTheme()
   const state = useSyncExternalStore(client.subscribe, client.getSnapshot),
     [tab, setTab] = useState('sync'),
     [draft, setDraft] = useState<Settings>(state.settings),
@@ -62,7 +64,7 @@ function SyncApp() {
   }
   const busy = state.busy || scanning
   return (
-    <SafeAreaView style={{ flex: 1 }}>
+    <SafeAreaView style={{ flex: 1, backgroundColor: theme.colors.background }}>
       <ScrollView contentContainerStyle={styles.page} keyboardShouldPersistTaps="handled">
         <View style={styles.header}>
           <View>
@@ -105,7 +107,7 @@ function SyncApp() {
               </>
             )}
             {state.error && (
-              <Text accessibilityRole="alert" style={{ color: '#b3261e' }}>
+              <Text accessibilityRole="alert" style={{ color: theme.colors.error }}>
                 {state.error}
               </Text>
             )}
