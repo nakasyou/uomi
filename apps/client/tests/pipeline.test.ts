@@ -186,3 +186,28 @@ test('bounded reconciliation overlaps two checks and drains them on failure', as
   assert.equal(drained, true)
   assert.deepEqual(visited, [0, 1])
 })
+
+test('bounded parallel operations report every in-flight failure after draining', async () => {
+  const { forEachBounded } = await import('../src/core/pipeline')
+  let release!: () => void
+  const start = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  const seen: number[] = []
+  const task = forEachBounded(
+    [0, 1, 2, 3, 4],
+    async (id) => {
+      seen.push(id)
+      if (seen.length === 4) release()
+      await start
+      throw Error(`chunk ${id}: HTTP ${500 + id}`)
+    },
+    4,
+  )
+  await assert.rejects(task, (error: Error) => {
+    for (let id = 0; id < 4; id++)
+      assert.match(error.message, new RegExp(`chunk ${id}: HTTP ${500 + id}`))
+    return true
+  })
+  assert.deepEqual(seen, [0, 1, 2, 3])
+})

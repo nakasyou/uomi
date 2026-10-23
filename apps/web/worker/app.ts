@@ -1,13 +1,21 @@
-import { notifyTranscriber, flushNotifications, refreshTranscript, webhookAuthorized } from './transcriber.ts'
+import { refreshTranscript, webhookAuthorized } from './transcriber.ts'
 import { searchCondition } from './search.js'
 import { optimizeCache } from './maintenance.ts'
 import { loadManifest, saveManifest } from './manifest.ts'
 import { Buffer } from 'buffer'
-import { oggOpus, oggFrames, stripSyntheticGaps, opusDuration } from '@uomi/audio'
-import { NotionStore, httpTransport, type AudioManifest } from '@uomi/notion'
+import {
+  oggOpus,
+  oggFrames,
+  stripSyntheticGaps,
+  OGG_UPLOAD_TYPE,
+  decodeOggUpload,
+} from '@uomi/audio'
+import { NotionStore, httpTransport, validateManifest, type AudioManifest } from '@uomi/notion'
 import mcp from './index.js'
-import { ranges } from './source-ranges.ts'
+import { ranges, overlappingRecordingsSql } from './source-ranges.ts'
 export { ranges } from './source-ranges.ts'
+import { enqueue, jobsApi, jobView, ApiError } from './jobs.ts'
+import { detailedTranscription } from './detailed-transcription.ts'
 import { resync, cachePage } from './notion-cache.ts'
 
 export const json = (value: unknown, status = 200) =>
@@ -28,7 +36,7 @@ export const digest = async (value: BufferSource | Uint8Array) =>
 const MAX_BODY = 12 * 1024 * 1024
 async function bytes(request: Request, max = MAX_BODY) {
   const reader = request.body?.getReader()
-  if (!reader) throw Error('Request body required')
+  if (!reader) throw new ApiError('Request body required')
   const parts: Uint8Array[] = []
   let size = 0
   try {
@@ -36,7 +44,7 @@ async function bytes(request: Request, max = MAX_BODY) {
       const p = await reader.read()
       if (p.done) break
       size += p.value.length
-      if (size > max) throw Error('Chunk exceeds 12 MiB. Use shorter chunks.')
+      if (size > max) throw new ApiError('Chunk exceeds 12 MiB. Use shorter chunks.')
       parts.push(p.value)
     }
   } finally {
@@ -56,11 +64,9 @@ export async function validateChunk(v: any) {
     typeof v.deviceId !== 'string' ||
     v.deviceId.length > 200 ||
     !Array.isArray(v.frames) ||
-    !v.frames.length ||
-    v.frames.length > 45000
+    !v.frames.length
   )
-    throw Error('Invalid Uomi chunk')
-  let total = 0
+    throw new ApiError('Invalid Uomi chunk')
   const ids = new Set()
   for (const f of v.frames) {
     if (
@@ -70,113 +76,50 @@ export async function validateChunk(v: any) {
       f.data.length > 4096 ||
       !/^[A-Za-z0-9+/]*={0,2}$/.test(f.data)
     )
-      throw Error('Invalid source packet')
+      throw new ApiError('Invalid source packet')
     ids.add(f.id)
-    const ms = opusDuration(Buffer.from(f.data, 'base64'))
-    if (ms !== f.durationMs) throw Error('Opus duration mismatch')
     if (
       !Number.isFinite(f.recordTimestamp) ||
       !/^\d{1,24}$/.test(f.sequence ?? '') ||
       !['device-utc', 'device-uptime'].includes(f.timing) ||
       (f.ringId !== null && (typeof f.ringId !== 'string' || f.ringId.length > 128))
     )
-      throw Error('Invalid source timing metadata')
-    if (!Number.isFinite(f.offsetMs) || f.offsetMs < 0) throw Error('Invalid source offset')
+      throw new ApiError('Invalid source timing metadata')
+    if (!Number.isFinite(f.offsetMs) || f.offsetMs < 0) throw new ApiError('Invalid source offset')
     if (
       f.capturedAt !== null &&
       (typeof f.capturedAt !== 'string' || !Number.isFinite(Date.parse(f.capturedAt)))
     )
-      throw Error('Invalid source clock')
-    total += ms
+      throw new ApiError('Invalid source clock')
   }
-  if (total > 900000 || total !== v.durationMs) throw Error('Chunk duration mismatch')
   return ranges(v.frames)
 }
 // Dispatch supplies these headers only after private Site authentication.
 // Some hosted browser renderers provide email without the stable user ID.
 function visitor(request: Request) {
-  return request.headers.get('oai-authenticated-user-id') || request.headers.get('oai-authenticated-user-email')
+  return (
+    request.headers.get('oai-authenticated-user-id') ||
+    request.headers.get('oai-authenticated-user-email')
+  )
 }
 async function authorize(request: Request, env: any) {
   if (visitor(request)) return 'owner'
-  const secret = request.headers.get('X-Uomi-Secret')
+  const secret = request.headers.get('X-Uomi-Worker-Secret') ?? request.headers.get('X-Uomi-Secret')
   if (!secret || secret.length < 24) return null
   const hash = await digest(new TextEncoder().encode(secret))
+  const workerSecret = env.UOMI_WORKER_SECRET || env.UOMI_WEBHOOK_SECRET
+  if (typeof workerSecret === 'string' && workerSecret.length >= 24) {
+    const expected = await digest(new TextEncoder().encode(workerSecret))
+    let difference = 0
+    for (let i = 0; i < hash.length; i++) difference |= hash.charCodeAt(i) ^ expected.charCodeAt(i)
+    if (difference === 0) return 'worker'
+  }
   const row = await env.DB.prepare('SELECT name FROM client_keys WHERE hash=? AND revoked=0')
     .bind(hash)
     .first()
   return row ? 'client' : null
 }
-async function ingest(request: Request, env: any, ctx: any) {
-  const value = await body(request)
-  const spans = await validateChunk(value)
-  const id = await digest(
-    new TextEncoder().encode(JSON.stringify(value.frames.map((f: any) => f.id))),
-  )
-  if (value.segmentId !== id || request.headers.get('Idempotency-Key') !== id)
-    throw Error('Chunk identity mismatch')
-  const audio = oggOpus(value.frames),
-    sha = await digest(audio)
-  const old = await env.DB.prepare('SELECT audio_sha,backup_step FROM recordings WHERE id=?')
-    .bind(id)
-    .first()
-  if (old) {
-    if (old.audio_sha !== sha) return json({ error: 'Chunk ID has different audio' }, 409)
-    ctx.waitUntil(backup(env, id))
-    return json(
-      { id, sha256: sha, saved: true, notion_saved: old.backup_step === 'done', duplicate: true },
-      old.backup_step === 'done' ? 200 : 202,
-    )
-  }
-  const overlaps = await env.DB.prepare(
-    `SELECT DISTINCT r.id AS recording_id FROM source_ranges s JOIN recordings r ON r.rid=s.recording_id JOIN json_each(?) j ON s.prefix=json_extract(j.value,'$.prefix') AND s.start<json_extract(j.value,'$.end') AND s.end>json_extract(j.value,'$.start') WHERE s.device=? LIMIT 9`,
-  )
-    .bind(JSON.stringify(spans), value.deviceId)
-    .all()
-  if (overlaps.results.length) {
-    if (overlaps.results.length > 8)
-      return json({ error: 'Chunk overlaps too many saved recordings; use shorter chunks.' }, 409)
-    const expected = new Map(value.frames.map((f: any) => [f.id, f]))
-    for (const item of overlaps.results) {
-      const saved = await env.DB.prepare(
-        'SELECT audio_key,manifest_gzip,manifest_key,backup_step FROM recordings WHERE id=?',
-      )
-        .bind(item.recording_id)
-        .first()
-      if (!saved || saved.backup_step !== 'done')
-        return json({ error: 'Overlapping source save is still pending; retry later.' }, 409)
-      const manifest = await loadManifest(env, saved),
-        object = await env.BUCKET.get(saved.audio_key)
-      if (!object)
-        return json({ error: 'Resync the overlapping recording from Notion before retrying.' }, 409)
-      const packets = oggFrames(
-        stripSyntheticGaps(
-          new Uint8Array(await object.arrayBuffer()),
-          manifest.gaps ?? [],
-          manifest.frameIds.length,
-        ),
-      )
-      if (packets.length !== manifest.frameIds.length)
-        throw Error('Cached source packet count mismatch')
-      manifest.frameIds.forEach((frameId, i) => {
-        const wanted: any = expected.get(frameId)
-        if (wanted) {
-          if (wanted.data !== packets[i].data || wanted.durationMs !== packets[i].durationMs)
-            throw Error('Source frame identity has different audio')
-          expected.delete(frameId)
-        }
-      })
-    }
-    if (expected.size === 0)
-      return json({ id, sha256: sha, saved: true, notion_saved: true, duplicate: true })
-    return json(
-      {
-        error:
-          'Chunk partially overlaps saved audio. Keep local audio and use the original chunk boundaries.',
-      },
-      409,
-    )
-  }
+function legacyManifest(value: any, id: string, sha: string): AudioManifest {
   const capturedAt = value.frames[0].capturedAt
   const manifest: AudioManifest = {
     schema: 'uomi.notion.v1',
@@ -207,6 +150,127 @@ async function ingest(request: Request, env: any, ctx: any) {
         frames: 1,
       })
   })
+  return manifest
+}
+async function ingest(request: Request, env: any, ctx: any) {
+  const binary = request.headers.get('Content-Type')?.split(';')[0] === OGG_UPLOAD_TYPE
+  let audio: Buffer
+  let manifest: AudioManifest
+  if (binary) {
+    const upload = decodeOggUpload(await bytes(request))
+    try {
+      validateManifest(upload.manifest)
+    } catch (e) {
+      throw new ApiError((e as Error).message)
+    }
+    manifest = upload.manifest
+    audio = upload.audio
+  } else {
+    // Keep older installed clients working during the binary protocol rollout.
+    const value = await body(request)
+    await validateChunk(value)
+    audio = oggOpus(value.frames)
+    manifest = legacyManifest(value, value.segmentId, await digest(audio))
+  }
+  const id = await digest(new TextEncoder().encode(JSON.stringify(manifest.frameIds)))
+  if (manifest.id !== id || request.headers.get('Idempotency-Key') !== id)
+    throw new ApiError('Chunk identity mismatch')
+  if (
+    typeof manifest.deviceId !== 'string' ||
+    manifest.deviceId.length > 200 ||
+    (manifest.capturedAt !== null && !Number.isFinite(Date.parse(manifest.capturedAt)))
+  )
+    throw new ApiError('Invalid source metadata')
+  const sha = await digest(audio)
+  if (manifest.sha256 !== sha) throw new ApiError('Ogg audio hash mismatch')
+  const spans = ranges(manifest.frameIds.map((id) => ({ id })))
+  const old = await env.DB.prepare(
+    'SELECT audio_sha,backup_step,id AS recording_id FROM recordings WHERE id=?1 UNION ALL SELECT a.audio_sha,r.backup_step,r.id AS recording_id FROM chunk_aliases a JOIN recordings r ON r.id=a.recording_id WHERE a.id=?1 LIMIT 1',
+  )
+    .bind(id)
+    .first()
+  if (old) {
+    if (old.audio_sha !== sha) return json({ error: 'Chunk ID has different audio' }, 409)
+    await enqueue(env, old.recording_id)
+    ctx.waitUntil(backup(env, old.recording_id))
+    return json(
+      {
+        id,
+        sha256: sha,
+        saved: true,
+        notion_saved: old.backup_step === 'done',
+        duplicate: true,
+        transcription: jobView(
+          await env.DB.prepare(
+            "SELECT * FROM transcription_jobs WHERE recording_id=? AND mode='standard'",
+          )
+            .bind(old.recording_id)
+            .first(),
+        ),
+      },
+      200,
+    )
+  }
+  const overlaps = await env.DB.prepare(overlappingRecordingsSql)
+    .bind(JSON.stringify(spans), manifest.deviceId)
+    .all()
+  if (overlaps.results.length) {
+    if (overlaps.results.length > 8)
+      return json({ error: 'Chunk overlaps too many saved recordings; use shorter chunks.' }, 409)
+    // Decode packets only when comparing an upload with existing source claims.
+    const uploadedPackets = oggFrames(audio)
+    const expected = new Map(manifest.frameIds.map((id, i) => [id, uploadedPackets[i]]))
+    let notionSaved = true
+    for (const item of overlaps.results) {
+      const saved = await env.DB.prepare(
+        'SELECT audio_key,manifest_gzip,manifest_key,backup_step FROM recordings WHERE id=?',
+      )
+        .bind(item.recording_id)
+        .first()
+      if (!saved)
+        return json({ error: 'Overlapping source save is still pending; retry later.' }, 409)
+      notionSaved &&= ['done', 'legacy'].includes(saved.backup_step)
+      const manifest = await loadManifest(env, saved),
+        object = await env.BUCKET.get(saved.audio_key)
+      if (!object)
+        return json({ error: 'Resync the overlapping recording from Notion before retrying.' }, 409)
+      const packets = oggFrames(
+        stripSyntheticGaps(
+          new Uint8Array(await object.arrayBuffer()),
+          manifest.gaps ?? [],
+          manifest.frameIds.length,
+        ),
+      )
+      if (packets.length !== manifest.frameIds.length)
+        throw new ApiError('Cached source packet count mismatch')
+      manifest.frameIds.forEach((frameId, i) => {
+        const wanted: any = expected.get(frameId)
+        if (expected.has(frameId)) {
+          if (!wanted) throw new ApiError('Missing source packet in uploaded Ogg')
+          if (wanted.data !== packets[i].data || wanted.durationMs !== packets[i].durationMs)
+            throw new ApiError('Source frame identity has different audio')
+          expected.delete(frameId)
+        }
+      })
+    }
+    if (expected.size === 0) {
+      const canonicalId = overlaps.results[0].recording_id
+      await env.DB.prepare(
+        'INSERT OR IGNORE INTO chunk_aliases(id,audio_sha,recording_id) VALUES(?,?,?)',
+      )
+        .bind(id, sha, canonicalId)
+        .run()
+      return json({ id, sha256: sha, saved: true, notion_saved: notionSaved, duplicate: true })
+    }
+    return json(
+      {
+        error:
+          'Chunk partially overlaps saved audio. Keep local audio and use the original chunk boundaries.',
+      },
+      409,
+    )
+  }
+  const capturedAt = manifest.capturedAt
   const manifestKey = await saveManifest(env, manifest)
   const key = `audio/${sha}.ogg`
   await env.BUCKET.put(key, audio, {
@@ -218,26 +282,28 @@ async function ingest(request: Request, env: any, ctx: any) {
   try {
     await env.DB.batch([
       env.DB.prepare(
-        "INSERT INTO recordings(id,recorded_at,finished_at,edited_at,device,status,url,text,audio_key,audio_sha,duration_ms,manifest_key,backup_step) VALUES(?,?,?,?,?,'Pending','','',?,?,?,?,'page')",
+        "INSERT INTO recordings(id,recorded_at,finished_at,edited_at,device,status,url,text,audio_key,audio_sha,duration_ms,manifest_key,backup_step,primary_owned) VALUES(?,?,?,?,?,'Pending','','',?,?,?,?,'page',1)",
       ).bind(
         id,
         start,
-        start === null ? null : start + value.durationMs,
+        start === null ? null : start + manifest.durationMs,
         now,
-        value.deviceId,
+        manifest.deviceId,
         key,
         sha,
-        value.durationMs,
+        manifest.durationMs,
         manifestKey,
       ),
-      ...spans.map((s) =>
-        env.DB.prepare('INSERT INTO source_ranges VALUES(?,?,?,?,(SELECT rid FROM recordings WHERE id=?))').bind(
-          value.deviceId,
-          s.prefix,
-          s.start,
-          s.end,
-          id,
-        ),
+      env.DB.prepare(
+        "INSERT OR IGNORE INTO transcription_jobs(id,recording_id,mode,created_at,updated_at) VALUES(?,?,'standard',?,?)",
+      ).bind(id + ':standard', id, Date.now(), Date.now()),
+      // One statement keeps all claims atomic without a statement per source packet.
+      env.DB.prepare(`INSERT INTO source_ranges
+        SELECT ?,json_extract(value,'$.prefix'),json_extract(value,'$.start'),json_extract(value,'$.end'),
+          (SELECT rid FROM recordings WHERE id=?) FROM json_each(?)`).bind(
+        manifest.deviceId,
+        id,
+        JSON.stringify(spans),
       ),
     ])
   } catch (e) {
@@ -251,8 +317,9 @@ async function ingest(request: Request, env: any, ctx: any) {
       .first()
     if (winner?.audio_sha !== sha) throw e
   }
+  const transcription = jobView(await enqueue(env, id))
   ctx.waitUntil(backup(env, id))
-  return json({ id, sha256: sha, saved: true, notion_saved: false }, 202)
+  return json({ id, sha256: sha, saved: true, notion_saved: false, transcription }, 201)
 }
 
 // Durable checkpoints are authoritative. waitUntil is only an opportunistic runner.
@@ -262,8 +329,10 @@ export async function backup(env: any, id: string) {
   let row = await env.DB.prepare('SELECT * FROM recordings WHERE id=? AND audio_key IS NOT NULL')
     .bind(id)
     .first()
-  if (!row || row.backup_step === 'uncertain') return
-  if (row.backup_step === 'done') { await notifyTranscriber(env,id); return }
+  if (!row || (row.backup_step === 'done' && row.backup_revision >= row.revision)) return
+  if (!env.NOTION_TOKEN || !env.NOTION_DATA_SOURCE_ID || row.backup_next_attempt > now) return
+  if (row.backup_step === 'done') row.backup_step = 'transcript'
+  if (row.backup_step === 'legacy') row.backup_step = row.backup_page ? 'transcript' : 'page'
   const lock = await env.DB.prepare(
     'UPDATE recordings SET backup_lease=?,backup_until=? WHERE id=? AND backup_until<?',
   )
@@ -274,11 +343,15 @@ export async function backup(env: any, id: string) {
     deadline = now + 24000
   const checkpoint = async (step: string, extra: Record<string, unknown> = {}) => {
     const entries = Object.entries(extra)
-    await env.DB.prepare(
-      `UPDATE recordings SET backup_step=?,backup_error=NULL${entries.map(([k]) => `,${k}=?`).join('')} WHERE id=? AND backup_lease=? AND revision=?`,
+    const result = await env.DB.prepare(
+      `UPDATE recordings SET backup_step=?,backup_error=NULL,backup_attempts=0,backup_next_attempt=0${entries.map(([k]) => `,${k}=?`).join('')} WHERE id=? AND backup_lease=? AND revision=?`,
     )
       .bind(step, ...entries.map(([, v]) => v), id, token, revision)
       .run()
+    if (!result.meta.changes)
+      throw Error(
+        'Backup paused because the recording changed; the latest revision will be backed up on retry',
+      )
     Object.assign(row, extra, { backup_step: step })
   }
   try {
@@ -292,13 +365,17 @@ export async function backup(env: any, id: string) {
     const store = new NotionStore(transport, env.NOTION_DATA_SOURCE_ID)
     const manifest = await loadManifest(env, row)
     while (Date.now() < deadline - 2500) {
-      if (row.backup_step === 'page') {
+      if (row.backup_step === 'page' || row.backup_step === 'uncertain') {
         await store.setup()
         const existing = await store.find(id)
         if (existing) {
           await checkpoint('audio', { backup_page: existing.id })
           continue
         }
+        if (row.backup_step === 'uncertain')
+          throw Error(
+            'Notion page creation is unconfirmed; retry backup after checking the backup destination',
+          )
         await checkpoint('uncertain')
         const page = await store.reserve(manifest)
         await checkpoint('audio', { backup_page: page.id })
@@ -342,17 +419,49 @@ export async function backup(env: any, id: string) {
           throw Error('Notion saved audio hash mismatch')
         await checkpoint('transcript')
       } else if (row.backup_step === 'transcript') {
+        await store.update(row.backup_page, {
+          Name: { title: [{ type: 'text', text: { content: row.title || id } }] },
+          Starred: { checkbox: !!row.starred },
+        })
         if (row.status === 'Completed')
-          await store.saveTranscript(row.backup_page, row.text, 'uomi-web')
+          await store.saveTranscript(
+            row.backup_page,
+            row.text,
+            'uomi-web',
+            'standard',
+            JSON.parse(row.transcript_segments),
+          )
+        if (row.detailed_status === 'Completed')
+          await store.saveTranscript(
+            row.backup_page,
+            row.detailed_text,
+            'codex',
+            'detailed',
+            JSON.parse(row.detailed_segments),
+          )
         await checkpoint('done', { backup_revision: revision })
-        await env.DB.prepare('INSERT OR IGNORE INTO transcriber_notifications(recording_id) VALUES(?)').bind(row.rid).run()
-        if (Date.now() < deadline - 4000) await notifyTranscriber(env,id)
+
         break
       } else break
     }
   } catch (e) {
-    await env.DB.prepare('UPDATE recordings SET backup_error=? WHERE id=? AND backup_lease=?')
-      .bind(String((e as Error).message).slice(0, 1000), id, token)
+    console.error(
+      JSON.stringify({
+        event: 'notion_backup_failed',
+        recording_id: id,
+        error: String(e),
+        stack: (e as Error).stack,
+      }),
+    )
+    await env.DB.prepare(
+      'UPDATE recordings SET backup_error=?,backup_attempts=backup_attempts+1,backup_next_attempt=? WHERE id=? AND backup_lease=?',
+    )
+      .bind(
+        String((e as Error).message).slice(0, 4000),
+        Date.now() + Math.min(3600000, 15000 * 2 ** Math.min(row.backup_attempts, 8)),
+        id,
+        token,
+      )
       .run()
   } finally {
     await env.DB.prepare(
@@ -363,20 +472,113 @@ export async function backup(env: any, id: string) {
   }
 }
 
+export const pendingBackupsSql =
+  "SELECT id FROM recordings WHERE audio_key IS NOT NULL AND backup_until<? AND backup_next_attempt<=? AND (backup_step NOT IN ('done','legacy') OR backup_revision<revision) ORDER BY backup_next_attempt,backup_until LIMIT 2"
+async function resumeBackups(env: any) {
+  if (!env.NOTION_TOKEN || !env.NOTION_DATA_SOURCE_ID) return
+  const rows = await env.DB.prepare(pendingBackupsSql).bind(Date.now(), Date.now()).all()
+  await Promise.allSettled(rows.results.map((r: any) => backup(env, r.id)))
+}
 async function requireSearchReady(env: any) {
+  const dirty = await env.DB.prepare(
+    'SELECT 1 FROM recordings WHERE search_version=0 LIMIT 1',
+  ).first()
+  if (!dirty) return
   const state = await optimizeCache(env)
-  if (state.search_remaining) throw Error('Search index upgrade in progress; retry to continue the bounded migration')
+  if (state.search_remaining)
+    throw Error('Search index upgrade in progress; retry to continue the bounded migration')
 }
 
 async function api(request: Request, env: any, ctx: any, role: string) {
   const url = new URL(request.url),
     path = url.pathname,
     method = request.method
+  if (path === '/api/migrations/notion') {
+    if (!['worker', 'owner'].includes(role))
+      return json({ error: 'Worker or owner access required' }, 403)
+    if (method === 'GET') {
+      const state = await env.DB.prepare(
+        'SELECT since,cursor,started,lease_until,last_error,updated_at FROM resync_state WHERE id=1',
+      ).first()
+      return json({
+        status: !state
+          ? 'not_started'
+          : state.last_error
+            ? 'failed'
+            : state.cursor
+              ? 'running'
+              : state.since === '1970-01-01T00:00:00.000Z'
+                ? 'not_started'
+                : 'completed',
+        has_more: !!state?.cursor,
+        watermark: state?.since ?? null,
+        started: state?.started ?? null,
+        error: state?.last_error ?? null,
+        updated_at: state?.updated_at ?? null,
+      })
+    }
+    if (method === 'POST') {
+      const data = request.body ? await body(request, 4096) : {}
+      if (data.reset !== undefined && typeof data.reset !== 'boolean')
+        throw new ApiError('reset must be boolean')
+      return json(await resync(env, data.reset === true))
+    }
+  }
   if (path === '/api/resync' && method === 'POST') {
     const data = await body(request, 4096)
     return json(await resync(env, data.reset === true))
   }
+  if (path === '/api/jobs' || path.startsWith('/api/jobs/')) {
+    if (path === '/api/jobs/claim') ctx.waitUntil(resumeBackups(env))
+    return json(
+      await jobsApi(request, env, method === 'POST' ? await body(request, 4 * 1024 * 1024) : {}),
+    )
+  }
   if (path === '/api/chunks' && method === 'POST') return ingest(request, env, ctx)
+  if (path === '/api/chunks/status' && method === 'POST') {
+    const { ids } = await body(request, 8192)
+    if (
+      !Array.isArray(ids) ||
+      ids.length > 64 ||
+      !ids.length ||
+      ids.some((id) => typeof id !== 'string' || !/^[a-f0-9]{64}$/.test(id))
+    )
+      throw new ApiError('Expected 1–64 chunk IDs')
+    const { results } = await env.DB.prepare(
+      'SELECT id,id AS recording_id,backup_step,backup_error,backup_until FROM recordings WHERE id IN (SELECT value FROM json_each(?1)) UNION ALL SELECT a.id,r.id AS recording_id,r.backup_step,r.backup_error,r.backup_until FROM chunk_aliases a JOIN recordings r ON r.id=a.recording_id WHERE a.id IN (SELECT value FROM json_each(?1))',
+    )
+      .bind(JSON.stringify(ids))
+      .all()
+    const rows = new Map<string, any>(results.map((r: any) => [r.id, r]))
+    const jobs = await env.DB.prepare(
+      "SELECT * FROM transcription_jobs WHERE mode='standard' AND recording_id IN (SELECT value FROM json_each(?1) UNION SELECT recording_id FROM chunk_aliases WHERE id IN (SELECT value FROM json_each(?1)))",
+    )
+      .bind(JSON.stringify(ids))
+      .all()
+    const jobRows = new Map<string, any>(jobs.results.map((r: any) => [r.recording_id, r]))
+    // Resume bounded background checkpoints without requiring the audio again.
+    for (const row of results
+      .filter(
+        (r: any) =>
+          !['done', 'legacy', 'uncertain'].includes(r.backup_step) && r.backup_until < Date.now(),
+      )
+      .slice(0, 4))
+      ctx.waitUntil(backup(env, row.recording_id))
+    return json({
+      uploads: ids.map((id) => {
+        const row = rows.get(id)
+        return {
+          id,
+          status: row ? 'saved' : 'missing',
+          error: null,
+          backup_status: row?.backup_step ?? null,
+          backup_error: row?.backup_error ?? null,
+          transcription: jobView(jobRows.get(row?.recording_id)),
+        }
+      }),
+    })
+  }
+
   if (path === '/api/recordings' && method === 'GET') {
     const limit = Math.min(50, Math.max(1, Number(url.searchParams.get('limit')) || 30)),
       clauses: string[] = [],
@@ -397,27 +599,43 @@ async function api(request: Request, env: any, ctx: any, role: string) {
       const value = url.searchParams.get(param)
       if (value) {
         const time = Date.parse(value)
-        if (!Number.isFinite(time)) throw Error('Invalid date range')
+        if (!Number.isFinite(time)) throw new ApiError('Invalid date range')
         clauses.push(`r.${col}${op}?`)
         args.push(time)
+        if (param === 'to') {
+          clauses.push('r.sort_time<?')
+          args.push(time)
+        }
+        if (param === 'from') {
+          const overlap = await env.DB.prepare(
+            'SELECT 1 FROM recordings WHERE finished_at>? LIMIT 1',
+          )
+            .bind(time)
+            .first()
+          if (!overlap) return json({ results: [], next_cursor: null })
+        }
       }
     }
     if (url.searchParams.get('starred') === '1') clauses.push('r.starred=1')
     const cursor = url.searchParams.get('cursor')
     if (cursor) {
       const c = JSON.parse(atob(cursor))
-      if (!Number.isFinite(c.time) || typeof c.id !== 'string') throw Error('Invalid cursor')
-      clauses.push('(COALESCE(r.recorded_at,0)<? OR (COALESCE(r.recorded_at,0)=? AND r.id<?))')
-      args.push(c.time, c.time, c.id)
+      if (!Number.isFinite(c.time) || typeof c.id !== 'string') throw new ApiError('Invalid cursor')
+      clauses.push('(r.sort_time,r.id)<(?,?)')
+      args.push(c.time, c.id)
     }
     const { results } = await env.DB.prepare(
-      `SELECT r.id,r.title,r.recorded_at,r.finished_at,r.duration_ms,r.status,r.starred,r.backup_step,r.backup_error,r.audio_key IS NOT NULL AS has_audio,substr(r.text,1,240) AS preview FROM recordings r${join}${clauses.length ? ' WHERE ' + clauses.join(' AND ') : ''} ORDER BY COALESCE(r.recorded_at,0) DESC,r.id DESC LIMIT ?`,
+      `SELECT r.id,r.title,r.recorded_at,r.finished_at,r.duration_ms,r.status,r.starred,r.backup_step,r.backup_error,r.audio_key IS NOT NULL AS has_audio,(SELECT json_object('id',j.id,'status',j.status,'stage',j.stage,'progress',j.progress,'attempt',j.attempt,'error',j.error,'updated_at',j.updated_at) FROM transcription_jobs j WHERE j.recording_id=r.id AND j.mode='standard') AS transcription_json,substr(r.text,1,240) AS preview FROM recordings r${join}${clauses.length ? ' WHERE ' + clauses.join(' AND ') : ''} ORDER BY r.sort_time DESC,r.id DESC LIMIT ?`,
     )
       .bind(...args, limit + 1)
       .all()
     const last = results[limit - 1]
     return json({
-      results: results.slice(0, limit),
+      results: results.slice(0, limit).map((r: any) => ({
+        ...r,
+        transcription: r.transcription_json ? JSON.parse(r.transcription_json) : null,
+        transcription_json: undefined,
+      })),
       next_cursor:
         results.length > limit
           ? btoa(JSON.stringify({ time: last.recorded_at ?? 0, id: last.id }))
@@ -425,16 +643,55 @@ async function api(request: Request, env: any, ctx: any, role: string) {
     })
   }
   const match = path.match(
-    /^\/api\/recordings\/([a-zA-Z0-9-]+)(?:\/(audio|backup|transcript|resync|transcribe))?$/,
+    /^\/api\/recordings\/([a-zA-Z0-9-]+)(?:\/(audio|manifest|backup|transcript|transcription|resync|status|transcribe|detailed-transcription))?$/,
   )
   if (match) {
     const [, id, action] = match
+    if (action === 'status' && method === 'GET') {
+      const status =
+        await env.DB.prepare(`SELECT r.id,r.revision,r.status,r.detailed_status,r.backup_step,r.backup_error,r.audio_key IS NOT NULL AS has_audio,r.edited_at AS updated_at,
+        (SELECT json_object('id',j.id,'recording_id',j.recording_id,'mode',j.mode,'status',j.status,'stage',j.stage,'progress',j.progress,'attempt',j.attempt,'error',j.error,'lease_until',j.lease_until,'updated_at',j.updated_at,'available_at',j.available_at) FROM transcription_jobs j WHERE j.recording_id=r.id AND mode='standard') AS transcription_json,
+        (SELECT json_object('id',j.id,'recording_id',j.recording_id,'mode',j.mode,'status',j.status,'stage',j.stage,'progress',j.progress,'attempt',j.attempt,'error',j.error,'lease_until',j.lease_until,'updated_at',j.updated_at,'available_at',j.available_at) FROM transcription_jobs j WHERE j.recording_id=r.id AND mode='detailed') AS detailed_json
+        FROM recordings r WHERE r.id=?`)
+          .bind(id)
+          .first()
+      if (!status) return json({ error: 'Recording not found' }, 404)
+      return json({
+        ...status,
+        has_audio: !!status.has_audio,
+        transcription: status.transcription_json ? JSON.parse(status.transcription_json) : null,
+        detailed_transcription: status.detailed_json ? JSON.parse(status.detailed_json) : null,
+        transcription_json: undefined,
+        detailed_json: undefined,
+      })
+    }
     let row = await env.DB.prepare('SELECT * FROM recordings WHERE id=?').bind(id).first()
     if (!row) return json({ error: 'Recording not found' }, 404)
-    if (action === 'transcribe' && method === 'POST') {
-      if (!env.TRANSCRIBER_WEBHOOK_URL || !env.UOMI_WEBHOOK_SECRET) return json({error:'Configure TRANSCRIBER_WEBHOOK_URL and UOMI_WEBHOOK_SECRET in Sites'},503)
-      ctx.waitUntil(notifyTranscriber(env,id,true))
-      return json({accepted:true},202)
+    if (action === 'manifest' && method === 'GET') return json(await loadManifest(env, row))
+    if (['transcription', 'transcribe'].includes(action) && method === 'POST') {
+      if (!row.audio_key)
+        throw new ApiError('Recording audio must be imported first', 409, 'audio_unavailable')
+      const data = request.body ? await body(request, 4096) : {}
+      if (data.retry !== undefined && typeof data.retry !== 'boolean')
+        throw new ApiError('retry must be a boolean')
+      return json(
+        {
+          transcription: jobView(
+            await enqueue(env, id, 'standard', data.retry === true || row.status === 'Failed'),
+          ),
+        },
+        202,
+      )
+    }
+    if (action === 'detailed-transcription' && ['GET', 'POST'].includes(method)) {
+      if (role !== 'owner') return json({ error: 'Owner access required' }, 403)
+      const data = method === 'POST' && request.body ? await body(request, 4096) : {}
+      if (data.retry !== undefined && typeof data.retry !== 'boolean')
+        throw new ApiError('retry must be a boolean')
+      return json(
+        await detailedTranscription(env, ctx, row, method === 'POST', data.retry === true),
+        method === 'POST' ? 202 : 200,
+      )
     }
     if (action === 'resync' && method === 'POST') {
       const store = new NotionStore(httpTransport(env.NOTION_TOKEN), env.NOTION_DATA_SOURCE_ID)
@@ -447,9 +704,7 @@ async function api(request: Request, env: any, ctx: any, role: string) {
       if (!row.audio_key)
         return json({ error: 'Legacy recording; audio has not been imported from Notion' }, 404)
       const range = request.headers.get('Range')
-      const object = await env.BUCKET.get(row.audio_key, {
-        ...(range ? { range: request.headers } : {}),
-      })
+      const object = await env.BUCKET.get(row.audio_key, range ? { range: request.headers } : {})
       if (!object) return json({ error: 'Audio missing' }, 404)
       const headers = new Headers({
         'Content-Type': 'audio/ogg',
@@ -468,6 +723,7 @@ async function api(request: Request, env: any, ctx: any, role: string) {
       return new Response(object.body, { status, headers })
     }
     if (action === 'backup' && method === 'POST') {
+      await env.DB.prepare('UPDATE recordings SET backup_next_attempt=0 WHERE id=?').bind(id).run()
       if (row.backup_step === 'uncertain') {
         const store = new NotionStore(httpTransport(env.NOTION_TOKEN), env.NOTION_DATA_SOURCE_ID)
         const page = await store.find(id)
@@ -491,41 +747,50 @@ async function api(request: Request, env: any, ctx: any, role: string) {
     if (!action && method === 'PATCH') {
       const data = await body(request, 4096)
       if (data.title !== undefined && (typeof data.title !== 'string' || data.title.length > 200))
-        throw Error('Invalid title')
+        throw new ApiError('Invalid title')
       if (data.starred !== undefined && typeof data.starred !== 'boolean')
-        throw Error('Invalid starred flag')
-      if (!row.backup_page && row.backup_step !== 'legacy')
-        throw Error('Wait for the Notion save before editing')
-      const store = new NotionStore(httpTransport(env.NOTION_TOKEN), env.NOTION_DATA_SOURCE_ID)
-      await store.setup()
-      const props: any = {}
-      if (data.title !== undefined)
-        props.Name = { title: [{ type: 'text', text: { content: data.title } }] }
-      if (data.starred !== undefined) props.Starred = { checkbox: data.starred }
-      await store.update(row.backup_page ?? id, props)
-      await env.DB.prepare('UPDATE recordings SET title=?,starred=? WHERE id=?')
+        throw new ApiError('Invalid starred flag')
+      await env.DB.prepare(
+        'UPDATE recordings SET title=?,starred=?,primary_owned=1,revision=revision+1 WHERE id=?',
+      )
         .bind(
           data.title ?? row.title,
           data.starred === undefined ? row.starred : Number(data.starred),
           id,
         )
         .run()
+      ctx.waitUntil(backup(env, id))
       return json({ saved: true })
     }
-    if (!action && method === 'GET')
+    if (!action && method === 'GET') {
+      const jobs = await env.DB.prepare('SELECT * FROM transcription_jobs WHERE recording_id=?')
+        .bind(id)
+        .all()
       return json({
+        transcription: jobView(jobs.results.find((j: any) => j.mode === 'standard')),
+        detailed_transcription: jobView(jobs.results.find((j: any) => j.mode === 'detailed')),
+        segments: JSON.parse(row.transcript_segments),
+        detailed_segments: JSON.parse(row.detailed_segments),
         id: row.id,
+        revision: row.revision,
         title: row.title,
         recorded_at: row.recorded_at,
         duration_ms: row.duration_ms ?? row.finished_at - row.recorded_at,
         status: row.status,
         text: row.text,
+        detailed_status: row.detailed_status,
+        detailed_text: row.detailed_text,
+        detailed_error: row.detailed_error,
         starred: !!row.starred,
         has_audio: !!row.audio_key,
         backup_step: row.backup_step,
         backup_error: row.backup_error,
+        backup_attempts: row.backup_attempts,
+        backup_next_attempt: row.backup_next_attempt,
+        backup_configured: !!(env.NOTION_TOKEN && env.NOTION_DATA_SOURCE_ID),
         url: row.url,
       })
+    }
   }
   if (path === '/api/jobs' && method === 'GET') {
     const { results } = await env.DB.prepare(
@@ -543,7 +808,7 @@ async function api(request: Request, env: any, ctx: any, role: string) {
     if (method === 'POST') {
       const data = await body(request, 4096)
       if (typeof data.name !== 'string' || !data.name.trim() || data.name.length > 100)
-        throw Error('Device name required')
+        throw new ApiError('Device name required')
       const secret = crypto.randomUUID() + crypto.randomUUID()
       const hash = await digest(new TextEncoder().encode(secret))
       await env.DB.prepare('INSERT INTO client_keys(hash,name,created_at) VALUES(?,?,?)')
@@ -572,17 +837,20 @@ export default {
     try {
       const path = new URL(request.url).pathname
       if (path === '/api/transcriber/completed' && request.method === 'POST') {
-        if (!(await webhookAuthorized(request,env.UOMI_WEBHOOK_SECRET))) return json({error:'Authentication required'},401)
-        const data = await body(request,4096)
-        return json(await refreshTranscript(env,data.pageId))
+        if (!(await webhookAuthorized(request, env.UOMI_WEBHOOK_SECRET)))
+          return json({ error: 'Authentication required' }, 401)
+        const data = await body(request, 4096)
+        if (data.mode !== undefined && !['standard', 'detailed'].includes(data.mode))
+          throw Error('Invalid transcription mode')
+        return json(await refreshTranscript(env, data.pageId))
       }
       if (path === '/health') return json({ ok: true })
       if (path === '/mcp') {
         if (request.method === 'POST' && visitor(request)) {
           const rpc: any = await request.clone().json()
-          if (rpc.method === 'tools/call' && rpc.params?.name === 'search_transcripts') await requireSearchReady(env)
+          if (rpc.method === 'tools/call' && rpc.params?.name === 'search_transcripts')
+            await requireSearchReady(env)
           if (rpc.method === 'tools/call' && rpc.params?.name === 'index_status') {
-            ctx.waitUntil(flushNotifications(env))
             const count = await env.DB.prepare(
               "SELECT count(*) AS recordings,sum(audio_key IS NOT NULL) AS cached_audio,sum(backup_step NOT IN ('done','legacy')) AS pending_notion_saves FROM recordings",
             ).first()
@@ -618,14 +886,22 @@ export default {
                   {
                     type: 'text',
                     text: JSON.stringify({
-                      configured: !!(env.NOTION_TOKEN && env.NOTION_DATA_SOURCE_ID),
-                      source: 'Notion',
+                      configured: !!(env.DB && env.BUCKET),
+                      backup_configured: !!(env.NOTION_TOKEN && env.NOTION_DATA_SOURCE_ID),
+                      source: 'D1/R2',
                       ...count,
                       sync: state,
                       optimization,
                       transcriber: {
-                        configured: !!(env.TRANSCRIBER_WEBHOOK_URL && env.UOMI_WEBHOOK_SECRET),
-                        ...(await env.DB.prepare('SELECT count(*) AS pending_notifications FROM transcriber_notifications WHERE delivered_at IS NULL').first()),
+                        transport: 'api',
+                        worker_auth_configured: !!(
+                          env.UOMI_WORKER_SECRET || env.UOMI_WEBHOOK_SECRET
+                        ),
+                        jobs: (
+                          await env.DB.prepare(
+                            'SELECT mode,status,count(*) AS count FROM transcription_jobs GROUP BY mode,status',
+                          ).all()
+                        ).results,
                       },
                       storage: {
                         database_bytes: storage.meta?.size_after ?? null,
@@ -636,7 +912,7 @@ export default {
                       },
                       limitations: [
                         'Recording-level time ranges; no word timestamps.',
-                        'Run sync_index or Web Recorder source resync to refresh persistent caches.',
+                        'Run sync_index to import historical Notion recordings; existing primary records remain unchanged.',
                       ],
                     }),
                   },
@@ -666,15 +942,50 @@ export default {
         return env.ASSETS ? env.ASSETS.fetch(request) : new Response('Not found', { status: 404 })
       const role = await authorize(request, env)
       if (!role) return json({ error: 'Authentication required' }, 401)
+      if (
+        role === 'worker' &&
+        !(
+          path === '/api/jobs' ||
+          path.startsWith('/api/jobs/') ||
+          path === '/api/migrations/notion' ||
+          (request.method === 'GET' &&
+            /^\/api\/recordings\/[a-zA-Z0-9-]+\/(audio|manifest)$/.test(path))
+        )
+      )
+        return json(
+          {
+            error: 'Worker credentials only permit transcription jobs and audio/manifest reads',
+            code: 'worker_scope_required',
+          },
+          403,
+        )
       if (request.method !== 'GET' && visitor(request)) {
         const origin = request.headers.get('Origin')
         if (origin && origin !== new URL(request.url).origin)
           return json({ error: 'Cross-origin write rejected' }, 403)
       }
-      ctx.waitUntil(flushNotifications(env))
+
       return await api(request, env, ctx, role)
     } catch (e) {
-      return json({ error: String((e as Error).message).slice(0, 1000) }, 400)
+      const requestId = crypto.randomUUID()
+      const message = String((e as Error).message).slice(0, 4000)
+      console.error(
+        JSON.stringify({
+          event: 'api_error',
+          request_id: requestId,
+          path: new URL(request.url).pathname,
+          error: message,
+          stack: (e as Error).stack,
+        }),
+      )
+      return json(
+        {
+          error: message,
+          code: e instanceof ApiError ? e.code : 'request_failed',
+          request_id: requestId,
+        },
+        e instanceof ApiError ? e.status : e instanceof SyntaxError ? 400 : 500,
+      )
     }
   },
 }

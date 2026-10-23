@@ -16,6 +16,7 @@ test('a malformed canonical manifest cannot replace a persistent cache', async (
             return this
           },
           first: async () => null,
+          run: async () => ({ meta: { changes: 1 } }),
         }
       },
       batch: async () => {
@@ -78,6 +79,7 @@ test('Notion source can rebuild audio, transcript and metadata into empty caches
             return this
           },
           first: async () => null,
+          run: async () => ({ meta: { changes: 1 } }),
         }
       },
       batch: async (statements) => {
@@ -162,9 +164,36 @@ test('resync is resumable, partitions capped results and invalidates archived so
     for (let i = 0; i < 5 && r.has_more; i++) r = await resync(f.env)
     assert.equal(r.has_more, false)
     assert.ok(queries >= 4)
-    assert.equal(f.sqlite.prepare('SELECT count(*) AS n FROM recordings').get().n, 0)
+    assert.equal(f.sqlite.prepare('SELECT count(*) AS n FROM recordings').get().n, 1)
   } finally {
     globalThis.fetch = original
+    f.sqlite.close()
+  }
+})
+
+test('incomplete historical Uploading page imports metadata with an explicit missing-audio warning and no transcription job', async () => {
+  const { fixture } = await import('./helpers.js'),
+    f = fixture()
+  try {
+    const result = await cachePage(f.env, {
+      id: 'incomplete-source',
+      last_edited_time: '2026-10-23T00:00:00Z',
+      properties: {
+        Status: { select: { name: 'Uploading' } },
+        'Transcript preview': { rich_text: [{ plain_text: 'Historical preview' }] },
+      },
+    })
+    assert.equal(result.cached, true)
+    assert.equal(result.audio_imported, false)
+    assert.equal(result.warning, 'missing_audio')
+    assert.deepEqual(result.missing_source_files, ['Audio', 'Manifest'])
+    const row = f.sqlite.prepare('SELECT * FROM recordings WHERE id=?').get('incomplete-source')
+    assert.equal(row.audio_key, null)
+    assert.equal(row.text, 'Historical preview')
+    assert.equal(f.sqlite.prepare('SELECT count(*) n FROM transcription_jobs').get().n, 0)
+    const repeated = await cachePage(f.env, { id: 'incomplete-source', properties: {} })
+    assert.equal(repeated.warning, 'missing_audio')
+  } finally {
     f.sqlite.close()
   }
 })

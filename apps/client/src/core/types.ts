@@ -28,6 +28,7 @@ export const defaults: Settings = {
   deviceAddress: '',
 }
 export interface Device {
+  warnings?: string[]
   address: string
   name: string
   serial?: string
@@ -64,8 +65,22 @@ export interface SyncProgress {
   chunkIndex?: number
   chunksTotal?: number
   chunksSubmitted?: number
+  chunksSaveFailed?: number
   chunksStaged?: number
   chunksCompleted?: number
+  chunksActive?: number
+  chunksPreparing?: number
+  concurrency?: number
+  transcription?: {
+    pending: number
+    processing: number
+    done: number
+    failed: number
+    errors: string[]
+  }
+  checkingSaves?: boolean
+  saveCheckedAt?: number
+  updatedAt?: number
   completed: number
   total: number
 }
@@ -91,6 +106,8 @@ export interface ImportRequest {
   finalRange: boolean
 }
 export interface Snapshot {
+  uploadJobs?: UploadStatus[]
+  jobStatusError?: string | null
   transfer?: ImportMetrics
   storageMigrationError?: string | null
   localPlans?: ChunkPlan[]
@@ -114,7 +131,26 @@ export interface Snapshot {
   wifi: boolean
   droppedPackets: string
 }
+export interface UploadStatus {
+  id: string
+  status: 'missing' | 'pending' | 'saved' | 'failed'
+  error?: string | null
+  transcription?: {
+    id: string
+    status: string
+    stage: string
+    progress: number
+    attempt: number
+    error?: string | null
+    updated_at?: number | null
+  } | null
+  backup_status?: string
+  backup_error?: string | null
+}
 export interface Port {
+  acknowledgeAudio?: (updates: { key: string; uploaded: number; target: string }[]) => Promise<void>
+  uploadStatus?: (endpoint: string, header: string, ids: string[]) => Promise<UploadStatus[]>
+
   optimizeAudio?: () => Promise<number>
   importRing?: (
     request: ImportRequest,
@@ -187,6 +223,7 @@ export interface Port {
     body: string,
     compression: Compression,
     id: string,
+    binary?: boolean,
   ): Promise<boolean | void>
 }
 export function validateSettings(s: Settings): void {
@@ -196,7 +233,7 @@ export function validateSettings(s: Settings): void {
   if (s.endpoint) {
     const u = new URL(s.endpoint)
     if (u.protocol !== 'https:' || u.username || u.password || u.hash)
-      throw Error('Use an HTTPS webhook URL without credentials or a fragment.')
+      throw Error('Use an HTTPS API URL without credentials or a fragment.')
   }
   if (
     !/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(s.secretHeader) ||

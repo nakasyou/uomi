@@ -68,6 +68,7 @@ class UomiModule(private val context: ReactApplicationContext) :
                 execSQL(
                     "CREATE INDEX IF NOT EXISTS notion_time ON notion_index(target,start,device)"
                 )
+                execSQL("CREATE INDEX IF NOT EXISTS notion_target_order ON notion_index(target,start DESC,key DESC)")
             }
     private val adapter
         get() =
@@ -107,19 +108,16 @@ class UomiModule(private val context: ReactApplicationContext) :
             Base64.encodeToString(OggOpus.mux(packets), Base64.NO_WRAP)
         }
 
-    private fun getValue(key: String): String? {
-        val raw =
-            db.rawQuery("SELECT value FROM kv WHERE key=?", arrayOf(key)).use {
-                if (it.moveToFirst()) it.getString(0) else null
-            } ?: return null
+    private fun storedValue(key: String, raw: String, bytes: ByteArray?): String {
         if (!key.startsWith("record:") || JSONObject(raw).optInt("binaryAudio") != 1) return raw
-        val bytes =
-            db.rawQuery("SELECT data FROM recording_audio WHERE key=?", arrayOf(key)).use {
-                check(it.moveToFirst()) { "Missing binary audio" }
-                it.getBlob(0)
-            }
+        check(bytes != null) { "Missing binary audio" }
         return BinaryAudio.unpack(raw, bytes)
     }
+
+    private fun getValue(key: String): String? =
+        db.rawQuery("SELECT k.value,a.data FROM kv k LEFT JOIN recording_audio a ON a.key=k.key WHERE k.key=?", arrayOf(key)).use {
+            if (!it.moveToFirst()) null else storedValue(key, it.getString(0), if (it.isNull(1)) null else it.getBlob(1))
+        }
 
     private fun recordIndex(raw: String): String {
         val record = JSONObject(raw)
@@ -190,21 +188,57 @@ class UomiModule(private val context: ReactApplicationContext) :
     }
 
     @ReactMethod
-    fun getMany(json: String, p: Promise) =
-        operation(p) {
-            val keys = org.json.JSONArray(json)
-            require(keys.length() <= 256)
-            val out = Arguments.createArray()
-            for (i in 0 until keys.length()) {
-                val key = keys.getString(i)
-                val value = getValue(key) ?: continue
-                val entry = Arguments.createMap()
-                entry.putString("key", key)
-                entry.putString("value", value)
-                out.pushMap(entry)
+    fun getMany(json: String, p: Promise) = operation(p) {
+        val requested = org.json.JSONArray(json)
+        require(requested.length() <= 256) { "Too many storage keys" }
+        val keys = (0 until requested.length()).map { requested.getString(it) }
+        val values = mutableMapOf<String, String>()
+        if (keys.isNotEmpty()) {
+            val placeholders = keys.joinToString(",") { "?" }
+            db.rawQuery("SELECT k.key,k.value,a.data FROM kv k LEFT JOIN recording_audio a ON a.key=k.key WHERE k.key IN ($placeholders)", keys.toTypedArray()).use {
+                while (it.moveToNext()) {
+                    val key = it.getString(0)
+                    values[key] = storedValue(key, it.getString(1), if (it.isNull(2)) null else it.getBlob(2))
+                }
             }
-            out
         }
+        val out = Arguments.createArray()
+        for (key in keys) values[key]?.let { value ->
+            val entry = Arguments.createMap()
+            entry.putString("key", key); entry.putString("value", value); out.pushMap(entry)
+        }
+        out
+    }
+
+    @ReactMethod
+    fun acknowledgeAudio(json: String, p: Promise) = operation(p) {
+        val updates = org.json.JSONArray(json)
+        require(updates.length() <= 256) { "Too many acknowledgement updates" }
+        db.beginTransaction()
+        try {
+            for (i in 0 until updates.length()) {
+                val update = updates.getJSONObject(i)
+                val key = update.getString("key")
+                val target = update.getString("target")
+                val uploaded = update.getInt("uploaded")
+                require(key.startsWith("record:") && uploaded >= 0) { "Invalid acknowledgement" }
+                db.rawQuery("SELECT k.value,i.value FROM kv k JOIN record_index i ON i.key=k.key WHERE k.key=?", arrayOf(key)).use {
+                    check(it.moveToFirst()) { "Missing source recording metadata" }
+                    val stored = JSONObject(it.getString(0))
+                    val summary = JSONObject(it.getString(1))
+                    require(uploaded <= summary.getInt("frameCount")) { "Acknowledgement exceeds source frames" }
+                    if (summary.optString("notionTarget") == target && summary.optInt("uploaded") > uploaded) return@use
+                    summary.put("uploaded", uploaded).put("notionTarget", target)
+                    val record = if (stored.optInt("binaryAudio") == 1) stored.getJSONObject("record") else stored
+                    record.put("uploaded", uploaded).put("notionTarget", target)
+                    db.execSQL("UPDATE kv SET value=? WHERE key=? AND value!=?", arrayOf(stored.toString(), key, stored.toString()))
+                    db.execSQL("UPDATE record_index SET value=? WHERE key=? AND value!=?", arrayOf(summary.toString(), key, summary.toString()))
+                }
+            }
+            db.setTransactionSuccessful()
+        } finally { db.endTransaction() }
+        null
+    }
 
     @ReactMethod
     fun mirrorEntries(json: String, p: Promise) =
@@ -249,7 +283,7 @@ class UomiModule(private val context: ReactApplicationContext) :
         operation(p) {
             val rows = mutableListOf<Pair<String, String>>()
             db.rawQuery(
-                    "SELECT k.key,k.value FROM kv k LEFT JOIN recording_audio a ON a.key=k.key WHERE k.key>='record:' AND k.key<'record;' AND a.key IS NULL LIMIT 128",
+                    "SELECT k.key,k.value FROM kv k LEFT JOIN recording_audio a ON a.key=k.key WHERE k.key>='record:' AND k.key<'record;' AND a.key IS NULL ORDER BY k.key LIMIT 128",
                     null,
                 )
                 .use { while (it.moveToNext()) rows.add(it.getString(0) to it.getString(1)) }
@@ -360,8 +394,8 @@ class UomiModule(private val context: ReactApplicationContext) :
         operation(p) {
             val out = Arguments.createArray()
             db.rawQuery(
-                    "SELECT key FROM kv WHERE substr(key,1,?)=? ORDER BY key",
-                    arrayOf(prefix.length.toString(), prefix),
+                    "SELECT key FROM kv WHERE key>=? AND key<? ORDER BY key",
+                    arrayOf(prefix, prefix + String(Character.toChars(0x10ffff))),
                 )
                 .use { while (it.moveToNext()) out.pushString(it.getString(0)) }
             out
@@ -372,14 +406,14 @@ class UomiModule(private val context: ReactApplicationContext) :
         operation(p) {
             val out = Arguments.createArray()
             db.rawQuery(
-                    "SELECT key,value FROM kv WHERE key>=? AND key<? AND key>? ORDER BY key LIMIT 256",
+                    "SELECT k.key,k.value,a.data FROM kv k LEFT JOIN recording_audio a ON a.key=k.key WHERE k.key>=? AND k.key<? AND k.key>? ORDER BY k.key LIMIT 256",
                     arrayOf(prefix, prefix + String(Character.toChars(0x10ffff)), after),
                 )
                 .use {
                     while (it.moveToNext()) {
                         val entry = Arguments.createMap()
                         entry.putString("key", it.getString(0))
-                        entry.putString("value", getValue(it.getString(0)))
+                        entry.putString("value", storedValue(it.getString(0), it.getString(1), if (it.isNull(2)) null else it.getBlob(2)))
                         out.pushMap(entry)
                     }
                 }
@@ -639,7 +673,7 @@ class UomiModule(private val context: ReactApplicationContext) :
             val url = URL(endpoint)
             require(url.protocol == "https" && url.userInfo == null)
             val token = getSecret("transcriber")
-            check(token.isNotEmpty()) { "Set a transcriber webhook secret" }
+            check(token.isNotEmpty()) { "Set a transcriber API secret" }
             val c = url.openConnection() as HttpURLConnection
             try {
                 c.instanceFollowRedirects = false
@@ -1176,19 +1210,50 @@ class UomiModule(private val context: ReactApplicationContext) :
         }
 
     @ReactMethod
+    fun uploadStatus(endpoint: String, header: String, ids: String, p: Promise) =
+        operation(p, networkWorkers) {
+            val target = URL(endpoint)
+            require(target.protocol == "https" && target.userInfo == null) { "Use an HTTPS API URL." }
+            require(!header.contains('\r') && !header.contains('\n'))
+            val url = URL(target.protocol, target.host, target.port, target.path.trimEnd('/') + "/status")
+            val secret = getSecret("sites-api")
+            check(secret.isNotEmpty()) { "Set your API key in Settings." }
+            val connection = url.openConnection() as HttpURLConnection
+            try {
+                connection.requestMethod = "POST"
+                connection.instanceFollowRedirects = false
+                connection.connectTimeout = 30000
+                connection.readTimeout = 30000
+                connection.doOutput = true
+                connection.setRequestProperty("Content-Type", "application/json")
+                connection.setRequestProperty(header, secret)
+                val access = getSecret("sites-access")
+                if (access.isNotEmpty()) connection.setRequestProperty("OAI-Sites-Authorization", "Bearer $access")
+                val bytes = JSONObject().put("ids", org.json.JSONArray(ids)).toString().toByteArray(Charsets.UTF_8)
+                connection.setFixedLengthStreamingMode(bytes.size)
+                connection.outputStream.use { it.write(bytes) }
+                check(connection.responseCode in 200..299) {
+                    "Upload status HTTP ${connection.responseCode}: ${connection.errorStream?.bufferedReader()?.use { it.readText().take(2000) } ?: connection.responseMessage}. Audio stays local."
+                }
+                JSONObject(connection.inputStream.bufferedReader().readText()).getJSONArray("uploads").toString()
+            } finally { connection.disconnect() }
+        }
+
+    @ReactMethod
     fun post(
         endpoint: String,
         header: String,
         body: String,
         compression: String,
         id: String,
+        binary: Boolean,
         p: Promise,
     ) =
-        operation(p) {
+        operation(p, networkWorkers) {
             val url = URL(endpoint)
-            require(url.protocol == "https" && url.userInfo == null) { "Use an HTTPS webhook URL." }
+            require(url.protocol == "https" && url.userInfo == null) { "Use an HTTPS API URL." }
             require(!header.contains('\r') && !header.contains('\n'))
-            val raw = body.toByteArray(Charsets.UTF_8)
+            val raw = if (binary) Base64.decode(body, Base64.DEFAULT) else body.toByteArray(Charsets.UTF_8)
             val bytes =
                 if (compression == "none") raw
                 else
@@ -1198,29 +1263,32 @@ class UomiModule(private val context: ReactApplicationContext) :
                         out.toByteArray()
                     }
             val secret = getSecret("sites-api")
-            check(secret.isNotEmpty()) { "Set a webhook secret in Settings." }
+            check(secret.isNotEmpty()) { "Set your API key in Settings." }
             val connection = url.openConnection() as HttpURLConnection
             try {
                 connection.requestMethod = "POST"
                 connection.instanceFollowRedirects = false
                 connection.connectTimeout = 30000
-                connection.readTimeout = 30000
+                connection.readTimeout = 120000
                 connection.doOutput = true
-                connection.setRequestProperty("Content-Type", "application/vnd.uomi.audio+json")
+                connection.setRequestProperty("Content-Type", if (binary) "application/vnd.uomi.ogg" else "application/vnd.uomi.audio+json")
                 if (compression != "none")
                     connection.setRequestProperty("Content-Encoding", compression)
                 connection.setRequestProperty(header, secret)
                 val access = getSecret("sites-access")
                 if (access.isNotEmpty()) connection.setRequestProperty("OAI-Sites-Authorization", "Bearer $access")
                 connection.setRequestProperty("Idempotency-Key", id)
-                connection.setRequestProperty("X-Uomi-Schema", "1")
+                connection.setRequestProperty("X-Uomi-Schema", if (binary) "2" else "1")
                 connection.setFixedLengthStreamingMode(bytes.size)
                 connection.outputStream.use { it.write(bytes) }
                 val status = connection.responseCode
                 check(status in 200..299) {
-                    "Webhook returned HTTP $status. Audio stays queued; sync again to retry."
+                    "Audio upload HTTP $status: ${connection.errorStream?.bufferedReader()?.use { it.readText().take(2000) } ?: connection.responseMessage}. Audio stays queued."
                 }
-                JSONObject(connection.inputStream.bufferedReader().readText()).optBoolean("notion_saved", false)
+                val receipt = JSONObject(connection.inputStream.bufferedReader().use { it.readText() })
+                check(receipt.optString("id") == id) { "Upload receipt identity does not match. Audio stays local." }
+                check(receipt.has("saved") && receipt.get("saved") is Boolean) { "Upload receipt does not confirm server storage. Audio stays local." }
+                receipt.getBoolean("saved")
             } finally {
                 connection.disconnect()
             }

@@ -14,7 +14,6 @@
     "typecheck": "tsc --noEmit",
     "test": "tsx --test tests/*.test.ts",
     "check": "bun run typecheck && bun run test && bun run build:web",
-    "test:receiver": "python3 -m unittest discover -s tests -p '*_test.py'",
     "linux:check": "cargo check --manifest-path src-tauri/Cargo.toml"
   },
   "dependencies": {

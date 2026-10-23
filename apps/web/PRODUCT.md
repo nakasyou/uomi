@@ -1,10 +1,14 @@
-# Uomi Web Recorder
+# Uomi Recorder
 
-Single-owner web app. Notion is the source of truth for original Ogg Opus audio,
-recording manifests, metadata and transcripts. D1 is a persistent metadata/full-text
-cache; R2 is a persistent audio cache and temporary upload staging area.
-The capture client imports Omi audio locally and sends one chunk per request.
-A staging receipt does not acknowledge a canonical Notion save. Local audio remains
-until a later sync confirms Notion storage. Web UI handles search, playback, text,
-source resync and device credentials. Existing Bun daemon transcribes Notion pages.
-No word timestamps, fabricated waveform or diarization are claimed.
+Single-owner recorder. D1 owns recording metadata, transcript results and durable
+transcription jobs; R2 owns uploaded Ogg Opus audio and manifests. A verified R2
+write plus committed D1 metadata acknowledges a saved recording to the client.
+Notion is optional asynchronous backup and a migration source for earlier recordings.
+Its availability never blocks capture, saved receipts, playback or transcription.
+
+The capture client stores originals locally, uploads bounded independently retriable
+chunks and displays server storage and transcription states separately. The web UI
+supports search, playback, title/star edits, job progress, errors and retries. The
+Mac mini daemon claims leased API jobs, reports progress, and commits fenced results.
+Results accept timestamped segments and optional speaker identifiers; the UI only
+shows timestamps/speakers actually returned by the provider.

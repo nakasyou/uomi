@@ -126,3 +126,66 @@ The paused-error UI was inspected with fixture data at desktop and compact width
 Reconciliation reports checked cached pages against a native SQL count, including manifest checks and saved-audio verification. Notion pagination reports fetched page counts while its total is unknown. Checkpoint discovery/restoration, local index loading, source-ID indexing, acknowledgement writes and chunk planning report their own work units. Planning reports sorting, merging (cooperative planner), continuity checks and generated chunk counts. Unknown totals display processed counts without a fabricated percentage or ETA.
 
 All 86 client tests and 19 shared/daemon tests pass. The added regressions cover monotonic planner progress with unchanged chunk boundaries, progress text for known/unknown totals, and reconciliation/checkpoint restoration on retry. All 14 Rust tests pass; Linux debug build, Android Kotlin compilation, web build, typecheck and scoped format/lint checks pass. An actual browser Worker planned 3,000 synthetic recording indexes into the same five chunks as the synchronous planner while emitting loading/sorting/grouping/planning progress. Desktop and compact Devices previews display page counts, percentages and planned chunk counts without overlap. No personal audio, live Notion upload, deletion or app restart was used for verification. Native page-count support requires rebuilding/restarting the native client; older backends fall back to processed counts.
+
+## Detailed transcription production release — 2026-10-23
+
+The owner-private Sites deployment `appgdep_6adb648cfa748191b8df91154d329dd1`
+succeeded using source commit `541bb8aca140ac807ec9029cfc55578ffda32c83`.
+The deployed D1 history includes `0003_transcription.sql` and
+`0004_detailed_transcription.sql`; these are now applied and immutable. Subsequent
+migrations must follow that history rather than reuse index 4.
+
+Mac mini builds Uomi revision `59c88798911d215f68c67ceff9ce1814e7455099`
+from the `codex/detailed-transcription-release` branch. It includes the existing
+canonical-completion gating fix and independent standard/detailed callback outboxes.
+The pin and source hash are persisted in `~/dotfiles/pkgs/uomi-transcriber.nix`;
+`result-uomi-detailed` retains the built nix-darwin closure. Sudo was unavailable,
+so only the Nix-generated user LaunchAgent was installed/reloaded; a system-wide
+switch was not performed. The daemon is running from the new Nix package, with
+Chrome recognition and 900-second splits as the standard configuration.
+
+Verified: production deployment success and detailed D1 columns; local daemon
+health; webhook auth rejects unauthenticated requests and invalid detailed page
+IDs; a synthetic spoken deployment sample transcribes successfully through the
+actual Codex provider on Mac mini. No personal recording was used for the Codex
+smoke test. The standalone browser requires ChatGPT sign-in, so owner-session
+production UI interactions were not automated. The recording controls and state
+transitions were exercised using labeled development fixtures before publishing.
+
+## Primary storage and durable API migration — 2026-10-23
+
+This release changes the storage contract: verified audio/manifests in R2 plus a
+committed D1 recording/source transaction confirm a server save. Notion backup
+runs independently; it cannot block acknowledgements, primary edits or API
+transcription. Earlier deployed migrations 0000–0004 are preserved; 0005 adds
+fenced transcription jobs, backup retries, primary ownership, segments and receipt
+aliases. 0006 adds indexes for active work and bounded history queries.
+
+Local verification includes full TypeScript checks, client/web/shared/daemon
+regressions, Linux native tests/build, Android Kotlin compilation and APK build.
+API worker integration uses the actual API with SQLite/R2 fixtures, real ffmpeg
+decoding, worker authentication, progress and a saved transcript. Failure tests
+cover lost completion responses, restart checkpoints, expired leases, SHA mismatch,
+Notion outages, conflicting source ranges and migration replay preserving edits.
+
+Web desktop/mobile checks cover layout, modal focus/Escape, HTTP diagnostics and
+rename failure preserving user input. A simulated 503 displays operation, status,
+server message and request ID. No horizontal overflow at 390px. The Impeccable
+font warning is intentionally retained: Roboto is the pinned Material visual
+reference. Client desktop/mobile fixtures pass its detector. Used client icons
+are subset to 2.1KB instead of a 1.3MB font; client JS falls from 838KB to 651KB.
+
+No Android device is attached to ADB, and the configured Omi was not visible to
+Bluetooth during verification. Native app screenshot capture failed on offscreen
+Wayland bounds. These checks do not prove a new physical-device import or a
+real-device Android installation; the existing local audio was not deleted.
+
+Client database optimization was measured read-only against 543,292 key/value
+rows and 63,473 audio records. Prefix filtering changed from a covering-index scan
+to a bounded primary-key search. Five alternating warmed samples gave medians
+76.8→22.6ms for `record:` and 56.3→0.033ms for `cursor:` on this machine. These are
+local measurements, not service latency guarantees. Joined/bounded reads remove
+per-row audio lookups, and native receipt updates modify only metadata in a
+transaction. A regression forbids audio BLOB INSERT/UPDATE/DELETE while verifying
+acknowledgements, monotonic frame counts and rollback. Existing indexed catalog
+cursor seeks were retained. Client checks now include 78 TS and 17 Rust tests.

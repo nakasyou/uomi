@@ -37,40 +37,52 @@ function SyncApp() {
     [access, setAccess] = useState(''),
     [devices, setDevices] = useState<Device[]>([]),
     [scanning, setScanning] = useState(false),
-    [message, setMessage] = useState('')
+    [message, setMessage] = useState(''),
+    [operationError, setOperationError] = useState(''),
+    [acting, setActing] = useState(false),
+    [gain, setGain] = useState<string | null>(null)
   useEffect(() => {
-    void client.init().catch((e) => setMessage(String(e)))
+    void client.init().catch((e) => setOperationError(String(e)))
   }, [])
   useEffect(() => {
     setDraft(state.settings)
   }, [state.settings])
   const action = async (fn: () => Promise<unknown>) => {
+    if (acting) return
+    setActing(true)
+    setOperationError('')
     try {
       await fn()
     } catch (e) {
-      setMessage(e instanceof Error ? e.message : String(e))
+      setOperationError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setActing(false)
     }
   }
   const records =
       state.catalog ?? state.recordings.map((r) => ({ ...r, frameCount: r.frames.length })),
     pending = records.filter((r) => r.uploaded < r.frameCount).length
-  const viewer = () => {
+  const recorder = (() => {
+    if (!state.settings.endpoint) return { url: '', error: null }
     try {
-      return new URL(state.settings.endpoint).origin
-    } catch {
-      return ''
+      return { url: new URL(state.settings.endpoint).origin, error: null }
+    } catch (error) {
+      return { url: '', error: `Invalid saved API URL: ${String(error)}. Update Settings.` }
     }
-  }
-  const busy = state.busy || scanning
+  })()
+  const busy = state.busy || scanning || acting
   return (
     <SafeAreaView style={{ flex: 1, backgroundColor: theme.colors.background }}>
       <ScrollView contentContainerStyle={styles.page} keyboardShouldPersistTaps="handled">
         <View style={styles.header}>
           <View>
             <Text variant="headlineLarge">Uomi</Text>
-            <Text variant="bodyMedium">Capture here. Listen on the web.</Text>
           </View>
-          <Button mode="text" disabled={!viewer()} onPress={() => void Linking.openURL(viewer())}>
+          <Button
+            mode="text"
+            disabled={!recorder.url}
+            onPress={() => void action(() => Linking.openURL(recorder.url))}
+          >
             Open Recorder
           </Button>
         </View>
@@ -82,21 +94,55 @@ function SyncApp() {
             { value: 'settings', label: 'Settings' },
           ]}
         />
+        {(operationError ||
+          recorder.error ||
+          state.error ||
+          state.jobStatusError ||
+          state.storageMigrationError) && (
+          <View accessibilityRole="alert" style={styles.error}>
+            <Text selectable style={{ color: theme.colors.error }}>
+              {[
+                operationError,
+                recorder.error,
+                state.error,
+                state.jobStatusError,
+                state.storageMigrationError,
+              ]
+                .filter(Boolean)
+                .join('\n')}
+            </Text>
+          </View>
+        )}
         {tab === 'sync' ? (
           <View style={styles.section}>
             <Text variant="headlineMedium">
               {state.busy
-                ? 'Syncing recordings'
-                : pending
-                  ? `${pending} recordings to sync`
-                  : 'Ready to sync'}
+                ? state.progress?.stage === 'upload'
+                  ? 'Uploading audio'
+                  : 'Syncing recordings'
+                : state.progress?.stage === 'upload'
+                  ? 'Upload summary'
+                  : pending
+                    ? 'Audio ready to sync'
+                    : 'Ready to sync'}
             </Text>
-            <Text variant="bodyLarge">{state.phase}</Text>
-            {state.progress && <SyncProgressView progress={state.progress} transfer={state.transfer} />}
-            {state.error && (
-              <Text accessibilityRole="alert" style={{ color: theme.colors.error }}>
-                {state.error}
-              </Text>
+            <Text variant="bodyLarge" accessibilityLiveRegion="polite">
+              {state.phase}
+            </Text>
+            <Text variant="bodyMedium">
+              {pending} recordings waiting · {records.length - pending} saved on server
+            </Text>
+            {(!state.settings.endpoint || !state.hasSecret) && (
+              <Button mode="contained" onPress={() => setTab('settings')}>
+                Set up server connection
+              </Button>
+            )}
+            {state.progress && (
+              <SyncProgressView
+                progress={state.progress}
+                transfer={state.transfer}
+                active={state.busy}
+              />
             )}
             <View style={styles.actions}>
               <Button
@@ -110,20 +156,41 @@ function SyncApp() {
                 }
                 onPress={() => void action(() => client.sync())}
               >
-                Import & sync
+                Import & upload
               </Button>
               <Button
                 mode="outlined"
                 disabled={busy || !state.settings.endpoint || !state.hasSecret}
                 onPress={() => void action(() => client.syncCloud())}
               >
-                Send saved audio
+                Upload local audio
               </Button>
             </View>
-            <Text variant="bodyMedium">
-              Original Opus audio is cached on Sites, then saved to Notion. Sync again to confirm
-              pending saves. Local recordings stay here until you explicitly clear uploaded copies.
-            </Text>
+            {!!state.uploadJobs?.length && (
+              <View style={styles.jobs}>
+                <Text variant="titleMedium">Transcription</Text>
+                {state.uploadJobs.map((upload) => (
+                  <View key={upload.id} style={styles.job}>
+                    <Text variant="bodyMedium" selectable>
+                      {upload.id.slice(0, 12)} ·{' '}
+                      {upload.transcription
+                        ? `${upload.transcription.status} · ${upload.transcription.stage} · ${Math.round(upload.transcription.progress * 100)}%`
+                        : 'Not queued'}
+                    </Text>
+                    {!!upload.transcription?.error && (
+                      <Text selectable style={{ color: theme.colors.error }}>
+                        {upload.transcription.error}
+                      </Text>
+                    )}
+                    {!!upload.backup_error && (
+                      <Text selectable style={{ color: theme.colors.error }}>
+                        Notion backup: {upload.backup_error}
+                      </Text>
+                    )}
+                  </View>
+                ))}
+              </View>
+            )}
             <Divider />
             <Text variant="titleLarge">Omi device</Text>
             {state.device ? (
@@ -132,6 +199,19 @@ function SyncApp() {
                   title={state.device.name}
                   description={`${state.device.address}${state.device.battery !== undefined ? ` · ${state.device.battery}% battery` : ''}`}
                 />
+                {!!state.device.warnings?.length && (
+                  <List.Accordion title={`Device diagnostics (${state.device.warnings.length})`}>
+                    {state.device.warnings.map((warning) => (
+                      <Text
+                        key={warning}
+                        selectable
+                        style={{ color: theme.colors.onSurfaceVariant }}
+                      >
+                        {warning}
+                      </Text>
+                    ))}
+                  </List.Accordion>
+                )}
                 <View style={styles.actions}>
                   <Button disabled={busy} onPress={() => void action(() => client.importDevice())}>
                     Import only
@@ -140,15 +220,29 @@ function SyncApp() {
                     Disconnect
                   </Button>
                 </View>
-                <TextInput
-                  mode="outlined"
-                  label="Microphone gain (0–30)"
-                  keyboardType="numeric"
-                  defaultValue={String(state.device.micGain ?? 10)}
-                  onSubmitEditing={(e) =>
-                    void action(() => client.micGain(Number(e.nativeEvent.text)))
-                  }
-                />
+                <View style={styles.actions}>
+                  <TextInput
+                    mode="outlined"
+                    label="Microphone gain (0–8)"
+                    keyboardType="numeric"
+                    style={styles.gain}
+                    value={gain ?? String(state.device.micGain ?? '')}
+                    onChangeText={setGain}
+                  />
+                  <Button
+                    mode="outlined"
+                    disabled={busy || !gain}
+                    onPress={() =>
+                      void action(async () => {
+                        await client.micGain(Number(gain))
+                        setGain(null)
+                        setMessage('Microphone gain saved')
+                      })
+                    }
+                  >
+                    Apply gain
+                  </Button>
+                </View>
               </>
             ) : (
               <Text>Pair Omi to import its saved recordings.</Text>
@@ -159,9 +253,12 @@ function SyncApp() {
               disabled={busy}
               onPress={() => {
                 setScanning(true)
-                void action(async () => setDevices(await client.scan())).finally(() =>
-                  setScanning(false),
-                )
+                void action(async () => {
+                  const found = await client.scan()
+                  setDevices(found)
+                  if (!found.length)
+                    setMessage('No Omi found. Check Bluetooth and move the device closer.')
+                }).finally(() => setScanning(false))
               }}
             >
               Find Omi
@@ -171,6 +268,7 @@ function SyncApp() {
                 key={d.address}
                 title={d.name}
                 description={d.address}
+                disabled={busy}
                 onPress={() =>
                   void action(async () => {
                     await client.pair(d)
@@ -188,24 +286,28 @@ function SyncApp() {
               Last upload: {state.lastSync ? new Date(state.lastSync).toLocaleString() : 'Not yet'}
             </Text>
             <Text>Network: {state.wifi ? 'Wi-Fi available' : 'Wi-Fi unavailable'}</Text>
-            <Button disabled={busy} onPress={() => void action(() => client.clearDelivered())}>
-              Clear uploaded local copies
+            <Button
+              disabled={busy || records.length === pending}
+              onPress={() =>
+                void action(async () => {
+                  await client.clearDelivered()
+                  setMessage('Saved local copies removed')
+                })
+              }
+            >
+              Remove saved local copies
             </Button>
             <Text variant="bodySmall">
-              This removes only audio confirmed saved to Notion through your current Sites
-              destination. It does not delete R2 or Notion data.
+              Removes local audio only after server storage is confirmed.
             </Text>
           </View>
         ) : (
           <View style={styles.section}>
             <Text variant="headlineMedium">Connect to Recorder</Text>
-            <Text>
-              In the Web Recorder, open Devices and create an access key. Copy its upload URL, API
-              key and Sites access token below.
-            </Text>
+            <Text>Create an access key in Recorder → Devices.</Text>
             <TextInput
               mode="outlined"
-              label="Upload URL"
+              label="API upload URL"
               autoCapitalize="none"
               value={draft.endpoint}
               onChangeText={(endpoint) => setDraft({ ...draft, endpoint })}
@@ -243,16 +345,21 @@ function SyncApp() {
               value={String(draft.segmentSeconds)}
               onChangeText={(v) => setDraft({ ...draft, segmentSeconds: Number(v) })}
             />
-            <TextInput
-              mode="outlined"
-              label="Periodic interval (hours)"
-              keyboardType="numeric"
-              value={String(draft.intervalHours)}
-              onChangeText={(v) => setDraft({ ...draft, intervalHours: Number(v) })}
-            />
-            <Text>
-              Manual mode runs only when requested. Periodic mode uses Wi-Fi jobs. Real-time mode
-              keeps native background work active.
+            {draft.mode === 'periodic' && (
+              <TextInput
+                mode="outlined"
+                label="Periodic interval (hours)"
+                keyboardType="numeric"
+                value={String(draft.intervalHours)}
+                onChangeText={(v) => setDraft({ ...draft, intervalHours: Number(v) })}
+              />
+            )}
+            <Text variant="bodySmall">
+              {draft.mode === 'periodic'
+                ? 'Syncs on Wi-Fi at the interval above.'
+                : draft.mode === 'realtime'
+                  ? 'Imports continuously while the background service runs.'
+                  : 'Syncs when you press Import & upload.'}
             </Text>
             <Button
               mode="contained"
@@ -302,5 +409,9 @@ const styles = StyleSheet.create({
     flexWrap: 'wrap',
   },
   section: { gap: 20 },
+  error: { gap: 8 },
+  jobs: { gap: 12 },
+  job: { gap: 4, minWidth: 0 },
+  gain: { flexGrow: 1, minWidth: 180 },
   actions: { flexDirection: 'row', flexWrap: 'wrap', gap: 12 },
 })

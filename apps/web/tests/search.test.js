@@ -6,11 +6,22 @@ import { normalizeSearch } from '../worker/search.js'
 import worker, { searchPlan, time } from '../worker/index.js'
 function database() {
   const db = new DatabaseSync(':memory:')
-  for (const name of ['0000_index.sql','0001_primary.sql','0002_compact.sql']) db.exec(readFileSync(new URL('../drizzle/' + name, import.meta.url), 'utf8'))
+  for (const name of [
+    '0000_index.sql',
+    '0001_primary.sql',
+    '0002_compact.sql',
+    '0003_transcription.sql',
+    '0004_detailed_transcription.sql',
+    '0005_jobs.sql',
+    '0006_query_performance.sql',
+  ])
+    db.exec(readFileSync(new URL('../drizzle/' + name, import.meta.url), 'utf8'))
   return db
 }
 function insert(db, id, start, end, text) {
-  db.prepare('INSERT INTO recordings(id,recorded_at,finished_at,edited_at,device,status,url,text,search_text,search_version) VALUES(?,?,?,?,?,?,?,?,?,1)').run(
+  db.prepare(
+    'INSERT INTO recordings(id,recorded_at,finished_at,edited_at,device,status,url,text,search_text,search_version) VALUES(?,?,?,?,?,?,?,?,?,1)',
+  ).run(
     id,
     start,
     end,
@@ -123,7 +134,14 @@ test('normalized kana, width, case, spaces and two-character literal fallback sh
   insert(db, 'a', 0, 100, raw)
   for (const query of ['学校', '学校生活', 'chat gpt', 'かたかな', 'カタカナ', '０％', '_x']) {
     const p = searchPlan({ query })
-    assert.deepEqual(db.prepare(p.sql).all(...p.args).map(x => x.id), ['a'], query)
+    assert.deepEqual(
+      db
+        .prepare(p.sql)
+        .all(...p.args)
+        .map((x) => x.id),
+      ['a'],
+      query,
+    )
   }
   for (const query of ['0_', '%x', 'かたなく']) {
     const p = searchPlan({ query })
@@ -131,7 +149,11 @@ test('normalized kana, width, case, spaces and two-character literal fallback sh
   }
   assert.equal(db.prepare('SELECT text FROM recordings').get().text, raw)
   const rid = db.prepare('SELECT rid FROM recordings').get().rid
-  db.prepare('UPDATE recordings SET text=?,search_text=? WHERE id=?').run('別の原文', normalizeSearch('別の原文'), 'a')
+  db.prepare('UPDATE recordings SET text=?,search_text=? WHERE id=?').run(
+    '別の原文',
+    normalizeSearch('別の原文'),
+    'a',
+  )
   let p = searchPlan({ query: '学校生活' })
   assert.equal(db.prepare(p.sql).all(...p.args).length, 0)
   p = searchPlan({ query: '別の原文' })
@@ -139,7 +161,10 @@ test('normalized kana, width, case, spaces and two-character literal fallback sh
   assert.equal(db.prepare('SELECT rid FROM recordings').get().rid, rid)
   db.prepare('DELETE FROM recordings WHERE id=?').run('a')
   assert.equal(db.prepare(p.sql).all(...p.args).length, 0)
-  assert.equal(db.prepare("SELECT count(*) n FROM sqlite_master WHERE name='transcripts_content'").get().n, 0)
+  assert.equal(
+    db.prepare("SELECT count(*) n FROM sqlite_master WHERE name='transcripts_content'").get().n,
+    0,
+  )
   db.close()
 })
 

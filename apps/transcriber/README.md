@@ -1,0 +1,15 @@
+# Transcriber
+
+The daemon polls the web API's durable transcription queue. Notion is not involved in job scheduling, audio downloads, progress, results, or retries. `src/daemon.ts`, `coordinator.ts`, and `callbacks.ts` remain only for legacy migration tests; `src/index.ts` starts `ApiWorker`.
+
+Copy `.env.example` into private service configuration. Set `UOMI_API_URL` to the web application's origin and `UOMI_CLIENT_SECRET` to the worker secret configured on the API (`UOMI_WORKER_SECRET`), or a client key issued by that application's Settings. The worker secret only permits job processing and audio/manifest downloads. During migration the API may use its existing `UOMI_WEBHOOK_SECRET` as this scoped worker secret. For a private Sites deployment, retain `SITES_ACCESS_TOKEN` so requests pass the Sites gateway as well. A Notion token cannot authenticate the new transport.
+
+Run `bun run start` with Bun and ffmpeg on PATH. Default concurrency is two recordings, with at least ten seconds between provider requests. Detailed jobs use Codex; standard jobs use `TRANSCRIBER_PROVIDER`. The existing provider credentials stay on the daemon machine. The local HTTP server only exposes `/health`; old `/webhook` and `/reserve` calls return HTTP 410.
+
+The worker claims up to its free concurrency slots, renews each 180-second lease every 30 seconds, and reports `downloading`, `decoding`, `transcribing`, and `saving` stages with chunk progress. The API stores attempts, failures, retry times, and results. A worker that loses its lease discards its result. A lost completion response is retried with the same token. Failed delivery never relies on an inbound callback.
+
+Audio and manifests download concurrently from authenticated same-origin API endpoints. The worker verifies SHA-256 before invoking ffmpeg, bounds download sizes and decoder runtime, and checkpoints each successful provider chunk atomically in the private state directory. Restarted jobs reuse matching audio/provider/language/split-size checkpoints. HTTP failures retain status and response detail; processing failures include the failing stage and actual exception.
+
+Provider segments, when available, use `{start_ms, end_ms, text, speaker}`. Chunk offsets are converted to the original audio playback timeline; original silence is retained. Providers returning only text produce no fabricated timestamps or speaker labels. Supporting providers can add timing and speaker output without changing the queue protocol.
+
+On Mac mini, the service is managed by `~/dotfiles/modules/darwin/uomi-transcriber.nix` and its pinned source package. Update that declaration, build `.#darwinConfigurations.mac-mini.system`, apply the documented rebuild or generated user-agent update, and verify `/health` plus an actual completed queue job. Preserve the private credentials file and checkpoint directory. Do not finish deployment using an unmanaged background process.

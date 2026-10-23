@@ -646,7 +646,7 @@ test('native import rejects incomplete completion rather than claiming a success
   e.dispose()
 })
 
-test('Sites staging does not acknowledge or allow deletion before Notion confirms', async () => {
+test('an unconfirmed API receipt retains local audio; primary server confirmation permits explicit removal', async () => {
   const f = fixture()
   const e = new Engine(f.port)
   await e.init()
@@ -660,5 +660,344 @@ test('Sites staging does not acknowledge or allow deletion before Notion confirm
   assert.equal(e.getSnapshot().recordings[0].uploaded, 1)
   await e.clearDelivered()
   assert.equal(e.getSnapshot().recordings.length, 0)
+  e.dispose()
+})
+
+test('upload muxes on the client and passes binary Ogg with metadata instead of JSON audio frames', async () => {
+  const { oggOpus, decodeOggUpload } = await import('@uomi/audio')
+  const f = fixture()
+  let muxed: Uint8Array | undefined
+  let sent = false
+  f.port.muxAudio = async (frames) => (muxed = oggOpus(frames))
+  f.port.post = async (_endpoint, _header, body, compression, id, binary) => {
+    assert.equal(binary, true)
+    assert.equal(compression, 'none')
+    const { audio, manifest: raw } = decodeOggUpload(Buffer.from(body, 'base64'))
+    const manifest = raw as import('@uomi/notion').AudioManifest
+    assert.deepEqual(audio, muxed)
+    assert.equal(manifest.id, id)
+    assert.equal(manifest.sha256, createHash('sha256').update(audio).digest('hex'))
+    assert.equal(manifest.frameIds.length, 1)
+    assert.equal(manifest.timing[0].frames, 1)
+    assert.equal('frames' in manifest, false)
+    sent = true
+    return false
+  }
+  const e = new Engine(f.port)
+  await e.init()
+  await e.sync()
+  assert.ok(sent)
+  assert.equal(e.getSnapshot().recordings[0].uploaded, 0)
+  e.dispose()
+})
+
+function localAudioFixture(frames = 4) {
+  const f = fixture()
+  f.data.set(
+    'record:parallel',
+    JSON.stringify({
+      key: 'record:parallel',
+      deviceId: 'serial',
+      ringId: '321',
+      sequence: '1',
+      capturedAt: '2026-01-01T00:00:00.000Z',
+      timestampRaw: 1767225600,
+      timing: 'device-utc',
+      uploaded: 0,
+      bytes: 2 * frames,
+      receivedAt: '2026-01-01T00:00:00Z',
+      frames: Array.from({ length: frames }, (_, i) => ({
+        id: `serial:packet:${i}`,
+        data: 'mAE=',
+        durationMs: 20,
+        offsetMs: i * 20,
+      })),
+    }),
+  )
+  f.port.planAudio = async (records) =>
+    records.flatMap((r) =>
+      Array.from({ length: r.frameCount }, (_, i) => ({
+        key: `${r.key}:${i}`,
+        deviceId: r.deviceId,
+        capturedAt: r.capturedAt,
+        durationMs: 20,
+        sourceFrames: 1,
+        deliveredFrames: 0,
+        ranges: [{ key: r.key, from: i, to: i + 1, gapMs: 0 }],
+        endReason: { kind: 'duration-limit' as const },
+      })),
+    )
+  return f
+}
+
+test('four concurrent uploads retain every acknowledgement when chunks sharing a record finish out of order', async () => {
+  const f = localAudioFixture(8)
+  const { decodeOggUpload } = await import('@uomi/audio')
+  let active = 0,
+    maximum = 0
+  const releases = new Map<number, () => void>()
+  let ready!: () => void
+  const firstFour = new Promise<void>((r) => {
+    ready = r
+  })
+  f.port.post = async (_url, _header, body) => {
+    const { manifest } = decodeOggUpload(Buffer.from(body, 'base64'))
+    const i = Number(
+      (manifest as import('@uomi/notion').AudioManifest).frameIds[0].split(':').at(-1),
+    )
+    maximum = Math.max(maximum, ++active)
+    try {
+      if (i < 4)
+        await new Promise<void>((resolve) => {
+          releases.set(i, resolve)
+          if (releases.size === 4) ready()
+        })
+      return true
+    } finally {
+      active--
+    }
+  }
+  const e = new Engine(f.port)
+  await e.init()
+  const running = e.syncCloud()
+  try {
+    await firstFour
+    assert.equal(active, 4)
+    assert.equal(e.getSnapshot().progress?.chunksActive, 4)
+    for (const i of [3, 2, 1]) releases.get(i)!()
+    await new Promise((r) => setTimeout(r, 20))
+    assert.equal(JSON.parse(f.data.get('record:parallel')!).uploaded, 0)
+  } finally {
+    releases.get(0)?.()
+    await running
+  }
+  assert.equal(maximum, 4)
+  assert.equal(e.getSnapshot().recordings[0].uploaded, 8)
+  assert.equal(e.getSnapshot().progress?.chunksSubmitted, 8)
+  assert.equal(e.getSnapshot().progress?.chunksCompleted, 8)
+  assert.equal(e.getSnapshot().progress?.chunksActive, 0)
+  e.dispose()
+})
+
+test('upload progress counts staged deliveries while save acknowledgements stay separate', async () => {
+  const f = localAudioFixture(4)
+  f.port.post = async () => false
+  const e = new Engine(f.port)
+  await e.init()
+  await e.syncCloud()
+  const s = e.getSnapshot()
+  assert.equal(s.progress?.completed, 4)
+  assert.equal(s.progress?.chunksSubmitted, 4)
+  assert.equal(s.progress?.chunksCompleted, 0)
+  assert.equal(s.progress?.chunksStaged, 4)
+  assert.equal(s.recordings[0].uploaded, 0)
+  assert.equal(s.busy, false)
+  assert.match(s.phase, /Upload complete/)
+  e.dispose()
+})
+
+test('a failed concurrent upload stops admission and drains active requests before enabling retry', async () => {
+  const f = localAudioFixture(8)
+  const { decodeOggUpload } = await import('@uomi/audio')
+  let release!: () => void, reportFailure!: () => void
+  const blocked = new Promise<void>((r) => {
+    release = r
+  })
+  const failed = new Promise<void>((r) => {
+    reportFailure = r
+  })
+  const started: number[] = []
+  f.port.post = async (_url, _header, body) => {
+    const { manifest } = decodeOggUpload(Buffer.from(body, 'base64'))
+    const i = Number(
+      (manifest as import('@uomi/notion').AudioManifest).frameIds[0].split(':').at(-1),
+    )
+    started.push(i)
+    if (i === 0) {
+      await blocked
+      return true
+    }
+    reportFailure()
+    throw Error('HTTP 503')
+  }
+  const e = new Engine(f.port)
+  await e.init()
+  const running = e.syncCloud()
+  await failed
+  assert.equal(e.getSnapshot().busy, true)
+  release()
+  await running
+  assert.ok(started.length <= 4)
+  assert.equal(e.getSnapshot().busy, false)
+  assert.match(e.getSnapshot().error!, /HTTP 503/)
+  assert.equal(JSON.parse(f.data.get('record:parallel')!).uploaded, 1)
+  e.dispose()
+})
+
+test('cached chunks are checked without loading, muxing or retransmitting audio; pending saves refresh automatically', async () => {
+  const f = localAudioFixture(4)
+  let checks = 0
+  f.port.uploadStatus = async (_endpoint, _header, ids) => {
+    checks++
+    return ids.map((id) => ({ id, status: checks === 1 ? 'pending' : 'saved' }))
+  }
+  f.port.muxAudio = async () => {
+    throw Error('Cached audio must not be loaded or muxed')
+  }
+  f.port.post = async () => {
+    throw Error('Cached audio must not be retransmitted')
+  }
+  const e = new Engine(f.port)
+  await e.init()
+  await e.syncCloud()
+  assert.equal(e.getSnapshot().error, null)
+  assert.ok(checks >= 2)
+  assert.equal(e.getSnapshot().progress?.chunksCompleted, 4)
+  assert.equal(e.getSnapshot().progress?.chunksStaged, 0)
+  assert.equal(e.getSnapshot().recordings[0].uploaded, 4)
+  e.dispose()
+})
+
+test('save failures are distinct from pending saves and never cause automatic audio retransmission', async () => {
+  const f = localAudioFixture(4)
+  f.port.uploadStatus = async (_endpoint, _header, ids) =>
+    ids.map((id) => ({ id, status: 'failed', error: 'Notion permission denied' }))
+  f.port.post = async () => {
+    throw Error('Failed saves must not retransmit received audio')
+  }
+  const e = new Engine(f.port)
+  await e.init()
+  await e.syncCloud()
+  assert.match(e.getSnapshot().error!, /Notion permission denied/)
+  assert.equal(e.getSnapshot().progress?.chunksSubmitted, 4)
+  assert.equal(e.getSnapshot().progress?.chunksCompleted, 0)
+  assert.equal(e.getSnapshot().recordings[0].uploaded, 0)
+  e.dispose()
+})
+
+test('status responses must account for every requested identity before any upload', async () => {
+  const f = localAudioFixture(4)
+  f.port.uploadStatus = async () => []
+  const e = new Engine(f.port)
+  await e.init()
+  await e.syncCloud()
+  assert.match(e.getSnapshot().error!, /Invalid upload status response/)
+  assert.equal(f.posts, 0)
+  e.dispose()
+})
+
+test('primary server save remains successful when Notion backup fails; transcription job errors stay visible', async () => {
+  const f = localAudioFixture(4)
+  f.port.uploadStatus = async (_endpoint, _header, ids) =>
+    ids.map((id) => ({
+      id,
+      status: 'saved',
+      backup_status: 'failed',
+      backup_error: 'Notion HTTP 403: integration has no access',
+      transcription: {
+        id: `job:${id}`,
+        status: 'failed',
+        stage: 'recognizing',
+        progress: 0.6,
+        attempt: 3,
+        error: 'Provider quota exhausted',
+      },
+    }))
+  f.port.post = async () => {
+    throw Error('Saved primary audio must not be retransmitted')
+  }
+  const e = new Engine(f.port)
+  await e.init()
+  await e.syncCloud()
+  assert.equal(e.getSnapshot().error, null)
+  assert.equal(e.getSnapshot().progress?.chunksCompleted, 4)
+  assert.equal(e.getSnapshot().recordings[0].uploaded, 4)
+  assert.equal(e.getSnapshot().uploadJobs?.length, 4)
+  assert.equal(e.getSnapshot().uploadJobs?.[0].transcription?.error, 'Provider quota exhausted')
+  assert.match(e.getSnapshot().uploadJobs![0].backup_error!, /Notion HTTP 403/)
+  await e.clearDelivered()
+  assert.equal(e.getSnapshot().recordings.length, 0)
+  e.dispose()
+})
+
+test('transcription job identity survives restart and completed status is restored', async () => {
+  const f = localAudioFixture(1)
+  let saved = false
+  f.port.post = async () => {
+    saved = true
+    return true
+  }
+  f.port.uploadStatus = async (_endpoint, _header, ids) =>
+    ids.map((id) => ({
+      id,
+      status: saved ? 'saved' : 'missing',
+      transcription: saved
+        ? { id: `job:${id}`, status: 'completed', stage: 'completed', progress: 1, attempt: 1 }
+        : null,
+    }))
+  const first = new Engine(f.port)
+  await first.init()
+  await first.syncCloud()
+  assert.equal(first.getSnapshot().uploadJobs?.[0].transcription?.status, 'completed')
+  first.dispose()
+  const second = new Engine(f.port)
+  await second.init()
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  assert.equal(second.getSnapshot().uploadJobs?.[0].transcription?.status, 'completed')
+  second.dispose()
+})
+
+test('sync retains the upstream error when Bluetooth cleanup also fails', async () => {
+  const f = fixture()
+  const e = new Engine(f.port)
+  await e.init()
+  f.port.post = async () => {
+    throw Error('HTTP 503: recording database unavailable')
+  }
+  f.port.disconnect = async () => {
+    throw Error('BlueZ connection release failed')
+  }
+  await e.sync()
+  assert.match(e.getSnapshot().error!, /HTTP 503: recording database unavailable/)
+  assert.match(e.getSnapshot().error!, /BlueZ connection release failed/)
+  assert.equal(e.getSnapshot().busy, false)
+  assert.equal(e.getSnapshot().recordings[0].uploaded, 0)
+  e.dispose()
+})
+
+test('native saved-status acknowledgements update metadata without rereading audio or rewriting source packets', async () => {
+  const { recordIndex } = await import('../src/core/catalog')
+  const f = localAudioFixture(8)
+  let summary = recordIndex(JSON.parse(f.data.get('record:parallel')!))
+  f.port.catalogEntries = async (after) =>
+    after ? [] : [{ key: summary.key, value: JSON.stringify(summary) }]
+  const get = f.port.get
+  f.port.get = async (key) => {
+    assert.ok(!key.startsWith('record:'), 'Acknowledgements must not fetch original audio')
+    return get(key)
+  }
+  f.port.uploadStatus = async (_endpoint, _header, ids) =>
+    ids.map((id) => ({ id, status: 'saved' }))
+  f.port.post = async () => {
+    throw Error('Saved server audio must not be retransmitted')
+  }
+  const original = f.data.get('record:parallel')
+  let updates = 0
+  f.port.acknowledgeAudio = async (batch) => {
+    assert.ok(batch.length <= 256)
+    for (const update of batch) {
+      assert.ok(update.uploaded >= summary.uploaded)
+      summary = { ...summary, uploaded: update.uploaded, notionTarget: update.target }
+      updates++
+    }
+  }
+  const e = new Engine(f.port)
+  await e.init()
+  await e.syncCloud()
+  assert.equal(e.getSnapshot().error, null)
+  assert.equal(summary.uploaded, 8)
+  assert.equal(updates, 8)
+  assert.equal(e.getSnapshot().progress?.chunksCompleted, 8)
+  assert.equal(f.data.get('record:parallel'), original)
   e.dispose()
 })

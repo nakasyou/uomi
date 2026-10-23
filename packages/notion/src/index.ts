@@ -2,6 +2,26 @@ import { Buffer } from 'buffer'
 
 export const NOTION_VERSION = '2025-09-03'
 export type ProcessingStatus = 'Uploading' | 'Pending' | 'Processing' | 'Completed' | 'Failed'
+export type TranscriptionMode = 'standard' | 'detailed'
+export function transcriptionFields(mode: TranscriptionMode = 'standard') {
+  return mode === 'detailed'
+    ? {
+        status: 'Detailed status',
+        transcript: 'Detailed transcript',
+        preview: 'Detailed preview',
+        error: 'Detailed error',
+        attempts: 'Detailed attempts',
+        retry: 'Detailed retry after',
+      }
+    : {
+        status: 'Status',
+        transcript: 'Transcript',
+        preview: 'Transcript preview',
+        error: 'Error',
+        attempts: 'Attempts',
+        retry: 'Retry after',
+      }
+}
 export interface UploadBody {
   filename: string
   contentType: string
@@ -59,11 +79,9 @@ export function validateManifest(value: unknown): asserts value is AudioManifest
     !manifest.id ||
     !Number.isFinite(manifest.durationMs) ||
     manifest.durationMs <= 0 ||
-    manifest.durationMs > 900000 ||
     !/^[a-f0-9]{64}$/.test(manifest.sha256 ?? '') ||
     !Array.isArray(manifest.frameIds) ||
     !manifest.frameIds.length ||
-    manifest.frameIds.length > 360000 ||
     manifest.frameIds.some((id) => typeof id !== 'string' || id.length > 512) ||
     new Set(manifest.frameIds).size !== manifest.frameIds.length
   )
@@ -194,6 +212,14 @@ export const schema = {
   Audio: { files: {} },
   Manifest: { files: {} },
   Transcript: { files: {} },
+  'Detailed status': {
+    select: { options: ['Pending', 'Processing', 'Completed', 'Failed'].map((name) => ({ name })) },
+  },
+  'Detailed transcript': { files: {} },
+  'Detailed preview': { rich_text: {} },
+  'Detailed error': { rich_text: {} },
+  'Detailed attempts': { number: {} },
+  'Detailed retry after': { date: {} },
   'Transcript preview': { rich_text: {} },
   Error: { rich_text: {} },
   'Synthetic silence (s)': { number: {} },
@@ -573,28 +599,45 @@ export class NotionStore {
       target,
     }
   }
-  async saveTranscript(pageId: string, text: string, provider: string): Promise<void> {
+  async saveTranscript(
+    pageId: string,
+    text: string,
+    provider: string,
+    mode: TranscriptionMode = 'standard',
+    segments: Array<{
+      start_ms: number
+      end_ms: number
+      text: string
+      speaker?: string | null
+    }> = [],
+  ): Promise<void> {
+    const fields = transcriptionFields(mode)
     const fileId = await this.upload(
-      `${pageId}-transcript.json`,
+      `${pageId}-${mode}-transcript.json`,
       'application/json',
       Buffer.from(
         JSON.stringify({
           schema: 'uomi.transcript.v1',
           text,
           provider,
+          mode,
           completedAt: new Date().toISOString(),
           wordTimestamps: false,
+          timebase: 'recording-ms',
+          segments,
         }),
       ),
     )
     // Full text lives in a file; the bounded preview avoids Notion rich-text size limits.
     await this.update(pageId, {
-      Transcript: {
+      [fields.transcript]: {
         files: [{ name: 'transcript.json', type: 'file_upload', file_upload: { id: fileId } }],
       },
-      'Transcript preview': { rich_text: rich(text.slice(0, 6000)) },
-      Status: { select: { name: 'Completed' } },
-      Error: { rich_text: [] },
+      [fields.preview]: { rich_text: rich(text.slice(0, 6000)) },
+      [fields.status]: { select: { name: 'Completed' } },
+      [fields.error]: { rich_text: [] },
+      [fields.attempts]: { number: 0 },
+      [fields.retry]: { date: null },
     })
   }
 }
@@ -628,10 +671,46 @@ export function httpTransport(token: string, fetcher: typeof fetch = fetch): Tra
       signal: AbortSignal.timeout(120000),
     })
     if (!response.ok) {
-      await response.body?.cancel()
+      // Keep actionable API validation diagnostics without copying arbitrary
+      // gateway HTML, request bodies or credentials into persisted errors.
+      const reader = response.body?.getReader()
+      const parts: Uint8Array[] = []
+      let size = 0
+      let diagnostic = ''
+      try {
+        while (reader && size < 16384) {
+          const part = await reader.read()
+          if (part.done) break
+          size += part.value.length
+          if (size <= 16384) parts.push(part.value)
+        }
+        if (size <= 16384) {
+          const value = JSON.parse(Buffer.concat(parts).toString())
+          diagnostic = [
+            value.code,
+            value.message,
+            value.request_id ? `request ${value.request_id}` : '',
+          ]
+            .filter((v) => typeof v === 'string')
+            .join(' · ')
+            .slice(0, 2000)
+          if (token) diagnostic = diagnostic.split(token).join('[redacted]')
+          diagnostic = diagnostic.replace(/(?:secret|ntn|sk)_[A-Za-z0-9_-]{12,}/g, '[redacted]')
+        }
+      } catch (error) {
+        if (!(error instanceof SyntaxError))
+          diagnostic = `Error body unavailable: ${(error as Error).message}`
+      } finally {
+        try {
+          await reader?.cancel()
+        } catch (error) {
+          diagnostic += ` · Error stream cleanup: ${(error as Error).message}`
+        }
+      }
+      if (token) diagnostic = diagnostic.split(token).join('[redacted]')
       const retry = response.headers.get('retry-after')
       throw Error(
-        `Notion HTTP ${response.status}${retry ? `; retry after ${retry}s` : ''}. Check connection permissions and try again.`,
+        `Notion HTTP ${response.status} · ${request.method} ${request.path}${retry ? `; retry after ${retry}s` : ''}${diagnostic ? `: ${diagnostic}` : ''}`,
       )
     }
     return response.json()

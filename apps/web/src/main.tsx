@@ -1,7 +1,21 @@
 import React, { useEffect, useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
+import { api } from './api'
 import './style.css'
+
+type Job = {
+  id: string
+  status: string
+  stage: string
+  progress: number
+  attempt: number
+  error?: string
+  updated_at: number
+  available_at: number
+}
+type Segment = { start_ms: number; end_ms: number; text: string; speaker?: string }
 type Recording = {
+  revision?: number
   id: string
   title: string
   recorded_at: number | null
@@ -15,7 +29,15 @@ type Recording = {
   preview?: string
   text?: string
   url?: string
+  detailed_status?: string
+  detailed_text?: string
+  detailed_error?: string
+  transcription?: Job | null
+  detailed_transcription?: Job | null
+  segments?: Segment[]
+  detailed_segments?: Segment[]
 }
+type Device = { hash: string; name: string; revoked: number; created_at: number }
 const paths: Record<string, string> = {
   menu: 'M3 6h18M3 12h18M3 18h18',
   search: 'm21 21-5-5M18 10a8 8 0 1 1-16 0 8 8 0 0 1 16 0',
@@ -31,6 +53,7 @@ const paths: Record<string, string> = {
   sun: 'M12 3v2m0 14v2M3 12h2m14 0h2M5.6 5.6 7 7m10 10 1.4 1.4M5.6 18.4 7 17M17 7l1.4-1.4M16 12a4 4 0 1 1-8 0 4 4 0 0 1 8 0',
   edit: 'm4 16 12-12 4 4-12 12H4v-4Z',
   note: 'M6 3h12v18H6zM9 8h6M9 12h6M9 16h4',
+  settings: 'M4 7h16M4 17h16M8 4v6M16 14v6',
 }
 function Icon({ name, fill = false }: { name: string; fill?: boolean }) {
   return (
@@ -49,23 +72,14 @@ function Icon({ name, fill = false }: { name: string; fill?: boolean }) {
     </svg>
   )
 }
-async function api(path: string, options: RequestInit = {}) {
-  const res = await fetch(path, {
-    ...options,
-    headers: { 'Content-Type': 'application/json', ...options.headers },
-  })
-  const value = await res.json()
-  if (!res.ok) throw Error(value.error ?? `HTTP ${res.status}`)
-  return value
-}
-const clock = (seconds: number) =>
-  Number.isFinite(seconds)
-    ? `${Math.floor(seconds / 60)}:${String(Math.floor(seconds % 60)).padStart(2, '0')}`
+const clock = (s: number) =>
+  Number.isFinite(s)
+    ? `${Math.floor(Math.max(0, s) / 60)}:${String(Math.floor(Math.max(0, s) % 60)).padStart(2, '0')}`
     : '0:00'
 const date = (v: number | null) =>
   v
     ? new Date(v).toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' })
-    : 'Device clock unavailable'
+    : 'Unknown date'
 const title = (r: Recording) =>
   r.title ||
   (r.recorded_at
@@ -76,6 +90,42 @@ const title = (r: Recording) =>
         minute: '2-digit',
       })
     : 'Untimed recording')
+const durationOf = (r: Recording) =>
+  Math.max(0, (r.duration_ms ?? Math.max(0, (r.finished_at ?? 0) - (r.recorded_at ?? 0))) / 1000)
+const active = (j: Job | undefined | null) =>
+  !!j && !['completed', 'failed', 'Completed', 'Failed'].includes(j.status)
+const message = (e: unknown) => (e instanceof Error ? e.message : String(e))
+function JobState({
+  job,
+  fallback,
+  error,
+}: {
+  job?: Job | null
+  fallback: string
+  error?: string
+}) {
+  if (!job)
+    return (
+      <div className="job-state">
+        <span>{fallback}</span>
+        {error && <p className="error">{error}</p>}
+      </div>
+    )
+  return (
+    <div className="job-state" role="status">
+      <strong>{job.stage || job.status}</strong>
+      {active(job) && job.progress > 0 && <progress max="1" value={job.progress} />}
+      <span>
+        Attempt {job.attempt}
+        {job.updated_at ? ` · ${new Date(job.updated_at).toLocaleTimeString()}` : ''}
+      </span>
+      {job.status === 'retry' && job.available_at > Date.now() && (
+        <span>Retry at {new Date(job.available_at).toLocaleTimeString()}</span>
+      )}
+      {job.error && <p className="error">{job.error}</p>}
+    </div>
+  )
+}
 function App() {
   const [items, setItems] = useState<Recording[]>([]),
     [selected, setSelected] = useState<Recording | null>(null),
@@ -88,20 +138,42 @@ function App() {
     [loading, setLoading] = useState(true),
     [error, setError] = useState(''),
     [drawer, setDrawer] = useState(false),
-    [devices, setDevices] = useState(false),
+    [settings, setSettings] = useState(false),
     [light, setLight] = useState(false),
-    [notice, setNotice] = useState('')
-  const audio = useRef<HTMLAudioElement>(null),
+    [notice, updateNotice] = useState(''),
+    [noticeTone, setNoticeTone] = useState<'error' | 'success'>('error'),
+    [view, setView] = useState<'standard' | 'detailed'>('standard'),
+    [busy, setBusy] = useState(''),
     [playing, setPlaying] = useState(false),
     [position, setPosition] = useState(0),
     [duration, setDuration] = useState(0),
     [rate, setRate] = useState(1),
     [peaks, setPeaks] = useState<number[]>([]),
     [waveLoading, setWaveLoading] = useState(false),
-    [audioError, setAudioError] = useState('')
-  const requestId = useRef(0),
+    [audioError, setAudioError] = useState(''),
+    [rename, setRename] = useState<string | null>(null)
+  const audio = useRef<HTMLAudioElement>(null),
+    dialog = useRef<HTMLDialogElement>(null),
+    requestId = useRef(0),
     chooseId = useRef(0),
-    selectedRef = useRef<Recording | null>(null)
+    selectedRef = useRef<Recording | null>(null),
+    waveAbort = useRef<AbortController | null>(null)
+  const [keys, setKeys] = useState<Device[]>([]),
+    [deviceName, setDeviceName] = useState(''),
+    [credentials, setCredentials] = useState<Record<string, string> | null>(null),
+    [deviceError, setDeviceError] = useState(''),
+    [migration, setMigration] = useState<{
+      status: string
+      error?: string
+      watermark?: string
+    } | null>(null),
+    [syncing, setSyncing] = useState(false),
+    [synced, setSynced] = useState(0)
+  function setNotice(value: string, tone: 'error' | 'success' = 'error') {
+    updateNotice(value)
+    setNoticeTone(tone)
+  }
+  const stopSync = useRef(false)
   useEffect(() => {
     document.documentElement.dataset.theme = light ? 'light' : 'dark'
   }, [light])
@@ -109,18 +181,14 @@ function App() {
     const t = setTimeout(() => setSearch(query.trim()), 350)
     return () => clearTimeout(t)
   }, [query])
-  function params(next?: string) {
-    const p = new URLSearchParams()
-    if (search) p.set('q', search)
-    if (from) p.set('from', new Date(from + 'T00:00:00').toISOString())
-    if (to) {
-      const d = new Date(to + 'T00:00:00')
-      d.setDate(d.getDate() + 1)
-      p.set('to', d.toISOString())
-    }
-    if (onlyStar) p.set('starred', '1')
-    if (next) p.set('cursor', next)
-    return p
+  useEffect(() => {
+    if (settings) dialog.current?.showModal()
+    else dialog.current?.close()
+  }, [settings])
+  function merge(id: string, data: Partial<Recording>) {
+    setSelected((r) => (r?.id === id ? { ...r, ...data } : r))
+    if (selectedRef.current?.id === id) selectedRef.current = { ...selectedRef.current, ...data }
+    setItems((rs) => rs.map((r) => (r.id === id ? { ...r, ...data } : r)))
   }
   async function load(next?: string) {
     const gen = ++requestId.current
@@ -132,13 +200,28 @@ function App() {
         setCursor(null)
         return
       }
-      const data = await api('/api/recordings?' + params(next))
+      const p = new URLSearchParams()
+      if (search) p.set('q', search)
+      if (from) p.set('from', new Date(from + 'T00:00:00').toISOString())
+      if (to) {
+        const end = new Date(to + 'T00:00:00')
+        end.setDate(end.getDate() + 1)
+        p.set('to', end.toISOString())
+      }
+      if (from && to && from > to) throw Error('The start date must be before the end date.')
+      if (onlyStar) p.set('starred', '1')
+      if (next) p.set('cursor', next)
+      const data = await api('/api/recordings?' + p)
       if (gen !== requestId.current) return
-      setItems((old) => (next ? [...old, ...data.results] : data.results))
+      setItems((old) =>
+        next
+          ? [...old, ...data.results.filter((r: Recording) => !old.some((x) => x.id === r.id))]
+          : data.results,
+      )
       setCursor(data.next_cursor)
       if (!next && !selectedRef.current && data.results[0]) void choose(data.results[0])
     } catch (e) {
-      if (gen === requestId.current) setError((e as Error).message)
+      if (gen === requestId.current) setError(message(e))
     } finally {
       if (gen === requestId.current) setLoading(false)
     }
@@ -149,144 +232,219 @@ function App() {
   async function choose(r: Recording) {
     const gen = ++chooseId.current
     audio.current?.pause()
+    waveAbort.current?.abort()
     selectedRef.current = r
     setSelected(r)
     setDrawer(false)
+    setView('standard')
+    setRename(null)
     setPosition(0)
-    setDuration((r.duration_ms ?? (r.finished_at ?? 0) - (r.recorded_at ?? 0)) / 1000)
+    setDuration(durationOf(r))
     setPlaying(false)
     setPeaks([])
     setAudioError('')
     try {
       const full = await api('/api/recordings/' + r.id)
-      if (gen === chooseId.current) {
-        setSelected(full)
-        selectedRef.current = full
-      }
+      if (gen === chooseId.current) merge(r.id, full)
     } catch (e) {
-      setError((e as Error).message)
+      if (gen === chooseId.current) setNotice(message(e))
     }
   }
-  async function patch(data: any) {
+  // Refresh server job state without remounting the audio element or interrupting playback.
+  useEffect(() => {
     if (!selected) return
-    try {
-      await api('/api/recordings/' + selected.id, { method: 'PATCH', body: JSON.stringify(data) })
-      setSelected({ ...selected, ...data })
-      setItems(items.map((r) => (r.id === selected.id ? { ...r, ...data } : r)))
-    } catch (e) {
-      setNotice((e as Error).message)
+    const id = selected.id
+    let cancelled = false
+    let timer: ReturnType<typeof setTimeout>
+    const controller = new AbortController()
+    async function refresh() {
+      try {
+        const state = await api('/api/recordings/' + id + '/status', { signal: controller.signal })
+        if (cancelled) return
+        const previous = selectedRef.current
+        const changed =
+          previous?.id === id &&
+          (state.revision !== previous.revision || state.has_audio !== previous.has_audio)
+        merge(id, state)
+        if (changed) {
+          const full = await api('/api/recordings/' + id, { signal: controller.signal })
+          if (cancelled) return
+          merge(id, full)
+        }
+        timer = setTimeout(
+          () => void refresh(),
+          active(state.transcription) || active(state.detailed_transcription) ? 3000 : 15000,
+        )
+      } catch (e) {
+        if (!cancelled) {
+          setNotice(message(e))
+          timer = setTimeout(() => void refresh(), 15000)
+        }
+      }
     }
+    timer = setTimeout(() => void refresh(), 3000)
+    return () => {
+      cancelled = true
+      controller.abort()
+      clearTimeout(timer)
+    }
+  }, [selected?.id])
+  async function action(key: string, run: () => Promise<void>) {
+    if (busy) return
+    setBusy(key)
+    try {
+      await run()
+    } catch (e) {
+      setNotice(message(e))
+    } finally {
+      setBusy('')
+    }
+  }
+  async function patch(data: { title?: string; starred?: boolean }) {
+    const r = selectedRef.current
+    if (!r) return
+    await action('patch', async () => {
+      await api('/api/recordings/' + r.id, { method: 'PATCH', body: JSON.stringify(data) })
+      merge(r.id, data)
+      setRename(null)
+    })
+  }
+  async function transcribe(mode: 'standard' | 'detailed') {
+    const r = selectedRef.current
+    if (!r) return
+    await action('transcribe', async () => {
+      await api(
+        `/api/recordings/${r.id}/${mode === 'standard' ? 'transcription' : 'detailed-transcription'}`,
+        { method: 'POST', body: '{"retry":true}' },
+      )
+      const full = await api('/api/recordings/' + r.id)
+      merge(r.id, full)
+      if (selectedRef.current?.id === r.id) setView(mode)
+    })
   }
   async function waveform() {
-    if (!selected?.has_audio || waveLoading) return
-    const id = selected.id,
-      gen = chooseId.current
+    const r = selectedRef.current
+    if (!r?.has_audio || waveLoading) return
+    const gen = chooseId.current
+    const controller = new AbortController()
+    waveAbort.current = controller
     setWaveLoading(true)
     let context: AudioContext | undefined
     try {
-      const res = await fetch(`/api/recordings/${id}/audio`)
-      if (!res.ok) throw Error()
+      const res = await fetch(`/api/recordings/${r.id}/audio`, { signal: controller.signal })
+      if (!res.ok) throw Error(`Audio read failed: HTTP ${res.status}`)
       context = new AudioContext()
       const buffer = await context.decodeAudioData(await res.arrayBuffer()),
         data = buffer.getChannelData(0),
         count = 200,
         step = Math.ceil(data.length / count),
-        p = []
+        values = []
       for (let i = 0; i < count; i++) {
         let max = 0
         for (let j = i * step; j < Math.min(data.length, (i + 1) * step); j += 8)
           max = Math.max(max, Math.abs(data[j]))
-        p.push(max)
+        values.push(max)
       }
-      if (gen === chooseId.current) setPeaks(p)
-    } catch {
-      setNotice('Waveform unavailable in this browser. Audio playback may still work.')
+      if (gen === chooseId.current) setPeaks(values)
+    } catch (e) {
+      if (!controller.signal.aborted) setNotice('Waveform: ' + message(e))
     } finally {
-      await context?.close()
+      try {
+        await context?.close()
+      } catch (e) {
+        setNotice('Audio decoder cleanup: ' + message(e))
+      }
       setWaveLoading(false)
     }
   }
-  const seek = (value: number) => {
-    if (audio.current && selected?.has_audio) {
+  function seek(value: number) {
+    if (!audio.current || !selectedRef.current?.has_audio) return
+    try {
       audio.current.currentTime = Math.max(0, Math.min(duration, value))
       setPosition(audio.current.currentTime)
+    } catch (e) {
+      setAudioError(message(e))
     }
   }
-  const play = async () => {
+  async function play() {
     if (!audio.current) return
     try {
+      setAudioError('')
       if (playing) audio.current.pause()
       else await audio.current.play()
-    } catch {
-      setAudioError('Unable to play. Try downloading the original audio.')
+    } catch (e) {
+      setAudioError('Playback: ' + message(e))
     }
   }
-  const [syncing, setSyncing] = useState(false),
-    [synced, setSynced] = useState(0)
-  const stopSync = useRef(false)
-  async function syncNotion(reset = false) {
+  async function syncNotion() {
+    if (syncing) return
     setSyncing(true)
     setSynced(0)
     stopSync.current = false
     try {
-      let first = true,
-        more = true,
+      let more = true,
         count = 0
       while (more && !stopSync.current) {
-        const result = await api('/api/resync', {
-          method: 'POST',
-          body: JSON.stringify({ reset: reset && first }),
-        })
-        first = false
+        const result = await api('/api/migrations/notion', { method: 'POST', body: '{}' })
         count += result.processed
         setSynced(count)
         more = result.has_more
       }
+      setMigration(await api('/api/migrations/notion'))
       setNotice(
-        stopSync.current
-          ? 'Notion resync paused; progress is saved.'
-          : 'Notion cache is up to date.',
+        stopSync.current ? 'Import paused. Progress saved.' : 'Notion import complete.',
+        'success',
       )
       await load()
-      if (selected) await choose(selected)
     } catch (e) {
-      setNotice((e as Error).message)
+      setMigration({ status: 'failed', error: message(e) })
+      setNotice('Notion import: ' + message(e))
     } finally {
       setSyncing(false)
     }
   }
-  const [keys, setKeys] = useState<any[]>([]),
-    [deviceName, setDeviceName] = useState(''),
-    [credentials, setCredentials] = useState<any>(null)
-  async function openDevices() {
-    setDevices(true)
-    try {
-      setKeys((await api('/api/clients')).results)
-    } catch (e) {
-      setNotice((e as Error).message)
-    }
+  async function openSettings() {
+    setSettings(true)
+    setDeviceError('')
+    const results = await Promise.allSettled([api('/api/clients'), api('/api/migrations/notion')])
+    const [devicesResult, migrationResult] = results
+    if (devicesResult.status === 'fulfilled') setKeys(devicesResult.value.results)
+    else setDeviceError(message(devicesResult.reason))
+    if (migrationResult.status === 'fulfilled') setMigration(migrationResult.value)
+    else setMigration({ status: 'failed', error: message(migrationResult.reason) })
   }
+  async function createKey() {
+    await action('create', async () => {
+      const c = await api('/api/clients', {
+        method: 'POST',
+        body: JSON.stringify({ name: deviceName }),
+      })
+      setCredentials(c)
+      setDeviceName('')
+      try {
+        setKeys((await api('/api/clients')).results)
+      } catch (e) {
+        setDeviceError(message(e))
+      }
+    })
+  }
+  const currentJob =
+    view === 'standard' ? selected?.transcription : selected?.detailed_transcription
+  const transcript = view === 'standard' ? selected?.text : selected?.detailed_text
+  const segments = view === 'standard' ? selected?.segments : selected?.detailed_segments
   return (
     <div className="app">
       <header className="topbar">
         <button
-          className="icon-button"
-          aria-label="Toggle recordings"
+          className="icon-button menu-button"
+          aria-label="Show recordings"
+          aria-expanded={drawer}
           onClick={() => setDrawer(!drawer)}
         >
           <Icon name="menu" />
         </button>
         <a className="brand" href="/">
-          <svg viewBox="0 0 36 36" width="36" height="36" aria-hidden="true">
-            <circle cx="18" cy="18" r="18" fill="#fff" />
-            <path
-              d="M9 16v4m4-9v14m5-18v22m5-17v12m4-9v6"
-              stroke="#ed6868"
-              strokeWidth="3"
-              strokeLinecap="round"
-            />
-          </svg>
-          <span>Uomi Recorder</span>
+          Uomi<span>Recorder</span>
         </a>
         <div className="search">
           <Icon name="search" />
@@ -303,30 +461,45 @@ function App() {
           )}
         </div>
         <button
-          className="icon-button"
-          aria-label="Sync from Notion"
-          disabled={syncing}
-          onClick={() => void syncNotion()}
-        >
-          <Icon name="refresh" />
-        </button>
-        <button
           className="icon-button theme"
-          aria-label="Toggle light theme"
+          aria-label={light ? 'Use dark theme' : 'Use light theme'}
           onClick={() => setLight(!light)}
         >
           <Icon name="sun" />
         </button>
         <button
           className="icon-button"
-          aria-label="Connect devices"
-          onClick={() => void openDevices()}
+          aria-label="Devices and backup"
+          onClick={() => void openSettings()}
         >
-          <Icon name="device" />
+          <Icon name="settings" />
         </button>
       </header>
+      {notice && (
+        <div className={`notice ${noticeTone}`} role={noticeTone === 'error' ? 'alert' : 'status'}>
+          <span>{notice}</span>
+          <button
+            aria-label="Dismiss message"
+            className="icon-button"
+            onClick={() => setNotice('')}
+          >
+            <Icon name="close" />
+          </button>
+        </div>
+      )}
       <div className="workspace">
         <aside className={`sidebar ${drawer ? 'open' : ''}`} aria-label="Recordings">
+          <div className="list-heading">
+            <h1>Recordings</h1>
+            <button
+              className="icon-button"
+              aria-label="Refresh recordings"
+              disabled={loading}
+              onClick={() => void load()}
+            >
+              <Icon name="refresh" />
+            </button>
+          </div>
           <div className="filters">
             <button
               className={`chip ${onlyStar ? 'active' : ''}`}
@@ -336,39 +509,46 @@ function App() {
               <Icon name="star" />
               Starred
             </button>
-            <button
-              className="icon-button"
-              aria-label="Refresh recordings"
-              onClick={() => void load()}
-            >
-              <Icon name="refresh" />
-            </button>
-            <label>
-              From
-              <input type="date" value={from} onChange={(e) => setFrom(e.target.value)} />
-            </label>
-            <label>
-              Through
-              <input type="date" value={to} onChange={(e) => setTo(e.target.value)} />
-            </label>
+            <details>
+              <summary>Date range</summary>
+              <div className="date-fields">
+                <label>
+                  From
+                  <input type="date" value={from} onChange={(e) => setFrom(e.target.value)} />
+                </label>
+                <label>
+                  Through
+                  <input type="date" value={to} onChange={(e) => setTo(e.target.value)} />
+                </label>
+                {(from || to) && (
+                  <button
+                    onClick={() => {
+                      setFrom('')
+                      setTo('')
+                    }}
+                  >
+                    Clear dates
+                  </button>
+                )}
+              </div>
+            </details>
           </div>
           {error && (
             <div className="list-message error" role="alert">
               {error}
-              <button onClick={() => void load()}>Try again</button>
+              <button onClick={() => void load()}>Retry</button>
             </div>
           )}
           {search && [...search].length < 2 ? (
-            <p className="list-message">Enter at least 2 characters to search.</p>
-          ) : items.length === 0 && !loading ? (
+            <p className="list-message">Enter at least 2 characters.</p>
+          ) : !items.length && !loading ? (
             <div className="list-message">
-              <h2>{search ? 'No matching recordings' : 'Your recordings will appear here'}</h2>
-              <p>
-                {search
-                  ? 'Try another phrase or date range.'
-                  : 'Connect your Omi client and sync your first recording.'}
-              </p>
-              <button onClick={() => void openDevices()}>Connect a device</button>
+              <h2>
+                {search || from || to || onlyStar ? 'No matching recordings' : 'No recordings yet'}
+              </h2>
+              {!search && !from && !to && !onlyStar && (
+                <button onClick={() => void openSettings()}>Connect a device</button>
+              )}
             </div>
           ) : (
             items.map((r, i) => (
@@ -378,6 +558,7 @@ function App() {
                 )}
                 <button
                   className={`recording ${selected?.id === r.id ? 'selected' : ''}`}
+                  aria-current={selected?.id === r.id ? 'true' : undefined}
                   onClick={() => void choose(r)}
                 >
                   <span className="recording-title">
@@ -385,22 +566,10 @@ function App() {
                     {r.starred && <Icon name="star" />}
                   </span>
                   <span className="recording-meta">
-                    <span>
-                      {r.recorded_at
-                        ? new Date(r.recorded_at).toLocaleTimeString(undefined, {
-                            hour: '2-digit',
-                            minute: '2-digit',
-                          })
-                        : 'Unknown time'}
-                    </span>
-                    <span>
-                      {clock((r.duration_ms ?? (r.finished_at ?? 0) - (r.recorded_at ?? 0)) / 1000)}
-                    </span>
+                    <span>{clock(durationOf(r))}</span>
+                    <span>{r.status}</span>
                   </span>
-                  <span className="status-line">
-                    <i className={r.status === 'Completed' ? 'complete' : ''} />
-                  </span>
-                  <span className="sr-only">{r.status}</span>
+                  {r.preview && <span className="recording-preview">{r.preview}</span>}
                 </button>
               </React.Fragment>
             ))
@@ -421,15 +590,40 @@ function App() {
             <>
               <section className="recording-detail">
                 <div className="detail-heading">
-                  <div>
-                    <h1>{title(selected)}</h1>
+                  <div className="heading-text">
+                    {rename !== null ? (
+                      <form
+                        className="rename-form"
+                        onSubmit={(e) => {
+                          e.preventDefault()
+                          void patch({ title: rename })
+                        }}
+                      >
+                        <input
+                          autoFocus
+                          aria-label="Recording title"
+                          maxLength={200}
+                          value={rename}
+                          onChange={(e) => setRename(e.target.value)}
+                        />
+                        <button className="tonal" disabled={!!busy}>
+                          Save
+                        </button>
+                        <button type="button" onClick={() => setRename(null)}>
+                          Cancel
+                        </button>
+                      </form>
+                    ) : (
+                      <h1>{title(selected)}</h1>
+                    )}
                     <p>
-                      {date(selected.recorded_at)} · {selected.status}
+                      {date(selected.recorded_at)} · {clock(durationOf(selected))}
                     </p>
                   </div>
                   <div className="detail-actions">
                     <button
                       className={`icon-button ${selected.starred ? 'starred' : ''}`}
+                      disabled={!!busy}
                       aria-label={selected.starred ? 'Remove star' : 'Star recording'}
                       aria-pressed={selected.starred}
                       onClick={() => void patch({ starred: !selected.starred })}
@@ -439,10 +633,7 @@ function App() {
                     <button
                       className="icon-button"
                       aria-label="Rename recording"
-                      onClick={() => {
-                        const name = prompt('Recording title', selected.title ?? '')
-                        if (name !== null) void patch({ title: name })
-                      }}
+                      onClick={() => setRename(selected.title ?? '')}
                     >
                       <Icon name="edit" />
                     </button>
@@ -451,7 +642,7 @@ function App() {
                         className="icon-button"
                         href={`/api/recordings/${selected.id}/audio`}
                         download={`${title(selected)}.ogg`}
-                        aria-label="Download original audio"
+                        aria-label="Download audio"
                       >
                         <Icon name="download" />
                       </a>
@@ -464,7 +655,7 @@ function App() {
                       <div
                         className="wave"
                         role="img"
-                        aria-label="Audio amplitude waveform"
+                        aria-label="Audio waveform; use the playback slider to seek"
                         onClick={(e) =>
                           seek(
                             ((e.clientX - e.currentTarget.getBoundingClientRect().left) /
@@ -476,7 +667,9 @@ function App() {
                         {peaks.map((p, i) => (
                           <i
                             key={i}
-                            className={i / peaks.length <= position / duration ? 'played' : ''}
+                            className={
+                              duration && i / peaks.length <= position / duration ? 'played' : ''
+                            }
                             style={{ height: `${Math.max(2, p * 82)}%` }}
                           />
                         ))}
@@ -488,11 +681,6 @@ function App() {
                     ) : (
                       <div className="wave-empty">
                         <Icon name="note" />
-                        <p>
-                          {selected.has_audio
-                            ? 'Original audio, preserved.'
-                            : 'Audio is stored in Notion for this earlier recording.'}
-                        </p>
                         {selected.has_audio ? (
                           <button
                             className="tonal"
@@ -502,91 +690,141 @@ function App() {
                             {waveLoading ? 'Reading audio…' : 'Show waveform'}
                           </button>
                         ) : (
-                          selected.url && (
-                            <a
+                          <>
+                            <p>Audio not imported</p>
+                            {selected.url && (
+                              <a href={selected.url} target="_blank" rel="noreferrer">
+                                Open Notion backup
+                              </a>
+                            )}
+                            <button
                               className="tonal"
-                              href={selected.url}
-                              target="_blank"
-                              rel="noreferrer"
+                              disabled={syncing}
+                              onClick={() => void syncNotion()}
                             >
-                              Open in Notion
-                            </a>
-                          )
+                              Import audio
+                            </button>
+                          </>
                         )}
                       </div>
                     )}
-                    <div className="backup-status">
+                    <details className="backup-status">
+                      <summary>
+                        Notion backup ·{' '}
+                        {selected.backup_error
+                          ? 'Needs attention'
+                          : ['done', 'legacy'].includes(selected.backup_step)
+                            ? 'Saved'
+                            : selected.backup_step === 'disabled'
+                              ? 'Off'
+                              : 'Pending'}
+                      </summary>
+                      {selected.backup_error && <p className="error">{selected.backup_error}</p>}
                       <button
+                        disabled={!!busy}
                         onClick={() =>
-                          void api(`/api/recordings/${selected.id}/resync`, {
-                            method: 'POST',
-                            body: '{}',
-                          })
-                            .then(() => choose(selected))
-                            .catch((e) => setNotice(e.message))
-                        }
-                      >
-                        Reload from Notion
-                      </button>
-                      <span>
-                        {selected.backup_step === 'done'
-                          ? 'Saved in Notion'
-                          : selected.backup_step === 'legacy'
-                            ? 'Imported from Notion'
-                            : `Notion save: ${selected.backup_step}`}
-                      </span>
-                      {!['done', 'legacy'].includes(selected.backup_step) && (
-                        <button
-                          onClick={() =>
-                            void api(`/api/recordings/${selected.id}/backup`, {
+                          void action('backup', async () => {
+                            await api(`/api/recordings/${selected.id}/backup`, {
                               method: 'POST',
                               body: '{}',
                             })
-                              .then(() =>
-                                setNotice('Notion save scheduled. Refresh to check progress.'),
-                              )
-                              .catch((e) => setNotice(e.message))
-                          }
-                        >
-                          Retry Notion save
-                        </button>
+                            merge(selected.id, await api('/api/recordings/' + selected.id))
+                            setNotice('Backup requested.', 'success')
+                          })
+                        }
+                      >
+                        {busy === 'backup' ? 'Requesting…' : 'Retry backup'}
+                      </button>
+                      {selected.url && (
+                        <a href={selected.url} target="_blank" rel="noreferrer">
+                          Open in Notion
+                        </a>
                       )}
-                      {selected.backup_error && <p className="error">{selected.backup_error}</p>}
-                    </div>
+                    </details>
                   </div>
                   <article className="transcript" aria-label="Transcript">
-                    <div className="transcript-time">
-                      {selected.recorded_at
-                        ? new Date(selected.recorded_at).toLocaleTimeString(undefined, {
-                            hour: '2-digit',
-                            minute: '2-digit',
-                          })
-                        : 'Recording'}
-                      <span>Full recording</span>
+                    <div
+                      className="transcript-versions"
+                      role="group"
+                      aria-label="Transcript version"
+                    >
+                      <button
+                        aria-pressed={view === 'standard'}
+                        onClick={() => setView('standard')}
+                      >
+                        Transcript
+                      </button>
+                      <button
+                        aria-pressed={view === 'detailed'}
+                        onClick={() => setView('detailed')}
+                      >
+                        Detailed · Codex
+                      </button>
                     </div>
-                    {selected.text ? (
+                    <div className="transcription-controls">
+                      <JobState
+                        job={currentJob}
+                        error={view === 'detailed' ? selected.detailed_error : undefined}
+                        fallback={
+                          view === 'standard'
+                            ? selected.status
+                            : (selected.detailed_status ?? 'Not requested')
+                        }
+                      />
+                      {!active(currentJob) && (
+                        <button
+                          className="tonal"
+                          disabled={!!busy || !selected.has_audio}
+                          onClick={() => void transcribe(view)}
+                        >
+                          {busy === 'transcribe'
+                            ? 'Requesting…'
+                            : currentJob?.status === 'failed' || currentJob?.status === 'Failed'
+                              ? 'Retry transcription'
+                              : transcript || currentJob?.status === 'completed'
+                                ? 'Transcribe again'
+                                : 'Transcribe'}
+                        </button>
+                      )}
+                    </div>
+                    {segments?.length ? (
+                      <div className="transcript-text segments">
+                        {segments.map((s, i) => (
+                          <div className="segment" key={i}>
+                            <button
+                              onClick={() => seek(s.start_ms / 1000)}
+                              aria-label={`Play from ${clock(s.start_ms / 1000)}`}
+                            >
+                              {clock(s.start_ms / 1000)}
+                            </button>
+                            <p>
+                              {s.speaker && <strong>{s.speaker} </strong>}
+                              {s.text}
+                            </p>
+                          </div>
+                        ))}
+                      </div>
+                    ) : transcript ? (
                       <div className="transcript-text">
-                        {selected.text.split(/\n\n+/).map((p, i) => (
+                        {transcript.split(/\n\n+/).map((p, i) => (
                           <p key={i}>{p}</p>
                         ))}
                       </div>
                     ) : (
                       <div className="transcript-empty">
                         <h2>
-                          {selected.status === 'Completed'
-                            ? 'No speech transcribed'
-                            : 'Waiting for transcription'}
+                          {active(currentJob)
+                            ? 'Transcription in progress'
+                            : currentJob?.status === 'completed' ||
+                                (selected.status === 'Completed' && view === 'standard')
+                              ? 'No speech detected'
+                              : 'No transcript yet'}
                         </h2>
-                        <p>
-                          {selected.status === 'Completed'
-                            ? 'The transcript for this recording is empty.'
-                            : 'Audio is saved. The transcription daemon will process it separately.'}
-                        </p>
+                        {!selected.has_audio && (
+                          <p>Import the audio to transcribe this recording.</p>
+                        )}
                       </div>
                     )}
-                    <p className="transcript-caption">
-                      Automatic transcription · Word timestamps unavailable
-                    </p>
                   </article>
                 </div>
               </section>
@@ -603,7 +841,7 @@ function App() {
                       setDuration(
                         Number.isFinite(audio.current.duration)
                           ? audio.current.duration
-                          : (selected.duration_ms ?? 0) / 1000,
+                          : durationOf(selected),
                       )
                     }
                   }}
@@ -611,7 +849,9 @@ function App() {
                   onPause={() => setPlaying(false)}
                   onEnded={() => setPlaying(false)}
                   onError={() =>
-                    setAudioError('Audio could not be loaded. Try refreshing or downloading it.')
+                    setAudioError(
+                      `Audio load failed (media error ${audio.current?.error?.code ?? 'unknown'}): ${audio.current?.error?.message ?? 'Check connection and retry.'}`,
+                    )
                   }
                 />
                 <input
@@ -627,19 +867,21 @@ function App() {
                 />
                 <div className="time-labels">
                   <span>{clock(position)}</span>
-                  <span>−{clock(Math.max(0, duration - position))}</span>
+                  <span>{clock(duration)}</span>
                 </div>
                 <div className="transport">
-                  <span className="audio-kind">Original Opus</span>
+                  <span className="audio-kind">
+                    {selected.has_audio ? 'Audio saved' : 'Audio unavailable'}
+                  </span>
                   <div className="transport-buttons">
                     <button
                       className="skip"
-                      aria-label="Back 5 seconds"
+                      aria-label="Back 10 seconds"
                       disabled={!selected.has_audio}
-                      onClick={() => seek(position - 5)}
+                      onClick={() => seek(position - 10)}
                     >
                       <Icon name="back" />
-                      <span>5</span>
+                      <span>10</span>
                     </button>
                     <button
                       className="play"
@@ -658,164 +900,178 @@ function App() {
                       <Icon name="forward" />
                       <span>10</span>
                     </button>
-                    <select
-                      aria-label="Playback speed"
-                      value={rate}
-                      onChange={(e) => {
-                        const v = +e.target.value
-                        setRate(v)
-                        if (audio.current) audio.current.playbackRate = v
-                      }}
-                    >
-                      {[0.75, 1, 1.25, 1.5, 2].map((v) => (
-                        <option key={v} value={v}>
-                          {v}×
-                        </option>
-                      ))}
-                    </select>
+                    <label className="speed">
+                      <span className="sr-only">Playback speed</span>
+                      <select
+                        value={rate}
+                        onChange={(e) => {
+                          const value = Number(e.target.value)
+                          setRate(value)
+                          if (audio.current) audio.current.playbackRate = value
+                        }}
+                      >
+                        {[0.5, 0.75, 1, 1.25, 1.5, 2].map((v) => (
+                          <option key={v} value={v}>
+                            {v}×
+                          </option>
+                        ))}
+                      </select>
+                    </label>
                   </div>
-                  <span className="private-label">Your private recorder</span>
+                  <span className="private-label">Private recordings</span>
                 </div>
                 {audioError && (
-                  <p className="error" role="alert">
-                    {audioError}
-                  </p>
+                  <div className="audio-error error" role="alert">
+                    <span>{audioError}</span>
+                    <button
+                      onClick={() => {
+                        setAudioError('')
+                        audio.current?.load()
+                      }}
+                    >
+                      Retry audio
+                    </button>
+                  </div>
                 )}
               </footer>
             </>
           ) : (
-            <section className="welcome">
+            <div className="welcome">
               <Icon name="note" />
-              <h1>Your words, within reach.</h1>
-              <p>Select a recording to listen and read its transcript.</p>
-            </section>
+              <h1>{loading ? 'Loading recordings…' : 'Select a recording'}</h1>
+              <button className="tonal mobile-only" onClick={() => setDrawer(true)}>
+                Browse recordings
+              </button>
+            </div>
           )}
         </main>
       </div>
-      {devices && (
-        <div
-          className="modal-backdrop"
-          onKeyDown={(e) => {
-            if (e.key === 'Escape') {
-              setDevices(false)
+      <dialog
+        ref={dialog}
+        className="devices-dialog"
+        onCancel={() => {
+          setSettings(false)
+          setCredentials(null)
+        }}
+        onClose={() => {
+          setSettings(false)
+          setCredentials(null)
+        }}
+      >
+        <div className="dialog-heading">
+          <h2>Devices and backup</h2>
+          <button
+            className="icon-button"
+            aria-label="Close settings"
+            onClick={() => {
+              setSettings(false)
               setCredentials(null)
-            }
+            }}
+          >
+            <Icon name="close" />
+          </button>
+        </div>
+        {deviceError && (
+          <p className="error" role="alert">
+            {deviceError}
+          </p>
+        )}
+        <h3>Device access</h3>
+        <form
+          onSubmit={(e) => {
+            e.preventDefault()
+            void createKey()
           }}
         >
-          <section
-            className="devices-dialog"
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="devices-title"
-          >
-            <div className="dialog-heading">
-              <h2 id="devices-title">Connect a device</h2>
+          <label>
+            Device name
+            <input
+              required
+              maxLength={100}
+              placeholder="My phone"
+              value={deviceName}
+              onChange={(e) => setDeviceName(e.target.value)}
+            />
+          </label>
+          <button className="tonal" disabled={!!busy}>
+            {busy === 'create' ? 'Creating…' : 'Create key'}
+          </button>
+        </form>
+        {credentials && (
+          <div className="credentials">
+            <p>Copy this key now. It is shown once.</p>
+            {[
+              ['API URL', credentials.upload_url],
+              ['API key', credentials.secret],
+              ['Sites access token', credentials.access_token],
+            ]
+              .filter(([, v]) => v)
+              .map(([label, value]) => (
+                <label key={label}>
+                  {label}
+                  <input readOnly value={value} onFocus={(e) => e.target.select()} />
+                </label>
+              ))}
+          </div>
+        )}
+        <div className="device-list">
+          {keys.map((k) => (
+            <div key={k.hash}>
+              <span>
+                {k.name}
+                <small>{k.revoked ? 'Revoked' : new Date(k.created_at).toLocaleDateString()}</small>
+              </span>
               <button
-                autoFocus
-                className="icon-button"
-                aria-label="Close devices"
-                onClick={() => {
-                  setDevices(false)
-                  setCredentials(null)
-                }}
+                disabled={!!k.revoked || !!busy}
+                onClick={() =>
+                  void action('revoke', async () => {
+                    await api('/api/clients/' + k.hash, { method: 'DELETE' })
+                    setKeys((old) => old.map((v) => (v.hash === k.hash ? { ...v, revoked: 1 } : v)))
+                  })
+                }
               >
-                <Icon name="close" />
+                Revoke
               </button>
             </div>
-            <p>Keep Omi capture on your phone or desktop. Listen, search and read here.</p>
-            <form
-              onSubmit={(e) => {
-                e.preventDefault()
-                void api('/api/clients', {
-                  method: 'POST',
-                  body: JSON.stringify({ name: deviceName }),
-                })
-                  .then((c) => {
-                    setCredentials(c)
-                    setDeviceName('')
-                    void api('/api/clients').then((v) => setKeys(v.results))
-                  })
-                  .catch((e) => setNotice(e.message))
-              }}
-            >
-              <label>
-                Device name
-                <input
-                  required
-                  maxLength={100}
-                  placeholder="My phone"
-                  value={deviceName}
-                  onChange={(e) => setDeviceName(e.target.value)}
-                />
-              </label>
-              <button className="tonal">Create access key</button>
-            </form>
-            {credentials && (
-              <div className="credentials">
-                <p>Copy these to the client settings. The API key is only shown now.</p>
-                {[
-                  ['Upload URL', credentials.upload_url],
-                  ['API key', credentials.secret],
-                  ['Sites access token', credentials.access_token],
-                ].map(([label, value]) => (
-                  <label key={label}>
-                    {label}
-                    <input
-                      readOnly
-                      value={value ?? 'Not configured — add SITES_ACCESS_TOKEN in Sites secrets'}
-                      onFocus={(e) => e.target.select()}
-                    />
-                  </label>
-                ))}
-              </div>
-            )}
-            <p>Notion is the source of truth. D1 and R2 are persistent caches.</p>
-            <button className="tonal" disabled={syncing} onClick={() => void syncNotion(true)}>
-              Rebuild cache from Notion
-            </button>
-            <div className="device-list">
-              {keys.map((k) => (
-                <div key={k.hash}>
-                  <span>
-                    {k.name}
-                    <small>
-                      {k.revoked ? 'Revoked' : new Date(k.created_at).toLocaleDateString()}
-                    </small>
-                  </span>
-                  <button
-                    disabled={!!k.revoked}
-                    onClick={() =>
-                      void api('/api/clients/' + k.hash, { method: 'DELETE' })
-                        .then(() =>
-                          setKeys(keys.map((v) => (v.hash === k.hash ? { ...v, revoked: 1 } : v))),
-                        )
-                        .catch((e) => setNotice(e.message))
-                    }
-                  >
-                    Revoke
-                  </button>
-                </div>
-              ))}
-            </div>
-          </section>
+          ))}
         </div>
-      )}
-      {syncing && (
-        <div className="sync-progress" role="status">
-          Syncing from Notion · {synced} recordings
+        <h3>Notion migration</h3>
+        <p>Import earlier recordings. Existing server recordings are preserved.</p>
+        {migration && (
+          <p role="status">
+            {migration.status === 'completed'
+              ? 'Import complete'
+              : migration.status === 'running'
+                ? 'Import in progress'
+                : migration.status === 'failed'
+                  ? 'Import needs attention'
+                  : 'Not imported yet'}
+          </p>
+        )}
+        {migration?.error && <p className="error">{migration.error}</p>}
+        <button className="tonal" disabled={syncing} onClick={() => void syncNotion()}>
+          {syncing ? `Importing · ${synced}` : 'Import from Notion'}
+        </button>
+        {syncing && (
           <button
             onClick={() => {
               stopSync.current = true
             }}
           >
-            Pause after this recording
+            Pause import
           </button>
-        </div>
-      )}
-      {notice && (
-        <div className="snackbar" role="status">
-          {notice}
-          <button onClick={() => setNotice('')}>Dismiss</button>
+        )}
+      </dialog>
+      {syncing && !settings && (
+        <div className="sync-progress" role="status">
+          Importing · {synced}
+          <button
+            onClick={() => {
+              stopSync.current = true
+            }}
+          >
+            Pause
+          </button>
         </div>
       )}
     </div>

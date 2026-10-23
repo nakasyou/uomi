@@ -12,7 +12,7 @@ const tools = [
   {
     name: 'search_transcripts',
     description:
-      'Search the local Uomi full-text index. Normalized substring: NFKC, lowercase, kana and whitespace folding. Two characters use a literal LIKE scan; longer queries use compact trigram candidates with exact verification. Optional recording overlap range uses ISO-8601 timestamps with timezone. Results are recording-level, not word-level. Check index_status for freshness; sync_index advances a bounded page.',
+      'Search Uomi recordings. Normalized substring: NFKC, lowercase, kana and whitespace folding. Two characters use a literal LIKE scan; longer queries use compact trigram candidates with exact verification. Optional recording overlap range uses ISO-8601 timestamps with timezone. Results are recording-level, not word-level. New transcripts are searchable immediately; sync_index imports earlier Notion recordings.',
     inputSchema: object({
       query: { type: 'string', minLength: 2, maxLength: 200 },
       from: { type: 'string' },
@@ -56,7 +56,7 @@ const tools = [
   {
     name: 'sync_index',
     description:
-      'Rebuild or refresh persistent metadata and audio caches from Notion, one recording per call. Repeat until has_more=false. Writes only the derived index, never Notion.',
+      'Import earlier recordings from Notion, one recording per call. Repeat until has_more=false. Existing primary recordings are preserved.',
     inputSchema: object({}),
   },
 ].map((t) => ({
@@ -92,8 +92,8 @@ export function searchPlan(a) {
     args.push(time(a.from))
   }
   if (a.to !== undefined) {
-    clauses.push('r.recorded_at < ?')
-    args.push(time(a.to))
+    clauses.push('r.recorded_at < ? AND r.sort_time < ?')
+    args.push(time(a.to), time(a.to))
   }
   if (a.from !== undefined && a.to !== undefined && time(a.from) >= time(a.to))
     throw Error('from must precede to.')
@@ -113,16 +113,11 @@ export function searchPlan(a) {
     }
     if ((c.time !== null && !Number.isFinite(c.time)) || typeof c.id !== 'string')
       throw Error('Invalid cursor.')
-    if (c.time === null) {
-      clauses.push('((r.recorded_at IS NULL AND r.id > ?) OR r.recorded_at IS NOT NULL)')
-      args.push(c.id)
-    } else {
-      clauses.push('(r.recorded_at > ? OR (r.recorded_at = ? AND r.id > ?))')
-      args.push(c.time, c.time, c.id)
-    }
+    clauses.push('(r.sort_time,r.id) > (?,?)')
+    args.push(c.time ?? 0, c.id)
   }
   return {
-    sql: `SELECT r.id,r.recorded_at,r.finished_at,r.device,r.status,r.url,substr(r.text,1,1200) AS preview FROM recordings r${join} ${clauses.length ? 'WHERE ' + clauses.join(' AND ') : ''} ORDER BY r.recorded_at,r.id LIMIT ?`,
+    sql: `SELECT r.id,r.recorded_at,r.finished_at,r.device,r.status,r.url,substr(r.text,1,1200) AS preview FROM recordings r${join} ${clauses.length ? 'WHERE ' + clauses.join(' AND ') : ''} ORDER BY r.sort_time,r.id LIMIT ?`,
     args: [...args, limit + 1],
     limit,
   }
@@ -132,12 +127,13 @@ async function call(env, name, a) {
   if (name === 'sync_index') return resync(env)
   if (name === 'index_status')
     return {
-      configured: !!(env.NOTION_TOKEN && env.NOTION_DATA_SOURCE_ID),
+      configured: !!(env.DB && env.BUCKET),
+      backup_configured: !!(env.NOTION_TOKEN && env.NOTION_DATA_SOURCE_ID),
       ...(await env.DB.prepare('SELECT count(*) AS recordings FROM recordings').first()),
       limitations: [
         'Time filters operate on recording intervals, not individual words.',
-        'Notion resync refreshes active and archived pages.',
-        'Sync is explicit and bounded; repeat sync_index to catch up.',
+        'Notion import preserves primary server recordings.',
+        'Notion migration is explicit and bounded; repeat sync_index to finish.',
       ],
     }
   if (name === 'read_transcript') {
@@ -161,6 +157,13 @@ async function call(env, name, a) {
       throw Error('from and to are required.')
     if (name === 'search_transcripts' && a.query === undefined) throw Error('query is required.')
     const plan = searchPlan(a)
+    if (
+      a.from !== undefined &&
+      !(await env.DB.prepare('SELECT 1 FROM recordings WHERE finished_at>? LIMIT 1')
+        .bind(time(a.from))
+        .first())
+    )
+      return { results: [], next_cursor: null }
     const { results } = await env.DB.prepare(plan.sql)
       .bind(...plan.args)
       .all()
@@ -183,7 +186,7 @@ export default {
       return json({ error: 'Authentication required' }, 401)
     if (path !== '/mcp')
       return new Response(
-        'uomi — Private transcript search MCP. Configure NOTION_TOKEN and NOTION_DATA_SOURCE_ID in Sites, then run sync_index until caught up. POST /mcp exposes search_transcripts, recordings_in_range, read_transcript and index_status.',
+        'Uomi transcript API. POST /mcp exposes search_transcripts, recordings_in_range, read_transcript and index_status. Notion backup is optional.',
         { headers: { 'Content-Type': 'text/plain; charset=utf-8' } },
       )
     if (request.method !== 'POST') return json({ error: 'POST required' }, 405)

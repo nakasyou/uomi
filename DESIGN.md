@@ -8,5 +8,6 @@ Web visual authority is the supplied Google Recorder screenshot: charcoal canvas
 blue transport controls, left recording list, a rounded split waveform/transcript
 panel and fixed playback controls. See apps/web/DESIGN.md for its tokens. Mobile
 stacks reading and waveform, with a recordings drawer. Never synthesize a fake
-waveform or word timestamps. Cached, saved in Notion, and transcribed are distinct
-states. No cached receipt may authorize removal of an unconfirmed local original.
+waveform or word timestamps. Server storage, transcription and optional Notion
+backup are distinct states. Removal requires a confirmed server save receipt.
+Show operation-specific failures with their diagnostic details and retry action.

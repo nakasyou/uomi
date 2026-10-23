@@ -420,7 +420,12 @@ pub async fn import_ring(
     }
     let began = Instant::now();
     let mut trace = TransferTrace::new();
-    if trace.enabled { eprintln!("UOMI_BLE_TRACE {}", json!({"event":"start", "requested_records":count,"mtu":mtu})); }
+    if trace.enabled {
+        eprintln!(
+            "UOMI_BLE_TRACE {}",
+            json!({"event":"start", "requested_records":count,"mtu":mtu})
+        );
+    }
     let mut last = Instant::now();
     let mut storage_ms = 0.0;
     let mut bytes = 0usize;
@@ -465,7 +470,14 @@ pub async fn import_ring(
             }
         }
     }.await;
-    trace.report(if result.is_ok() { "done" } else { "error" }, bytes, committed, storage_ms, mtu, largest);
+    trace.report(
+        if result.is_ok() { "done" } else { "error" },
+        bytes,
+        committed,
+        storage_ms,
+        mtu,
+        largest,
+    );
     *state.bulk.lock().map_err(error)? = None;
     state
         .bulk_cancelled

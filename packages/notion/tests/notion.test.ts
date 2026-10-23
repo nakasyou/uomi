@@ -283,3 +283,34 @@ test('setup reuses source metadata and concurrent uploads share the limit lookup
   ])
   expect(fake.requests.filter((r) => r.path === '/users/me')).toHaveLength(1)
 })
+
+test('Notion diagnostics retain validation message and request ID while redacting credentials', async () => {
+  const transport = httpTransport(
+    'private-token',
+    Object.assign(
+      async () =>
+        Response.json(
+          {
+            code: 'validation_error',
+            message: 'Missing Audio property; private-token',
+            request_id: 'notion-request-42',
+            extra: 'do-not-copy',
+          },
+          { status: 400 },
+        ),
+      { preconnect: fetch.preconnect },
+    ),
+  )
+  try {
+    await transport({ path: '/pages', method: 'POST', body: {} })
+    throw Error('Expected request failure')
+  } catch (error) {
+    const diagnostic = String(error)
+    expect(diagnostic).toContain('Notion HTTP 400')
+    expect(diagnostic).toContain('POST /pages')
+    expect(diagnostic).toContain('Missing Audio property')
+    expect(diagnostic).toContain('notion-request-42')
+    expect(diagnostic).not.toContain('private-token')
+    expect(diagnostic).not.toContain('do-not-copy')
+  }
+})

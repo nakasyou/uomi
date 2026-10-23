@@ -10,10 +10,10 @@ export class SyncEta {
       this.samples = []
       return null
     }
-    // Verified chunks cover the whole upload pipeline, rather than just network writes.
-    const chunks = progress.chunksTotal !== undefined
+    // Upload ETA follows accepted network deliveries, independently of server saves.
+    const chunks = progress.stage === 'upload' && progress.chunksTotal !== undefined
     const total = chunks ? progress.chunksTotal! : progress.total
-    const completed = chunks ? (progress.chunksCompleted ?? 0) : progress.completed
+    const completed = chunks ? (progress.chunksSubmitted ?? 0) : progress.completed
     const key = `${progress.stage}:${chunks}:${total}`
     const last = this.samples.at(-1)
     if (key !== this.key || (last && (completed < last.completed || now < last.at))) {

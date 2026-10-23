@@ -15,7 +15,15 @@ export class ReservationCoordinator {
   ) {}
   reserve(value: unknown): Promise<{ pageId: string }> {
     const task = this.chain.then(() => this.perform(value))
-    this.chain = task.catch(() => {})
+    // A failed reservation must not poison later reservations; task still rejects to its caller.
+    this.chain = task.catch((error) => {
+      console.error(
+        JSON.stringify({
+          stage: 'legacy_reservation',
+          error: error instanceof Error ? error.message : String(error),
+        }),
+      )
+    })
     return task
   }
   async close() {

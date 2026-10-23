@@ -1,3 +1,4 @@
+import { enqueue, validateSegments } from './jobs.ts'
 import { normalizeSearch } from './search.js'
 import { saveManifest } from './manifest.ts'
 import { Buffer } from 'buffer'
@@ -28,6 +29,30 @@ export async function attachment(url: string, max: number) {
   }
   return Buffer.concat(parts)
 }
+export async function readDetailedTranscript(store: NotionStore, page: any) {
+  const p = page.properties
+  let transcript = text(p['Detailed preview']?.rich_text),
+    segments: ReturnType<typeof validateSegments> = []
+  if (p['Detailed transcript']?.files?.[0]?.file?.url) {
+    const data = JSON.parse(
+      (await attachment(store.fileUrl(page, 'Detailed transcript'), 1024 * 1024)).toString(),
+    )
+    if (
+      data.schema !== 'uomi.transcript.v1' ||
+      typeof data.text !== 'string' ||
+      data.provider !== 'codex'
+    )
+      throw Error('Invalid detailed transcript attachment')
+    transcript = data.text
+    segments = validateSegments(data.segments, null)
+  }
+  return {
+    detailed_status: p['Detailed status']?.select?.name ?? null,
+    detailed_text: transcript,
+    detailed_segments: segments,
+    detailed_error: text(p['Detailed error']?.rich_text),
+  }
+}
 export async function cachePage(env: any, page: any) {
   const store = new NotionStore(httpTransport(env.NOTION_TOKEN), env.NOTION_DATA_SOURCE_ID),
     p = page.properties,
@@ -38,13 +63,19 @@ export async function cachePage(env: any, page: any) {
     .bind(page.id, canonicalId, page.id)
     .first()
   const id = old?.id ?? canonicalId
-  // Never replace an upload that has not finished reaching the source of truth.
-  if (old && old.backup_step !== 'done' && old.backup_step !== 'legacy')
-    return { id, skipped: 'pending-source-write' }
+  // Import is one-way: backups must never overwrite or delete primary edits/results.
+  if (old?.primary_owned)
+    return {
+      id,
+      skipped: 'primary-owned',
+      ...(!old.audio_key ? { audio_imported: false, warning: 'missing_audio' } : {}),
+    }
   if (page.archived || page.in_trash) {
     await env.DB.batch([
-      env.DB.prepare('DELETE FROM source_ranges WHERE recording_id=(SELECT rid FROM recordings WHERE id=?)').bind(id),
-      env.DB.prepare('DELETE FROM recordings WHERE id=?').bind(id),
+      env.DB.prepare(
+        'DELETE FROM source_ranges WHERE recording_id=(SELECT rid FROM recordings WHERE id=? AND primary_owned=0)',
+      ).bind(id),
+      env.DB.prepare('DELETE FROM recordings WHERE id=? AND primary_owned=0').bind(id),
     ])
     return { id, removed: true }
   }
@@ -53,7 +84,7 @@ export async function cachePage(env: any, page: any) {
     old.notion_edited === page.last_edited_time &&
     old.audio_key &&
     (await env.BUCKET.head(old.audio_key)) &&
-    (old.manifest_gzip || (old.manifest_key && await env.BUCKET.head(old.manifest_key)))
+    (old.manifest_gzip || (old.manifest_key && (await env.BUCKET.head(old.manifest_key))))
   )
     return { id, unchanged: true }
   let audioKey: string | null = null,
@@ -78,7 +109,8 @@ export async function cachePage(env: any, page: any) {
     })
     manifestKey = await saveManifest(env, manifest)
   }
-  let transcript = text(p['Transcript preview']?.rich_text)
+  let transcript = text(p['Transcript preview']?.rich_text),
+    segments: ReturnType<typeof validateSegments> = []
   if (p.Transcript?.files?.[0]?.file?.url) {
     const data = JSON.parse(
       (await attachment(store.fileUrl(page, 'Transcript'), 1024 * 1024)).toString(),
@@ -86,7 +118,9 @@ export async function cachePage(env: any, page: any) {
     if (data.schema !== 'uomi.transcript.v1' || typeof data.text !== 'string')
       throw Error('Invalid transcript attachment')
     transcript = data.text
+    segments = validateSegments(data.segments, null)
   }
+  const detailed = await readDetailedTranscript(store, page)
   const start = p.recorded_at_ms?.number ?? Date.parse(p['Recorded at']?.date?.start),
     duration = (p['Duration (s)']?.number ?? 0) * 1000,
     finish = p.record_finished_at_ms?.number ?? start + duration,
@@ -95,7 +129,7 @@ export async function cachePage(env: any, page: any) {
     status = p.Status?.select?.name ?? 'Pending'
   await env.DB.batch([
     env.DB.prepare(
-      "INSERT INTO recordings(id,recorded_at,finished_at,edited_at,device,status,url,text,audio_key,audio_sha,duration_ms,manifest_key,title,starred,backup_step,backup_page,notion_edited,search_text,search_version) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'done',?,?,?,1) ON CONFLICT(id) DO UPDATE SET recorded_at=excluded.recorded_at,finished_at=excluded.finished_at,edited_at=excluded.edited_at,device=excluded.device,status=excluded.status,url=excluded.url,text=excluded.text,audio_key=excluded.audio_key,audio_sha=excluded.audio_sha,duration_ms=excluded.duration_ms,manifest_key=excluded.manifest_key,manifest_gzip=NULL,title=excluded.title,starred=excluded.starred,backup_step='done',backup_page=excluded.backup_page,notion_edited=excluded.notion_edited,search_text=excluded.search_text,search_version=1",
+      "INSERT INTO recordings(id,recorded_at,finished_at,edited_at,device,status,url,text,audio_key,audio_sha,duration_ms,manifest_key,title,starred,backup_step,backup_page,notion_edited,search_text,search_version) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'done',?,?,?,1) ON CONFLICT(id) DO UPDATE SET recorded_at=excluded.recorded_at,finished_at=excluded.finished_at,edited_at=excluded.edited_at,device=excluded.device,status=excluded.status,url=excluded.url,text=excluded.text,audio_key=excluded.audio_key,audio_sha=excluded.audio_sha,duration_ms=excluded.duration_ms,manifest_key=excluded.manifest_key,manifest_gzip=NULL,title=excluded.title,starred=excluded.starred,backup_step='done',backup_page=excluded.backup_page,notion_edited=excluded.notion_edited,search_text=excluded.search_text,search_version=1 WHERE recordings.primary_owned=0",
     ).bind(
       id,
       Number.isFinite(start) ? start : null,
@@ -115,18 +149,42 @@ export async function cachePage(env: any, page: any) {
       page.last_edited_time,
       normalizeSearch(transcript),
     ),
-    env.DB.prepare('DELETE FROM source_ranges WHERE recording_id=(SELECT rid FROM recordings WHERE id=?)').bind(id),
-    ...sourceSpans.map((range) =>
-      env.DB.prepare('INSERT INTO source_ranges VALUES(?,?,?,?,(SELECT rid FROM recordings WHERE id=?))').bind(
-        text(p.Device?.rich_text),
-        range.prefix,
-        range.start,
-        range.end,
-        id,
-      ),
+    env.DB.prepare(
+      'UPDATE recordings SET detailed_status=?,detailed_text=?,detailed_error=?,transcript_segments=?,detailed_segments=? WHERE id=? AND primary_owned=0',
+    ).bind(
+      detailed.detailed_status,
+      detailed.detailed_text,
+      detailed.detailed_error,
+      JSON.stringify(segments),
+      JSON.stringify(detailed.detailed_segments),
+      id,
     ),
+    env.DB.prepare(
+      'DELETE FROM source_ranges WHERE recording_id=(SELECT rid FROM recordings WHERE id=? AND primary_owned=0)',
+    ).bind(id),
+    env.DB.prepare(`INSERT INTO source_ranges SELECT ?,json_extract(value,'$.prefix'),json_extract(value,'$.start'),json_extract(value,'$.end'),
+      (SELECT rid FROM recordings WHERE id=?) FROM json_each(?) WHERE EXISTS(SELECT 1 FROM recordings WHERE id=? AND primary_owned=0)`).bind(
+      text(p.Device?.rich_text),
+      id,
+      JSON.stringify(sourceSpans),
+      id,
+    ),
+    env.DB.prepare('UPDATE recordings SET primary_owned=1 WHERE id=?').bind(id),
   ])
-  return { id, cached: true }
+  if (audioKey && status !== 'Completed') await enqueue(env, id)
+  return {
+    id,
+    cached: true,
+    audio_imported: !!audioKey,
+    ...(!audioKey
+      ? {
+          warning: 'missing_audio',
+          missing_source_files: ['Audio', 'Manifest'].filter(
+            (name) => !p[name]?.files?.[0]?.file?.url,
+          ),
+        }
+      : {}),
+  }
 }
 export async function resync(env: any, reset = false) {
   if (!env.NOTION_TOKEN || !env.NOTION_DATA_SOURCE_ID)
@@ -206,7 +264,15 @@ export async function resync(env: any, reset = false) {
         hasMore ? started : null,
       )
       .run()
+    await env.DB.prepare('UPDATE resync_state SET last_error=NULL,updated_at=? WHERE id=1')
+      .bind(Date.now())
+      .run()
     return { processed: updates.length, has_more: hasMore, updates }
+  } catch (e) {
+    await env.DB.prepare('UPDATE resync_state SET last_error=?,updated_at=? WHERE id=1')
+      .bind(String((e as Error).message).slice(0, 4000), Date.now())
+      .run()
+    throw e
   } finally {
     await env.DB.prepare('UPDATE resync_state SET lease_until=0 WHERE id=1').run()
   }

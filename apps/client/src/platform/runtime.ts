@@ -51,6 +51,9 @@ function nativePort(): Port {
     JSON.parse(await native.notion(JSON.stringify(request))),
   )
   return {
+    acknowledgeAudio: (updates) => native.acknowledgeAudio(JSON.stringify(updates)),
+    uploadStatus: (endpoint, header, ids) =>
+      native.uploadStatus(endpoint, header, JSON.stringify(ids)).then(JSON.parse),
     optimizeAudio: () => native.optimizeAudio(),
     cancelImport: (id) => native.cancelImport(id),
     importRing: async (request, progress) => {
@@ -123,7 +126,8 @@ function nativePort(): Port {
       }
       return native.schedule(JSON.stringify(s))
     },
-    post: native.post,
+    post: (endpoint, header, body, compression, id, binary = false) =>
+      native.post(endpoint, header, body, compression, id, binary),
     subscribe: async (service, char, listener) => {
       const sub = events.addListener('UomiBle', (e: any) => {
         if (e.char === char) listener(e.data)
@@ -145,14 +149,18 @@ let engine: Engine | undefined
 export function getEngine() {
   if (!engine) {
     engine = new Engine(nativePort())
-    void engine.setActive(AppState.currentState === 'active')
+    void engine
+      .setActive(AppState.currentState === 'active')
+      .catch((error) => engine!.reportError('App lifecycle failed', error))
   }
   return engine
 }
 export const client: Client = Platform.OS === 'web' ? (window.uomi ?? previewClient()) : getEngine()
 if (Platform.OS !== 'web')
   AppState.addEventListener('change', (state) => {
-    void getEngine().setActive(state === 'active')
+    void getEngine()
+      .setActive(state === 'active')
+      .catch((error) => getEngine().reportError('App lifecycle failed', error))
   })
 function previewClient(): Client {
   const snapshot = {

@@ -1,122 +1,127 @@
-# Uomi Web Recorder
+# Uomi web app
 
-Void 1.2 / React viewer + private Sites MCP. Single owner, multiple capture devices.
-**Notion is canonical.** D1 stores rebuildable metadata, original/normalized transcripts and compact FTS; R2 stores
-rebuildable audio and compact manifest copies plus staged uploads waiting for Notion.
+Void / React library with a private Sites API and MCP. R2 holds original Ogg audio
+and compressed manifests; D1 holds primary metadata, full transcripts, search,
+source identity claims, optional backup checkpoints, and durable transcription jobs.
+Notion is an optional backup/import integration.
 
-## Flow
+## Persistence
 
-1. Capture client stores original Omi packets locally, groups bounded chunks and
-   POSTs one `uomi.audio.v1` chunk to `/api/chunks` with an idempotency key.
-2. Worker validates Opus packets and identity, muxes original bytes to Ogg, stores
-   R2 audio/manifest objects and a transactional D1 row/source interval claims. A 202 receipt means
-   staged only, **not** saved in Notion. The client retains local audio.
-3. `waitUntil` advances Notion save checkpoints: page → audio → manifest → attach
-   → readback/hash verification → transcript → done. A durable D1 lease and
-   checkpoints permit resumption after the 30-second background budget.
-4. Reposting the same chunk advances outstanding work without duplicating it;
-   only a confirmed canonical save returns `notion_saved:true`. Manual clearing
-   on the client is permitted only after this acknowledgement. Automatic local
-   deletion is disabled. A hash mismatch or partially overlapping chunk
-   fails visibly rather than claiming success or deleting source audio.
-5. The existing transcriber daemon processes Notion Pending pages. Resync imports
-   its resulting transcripts into D1. There is no server transcription model.
+1. The client POSTs original Ogg plus source/timing manifest to `/api/chunks` with
+   the recording ID as `Idempotency-Key`. The Worker validates identity and SHA-256.
+2. Original bytes and the manifest are written to R2. A D1 transaction commits the
+   recording, exclusive source interval claims, and standard transcription job.
+3. HTTP 201 with `saved:true` confirms primary persistence. Duplicate submissions
+   return HTTP 200; Notion confirmation is informational and never gates receipts.
+4. Local audio remains until the user explicitly clears confirmed recordings.
+   Partial overlaps and changed source bytes fail without deleting audio.
+5. API workers claim jobs, renew leases and commit transcripts. The API transaction
+   checks the lease token before saving text and completion. Stale results get 409.
+6. Optional Notion backup advances independently with a D1 lease, checkpoints,
+   persistent error/attempt state and exponential backoff. Ingest/status activity
+   and daemon claims resume due work. Backup failures do not change primary-save
+   or transcription results.
 
-Notion page-creation timeouts are explicitly `uncertain`, not blindly retried.
-The retry endpoint first searches for the existing recording ID. If absent, the
-owner must resolve the Notion outcome rather than risk creating duplicate pages.
+## Authentication
+
+Data routes accept a Sites-authenticated owner identity or a revocable device key
+in `X-Uomi-Secret`. Private Site service access additionally needs
+`OAI-Sites-Authorization: Bearer <token>`. Device creation/revocation and detailed-job requests
+require the owner. A dedicated `UOMI_WORKER_SECRET` (legacy fallback
+`UOMI_WEBHOOK_SECRET`) grants only job/audio/manifest transport and bounded historical
+migration, not owner or capture privileges. Browser writes reject a different Origin. No provider tokens
+are returned to browser code.
 
 ## API
 
-All data routes require Sites visitor identity, or a revocable device key via
-`X-Uomi-Secret` plus Sites' private service access header. No multi-tenant schema.
+- `POST /api/chunks`: binary `application/vnd.uomi.ogg` envelope, maximum 12 MiB.
+  Legacy JSON uploads remain accepted. Receipt includes `id`, `sha256`, `saved`,
+  informational `notion_saved`, and the standard `transcription` job.
+- `POST /api/chunks/status` `{ids}`: up to 64 recording IDs. Each upload has
+  `status:'saved'|'missing'`, separate `backup_status`/`backup_error`, and a
+  `transcription` job. Backup failures never turn a persisted upload into failed.
+- `GET /api/recordings`: newest-first cursor pagination; `q` searches normalized
+  literal substrings; `from`/`to` filter overlapping recording intervals;
+  `starred=1` filters stars. Rows include a standard-job summary.
+- `GET /api/recordings/:id`: metadata, standard/detailed text and statuses,
+  separate job objects, `segments`, `detailed_segments`, backup state and errors.
+- `GET /api/recordings/:id/audio`: authenticated R2 stream with byte ranges.
+- `GET /api/recordings/:id/manifest`: original source/timing manifest.
+- `PATCH /api/recordings/:id` `{title?,starred?}`: immediate D1 edit; optional
+  Notion update follows independently.
+- `POST /api/recordings/:id/transcription`: enqueue/retry a failed standard job.
+  Repeated requests do not duplicate work. Explicit `{retry:true}` requeues a
+  completed/failed job and preserves the previous transcript until replacement.
+  `/transcribe` remains an alias for older web clients.
+- `POST /api/recordings/:id/detailed-transcription`: owner-only durable detailed
+  job; no Notion dependency. `GET` reads its persisted result without network calls.
+- `GET /api/jobs`: up to 100 recent durable jobs, including stage/progress,
+  attempt, error, retry availability, lease expiry and last update time.
+- `POST /api/jobs/claim`: atomically claim up to eight jobs using `worker_id`,
+  `limit`, and `lease_seconds` (30–300). Returns same-origin audio/manifest URLs,
+  mode, attempt, opaque lease token and lease expiry.
+- `POST /api/jobs/:id/heartbeat`: renew token with optional stage/progress.
+- `POST /api/jobs/:id/complete`: commit `text`, optional `segments` and `model`;
+  same completed token is idempotent. Replaced/expired leases return 409.
+- `POST /api/jobs/:id/fail`: persist actual `error`, `retryable` and optional
+  `retry_after_seconds`; retry uses bounded exponential delay, maximum eight
+  attempts. Manual retry starts a fresh attempt budget.
+- `POST /api/recordings/:id/backup`: retry optional Notion backup. Unconfirmed page
+  creation is searched by recording ID; absent pages remain explicitly unconfirmed.
+- `GET/POST /api/migrations/notion`: worker/owner-only bounded import; POST
+  `{reset:true}` once, then `{}` until `has_more:false`. GET returns persisted
+  state and the last import error.
+- `POST /api/resync` `{reset?:boolean}`: migrate one historical Notion page
+  per request; repeat while `has_more`. Reset starts a complete scan. Progress
+  persists. `POST /api/recordings/:id/resync` imports one legacy page.
+- `POST/GET /api/clients`, `DELETE /api/clients/:hash`: owner key management.
 
-- `POST /api/chunks`: max 12 MiB JSON, 900 seconds/45,000 Opus packets, 1,500 ranges.
-- `GET /api/recordings`: bounded newest-first cursor pages, `q` literal substring
-  (minimum 2 characters after normalization), `from`/`to` overlap filters and `starred=1`.
-- `GET /api/recordings/:id`: cached metadata and full transcript.
-- `GET /api/recordings/:id/audio`: authenticated R2 streaming with byte ranges.
-- `PATCH /api/recordings/:id`: write title/star to Notion, then update cache.
-- `POST /api/recordings/:id/backup`: resume a pending Notion save.
-- `POST /api/recordings/:id/resync`: reread that canonical page and audio/transcript.
-- `POST /api/resync` `{reset?:boolean}`: import one changed Notion page per call;
-  repeat while `has_more`. Reset starts an exhaustive reread without destroying
-  staged uploads. Progress persists between calls. Source files capped at 20 MiB
-  per audio, 6 MiB manifest and 1 MiB transcript; failed reads do not checkpoint.
-- `POST/GET /api/clients`, `DELETE /api/clients/:hash`: owner-only key management.
+Unexpected failures return HTTP 500 with the actual bounded error, `code` and
+`request_id`; structured Worker logs retain the stack. Input errors return 400,
+missing resources 404, and stale job leases 409. Job/provider and backup errors
+also remain in D1 for display after reload.
 
-Downloads/search need no live Notion calls once cached. Source resync takes the
-slower upstream path and uses canonical page IDs, attachment hash validation,
-transactional replacement and a watermark overlap. Bulk resync scans both active and archived pages and removes cached archived
-records. Capped queries are split by creation-time windows, with persistent cursors
-and an explicit error for an unsplittable timestamp. Individual resync is also
-available to invalidate one canonical page. Existing
-Notion history can be recached without re-uploading or changing the originals.
+Segments use `{start_ms,end_ms,text,speaker?:string|null}` in the original
+recording timeline. They preserve provider timing; plain-text providers return an
+empty array. Search currently uses the standard transcript. Full result text and
+both segment arrays are primary D1 data and are included in optional Notion backups.
 
-## Configuration
+## Migration and backup
 
-Reuse `.openai/hosting.json` Site identity. Bind D1 as `DB` and R2 as `BUCKET`.
-Set `NOTION_TOKEN` (Read/Insert/Update, dedicated Uomi source),
-`NOTION_DATA_SOURCE_ID` (actual UUID), and `SITES_ACCESS_TOKEN` (the same private
-Site's service token) in Sites secrets. The last is returned only to the owner
-when issuing a device key; no secret is built into JS bundles. A Site sharing
-policy must remain owner-private. Native client keys use Keystore/Secret Service.
+Keep existing `0000`–`0003` migrations unchanged. Apply
+`0004_detailed_transcription.sql`, `0005_jobs.sql`, then
+`0006_query_performance.sql` before publishing. The last adds virtual sort keys and
+indexes verified with realistic query plans; see [query performance](../../docs/query-performance.md). Existing
+recording IDs, audio keys and transcripts survive. Existing audio-bearing pending
+recordings receive durable standard jobs. Existing cached audio becomes primary.
 
-## Development
+Historical import downloads/validates audio and manifests before committing,
+imports standard/detailed transcripts and preserves original IDs and source timing.
+Missing original Audio/Manifest attachments are reported as `warning:missing_audio`
+with `audio_imported:false`; metadata import can continue so incomplete sources
+can be enumerated. It scans active/archived pages with resumable cursors and splits capped queries
+by creation windows. A failed download does not advance the cursor. Once imported,
+a recording is primary-owned: later imports and archived backups cannot overwrite
+its edits/results or delete it. D1/R2 must be retained and backed up as primary data.
+Legacy completion callbacks remain for a staged migration but do not overwrite
+primary-owned recordings; no normal capture/transcription path sends webhooks.
 
-From the repo root: `bun install`, `bun run dev`, `bun run build:viewer`,
-`bun run test:web`. Void supplies file-based server routes and Workers builds.
-`.dev.ts` routes contain labeled visual QA samples and are excluded from builds.
-Production uses the actual D1/R2 bindings. `scripts/package-build.mjs` adapts Void's
-`dist/ssr` Worker output into Sites' `dist/server` contract. SQL stays in `drizzle/`
-for Sites-managed immutable migrations; Void deployment provisioning is not used.
+Configure `DB`, `BUCKET` and `SITES_ACCESS_TOKEN`. Optional Notion settings are
+`NOTION_TOKEN` and `NOTION_DATA_SOURCE_ID`; Notion needs Read/Insert/Update access
+only for backup/import. A daemon uses a web-issued `UOMI_CLIENT_SECRET` and the
+private Site service token. See [worker protocol](../../docs/webhook.md).
 
-The Sites source mirror contains the monorepo so workspace packages resolve. It
-builds `apps/web` and packages its Worker/client assets plus the same migrations.
-The GitHub PR does not auto-deploy. Android/BLE and Linux native behavior still
-need hardware verification; JS protocol, storage and acknowledgement flows have
-automated tests.
+## Development and storage format
 
-## Storage/search format v2
+Run `bun run dev`, `bun run build:viewer`, `bun run test:web` and
+`bun run typecheck` from the repository root. `.dev.ts` routes supply explicit
+visual samples and are excluded from production. `scripts/package-build.mjs`
+adapts Void output into Sites' Worker/client contract; SQL stays in `drizzle/`.
 
-`recordings.rid` is a stable INTEGER PRIMARY KEY; public `id` and Notion page IDs
-remain unchanged. Source interval foreign keys and FTS doc IDs use `rid`. The
-source range table uses WITHOUT ROWID. The old unused sync_state is removed.
-
-Original text is retained for display and UTF-16 offsets. Search text is NFKC,
-lowercase, katakana-to-hiragana folded, NFC, with Unicode whitespace/zero-width
-spaces removed. This does not equate phonetic spellings with English names.
-Two-code-point queries use escaped LIKE on normalized text, constrained by dates
-when supplied. Longer queries intersect unique trigrams in external-content FTS5
-with detail=none/columnsize=0 and verify substring order/multiplicity with instr.
-FTS no longer stores a second text/UUID copy or token positions.
-
-New manifests are gzip-compressed range runs in content-addressed R2 objects;
-Notion's canonical v1 manifest is unchanged. D1 stores their keys and source claims.
-Legacy D1 blobs and text normalization migrate in bounded restart-safe batches
-through index_status or search (100 records and one manifest per invocation).
-Public search is explicit about incomplete migration instead of dropping rows.
-Clear a legacy blob only after an R2 readback/hash check succeeds. Deleted objects
-can be restored through Notion resync. Freed SQLite pages may remain allocated
-for reuse; a smaller payload does not imply an immediately smaller database file.
-
-## Automatic transcription handoff
-
-Configure `TRANSCRIBER_WEBHOOK_URL` and `UOMI_WEBHOOK_SECRET` in Sites secrets.
-Use an HTTPS daemon `/webhook` endpoint and the daemon's existing 24+ character
-shared secret. Never put them in the hosting manifest or client bundle.
-After Notion verification, D1 journals a notification and waitUntil attempts a
-short authenticated webhook call. Due notifications retry during subsequent
-API/index-status activity; the daemon's Notion polling is the independent idle
-fallback. `index_status.transcriber` reports configuration and pending deliveries.
-`POST /api/recordings/:id/transcribe` manually retries notification.
-
-Configure the daemon with the Site origin in `SITES_URL` and its private service
-token in `SITES_ACCESS_TOKEN`. Completion callbacks use this token plus the shared
-secret. The URL is trusted local configuration, never a webhook-supplied target.
-The daemon persists a completion event before writing Notion Completed and
-retries from disk every recovery cycle, including after restart. Sites reads
-Notion's canonical transcript and commits normalized text/FTS before returning
-`saved:true`; it does not wait for another full audio resync. Duplicate callbacks
-are idempotent. The original audio cache and source range claims are preserved.
-Failed completion delivery does not mark successful transcription as Failed.
+`recordings.rid` is the stable integer primary key; public `id` values do not
+change. Source claims and FTS use integer IDs. Original text stays intact for
+reading; search text is NFKC/lowercase/kana/whitespace normalized. Two-code-point
+queries use escaped LIKE; longer queries intersect compact trigrams and verify
+exact substring order. Legacy normalization/manifests migrate in bounded batches
+through search/index-status, with explicit readiness errors rather than lost rows.
+New manifests are gzip-compressed range runs in content-addressed R2 objects.

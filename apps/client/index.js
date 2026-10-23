@@ -8,7 +8,8 @@ AppRegistry.registerHeadlessTask('UomiSync', () => async () => {
     await e.init()
     await e.sync('periodic')
     await NativeModules.Uomi.finishPeriodic(!e.getSnapshot().error)
-  } catch {
+  } catch (error) {
+    e.reportError('Background sync failed', error)
     await NativeModules.Uomi.finishPeriodic(false)
   }
 })

@@ -13,18 +13,18 @@ test('ETA learns observed throughput, includes stalls, and resets on stage/resta
   assert.equal(eta.remaining({ ...progress(20), stage: 'upload' }, 30000), null)
   assert.equal(eta.remaining(progress(100), 40000), 0)
 })
-test('upload ETA waits for verified chunks and unknown totals never fabricate an estimate', () => {
+test('upload ETA follows sent chunks independently of save confirmation and unknown totals never fabricate an estimate', () => {
   const eta = new SyncEta()
   const p: SyncProgress = {
     stage: 'upload',
     total: 100,
     completed: 90,
     chunksTotal: 10,
-    chunksCompleted: 0,
+    chunksSubmitted: 0,
   }
   assert.equal(eta.remaining(p, 0), null)
   assert.equal(eta.remaining({ ...p, completed: 100 }, 10000), null)
-  assert.equal(eta.remaining({ ...p, chunksCompleted: 2 }, 20000), 80000)
+  assert.equal(eta.remaining({ ...p, chunksSubmitted: 2 }, 20000), 80000)
   assert.equal(eta.remaining(null, 21000), null)
   assert.equal(eta.remaining({ ...progress(10), total: 0 }, 22000), null)
   assert.equal(etaLabel(null), 'Estimating…')

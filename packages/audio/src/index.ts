@@ -1,4 +1,28 @@
 import { Buffer } from 'buffer'
+export const OGG_UPLOAD_TYPE = 'application/vnd.uomi.ogg'
+
+// Wire format: uint32 big-endian JSON byte length, UTF-8 metadata, original Ogg.
+export function encodeOggUpload(manifest: unknown, audio: Uint8Array): Buffer {
+  const metadata = Buffer.from(JSON.stringify({ schema: 'uomi.ogg.v1', manifest }))
+  const header = Buffer.alloc(4)
+  header.writeUInt32BE(metadata.length)
+  return Buffer.concat([header, metadata, audio])
+}
+export function decodeOggUpload(input: Uint8Array): { manifest: unknown; audio: Buffer } {
+  const data = Buffer.from(input.buffer, input.byteOffset, input.byteLength)
+  if (data.length < 4) throw Error('Truncated Ogg upload')
+  const end = 4 + data.readUInt32BE(0)
+  if (end >= data.length) throw Error('Truncated Ogg upload')
+  const metadata = JSON.parse(data.subarray(4, end).toString())
+  if (metadata.schema !== 'uomi.ogg.v1') throw Error('Invalid Ogg upload schema')
+  const audio = data.subarray(end)
+  if (
+    audio.subarray(0, 4).toString() !== 'OggS' ||
+    audio.subarray(28, 36).toString() !== 'OpusHead'
+  )
+    throw Error('Expected Ogg Opus audio')
+  return { manifest: metadata.manifest, audio }
+}
 export interface Frame {
   id: string
   data: string

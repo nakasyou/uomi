@@ -52,10 +52,10 @@ test('daemon verifies audio, runs ffmpeg, writes transcript to Notion and ignore
       if (new URL(req.url).pathname === '/api/transcriber/completed') {
         callbacks++
         expect(req.headers.get('X-Uomi-Webhook-Secret')).toBe('test')
-        const payload = await req.json() as {pageId:string}
-        expect(payload.pageId).toBe(page.id.replaceAll('-',''))
+        const payload = (await req.json()) as { pageId: string }
+        expect(payload.pageId).toBe(page.id.replaceAll('-', ''))
         expect((await store.page(page.id)).properties.Status.select.name).toBe('Completed')
-        return Response.json({saved:true})
+        return Response.json({ saved: true })
       }
       const id = new URL(req.url).pathname.slice(1)
       const bytes = fake.files.get(id)
@@ -70,12 +70,17 @@ test('daemon verifies audio, runs ffmpeg, writes transcript to Notion and ignore
     )
   let calls = 0
   let providerStarted!: () => void
-  const providerReady = new Promise<void>(resolve => { providerStarted = resolve })
+  const providerReady = new Promise<void>((resolve) => {
+    providerStarted = resolve
+  })
   const daemon = new Daemon(
     store,
     {
       secret: 'test',
-      sitesCallback: {url:`http://127.0.0.1:${server.port}/api/transcriber/completed`,accessToken:'test-site-token'},
+      sitesCallback: {
+        url: `http://127.0.0.1:${server.port}/api/transcriber/completed`,
+        accessToken: 'test-site-token',
+      },
       provider: 'chrome-recognizetion',
       splitSeconds: 900,
       language: 'ja',
@@ -107,6 +112,44 @@ test('daemon verifies audio, runs ffmpeg, writes transcript to Notion and ignore
     await restarted.close()
     expect(callbacks).toBe(2)
     expect(calls).toBe(1)
+    const providers: string[] = []
+    let fail = true
+    const recognize = async (_file: string, options: any) => {
+      providers.push(options.provider)
+      if (fail) throw Error('Codex unavailable')
+      return { text: 'Detailed Codex transcript' }
+    }
+    const detailed = new Daemon(store, daemon.config, recognize)
+    expect(await detailed.accept(page.id, 'detailed')).toEqual({ accepted: true })
+    expect(await detailed.accept(page.id, 'detailed')).toEqual({ accepted: false })
+    await detailed.close()
+    let current = await store.page(page.id)
+    expect(current.properties['Detailed status'].select.name).toBe('Failed')
+    expect(current.properties.Status.select.name).toBe('Completed')
+    expect(current.properties['Detailed attempts'].number).toBe(1)
+    expect(Date.parse(current.properties['Detailed retry after'].date.start)).toBeGreaterThan(
+      Date.now(),
+    )
+    const recovered = new Daemon(store, daemon.config, recognize)
+    expect(await recovered.recover()).toBe(0)
+    await store.update(page.id, { 'Detailed retry after': { date: null } })
+    fail = false
+    expect(await recovered.recover()).toBe(1)
+    await recovered.close()
+    expect(providers).toEqual(['codex', 'codex'])
+    current = await store.page(page.id)
+    expect(current.properties['Detailed status'].select.name).toBe('Completed')
+    expect(current.properties.Status.select.name).toBe('Completed')
+    expect(JSON.parse(await fake.attachment(page.id, 'Transcript')).text).toBe('Test transcript')
+    const detailFile = current.properties['Detailed transcript'].files[0].file_upload.id
+    const result = JSON.parse(Buffer.from(fake.files.get(detailFile)!).toString())
+    expect(result.text).toBe('Detailed Codex transcript')
+    expect(result.provider).toBe('codex')
+    expect(result.mode).toBe('detailed')
+    const final = new Daemon(store, daemon.config, recognize)
+    expect(await final.accept(page.id, 'detailed')).toEqual({ accepted: false, completed: true })
+    expect(await final.recover()).toBe(0)
+    await final.close()
   } finally {
     server.stop(true)
     await rm(dir, { recursive: true, force: true })

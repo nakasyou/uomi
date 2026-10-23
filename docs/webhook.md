@@ -1,63 +1,60 @@
-# Webhook contract
+# Transcriber API transport
 
-Uomi POSTs an HTTPS request directly to your configured endpoint. Successful HTTP **2xx** means the receiver has durably accepted **every** frame. Other responses, timeouts and redirects leave audio queued. Redirects are intentionally not followed because a secret header must not be forwarded to another server.
+The daemon polls the private Uomi API. No public listener or webhook is needed.
+Notion is not a queue, a source of transcription input, or a completion checkpoint.
 
-Headers:
+## Configuration
 
-```http
-Content-Type: application/vnd.uomi.audio+json
-Content-Encoding: gzip
-X-Uomi-Secret: <your secret>
-Idempotency-Key: <SHA-256 of the ordered frame ID array>
-X-Uomi-Schema: 1
-```
+Set `SITES_URL` to the existing private Site origin, `SITES_ACCESS_TOKEN` to that
+Site's service token, and `UOMI_CLIENT_SECRET` to a key created in web device
+settings, or a dedicated worker secret configured as `UOMI_WORKER_SECRET` in
+Sites. The legacy `UOMI_WEBHOOK_SECRET` is accepted only when no dedicated worker
+secret is configured. Worker credentials cannot upload, edit, or create client keys.
+Requests use `X-OpenAI-Site-Access-Token` and `X-Uomi-Secret`.
+Keep these credentials on the daemon host; never commit `.env` or embed provider
+credentials into web assets. ffmpeg and provider dependencies run on that host.
 
-The secret header name is configurable. `Content-Encoding` is `gzip`, zlib-wrapped `deflate`, or absent for None. Compression wraps the JSON envelope; the audio stays **Opus, mono, 16 kHz**. This version does not transcode into MP3/AAC. The maximum duration is configured in minutes in Settings (decimals allowed, equivalent to 1–900 seconds), computed using the real Opus packet TOC, with a shorter final segment. The library, playback and delivery share these chunk boundaries. Sequence gaps, device/ring changes, clock reversals and forward device timestamp steps over 60 seconds start new chunks. Shorter timestamp gaps are shown in the library without adding silence or changing frame timestamps; partial retries send only the unacknowledged frames within a chunk. The real-time interval uses the same value; delivery can lag until Omi commits an on-device storage packet.
+## Protocol
 
-The decompressed JSON is:
+1. `POST /api/jobs/claim` with `{worker_id,limit,lease_seconds}` atomically selects
+   due jobs. Default limit is one (maximum eight); lease duration is 30–300 seconds.
+   The daemon normally bounds parallelism to two jobs.
+2. Each claimed job contains `id`, `recording_id`, `mode`, `attempt`, `lease_token`,
+   `lease_until`, `duration_ms`, `audio_url` and `manifest_url`. Fetch URLs with the
+   same authentication, validate the manifest and original-audio SHA-256.
+3. `POST /api/jobs/:id/heartbeat` with `{lease_token,stage,progress,lease_seconds}`
+   renews ownership. Progress is 0–1. The web app reads the persisted stage/progress
+   rather than inferring completion from request delivery.
+4. `POST /api/jobs/:id/complete` with `{lease_token,text,segments?,model?}` commits
+   the transcript and completed job transactionally. A repeated receipt for the
+   same completed lease succeeds; expired/replaced leases return 409.
+5. `POST /api/jobs/:id/fail` with `{lease_token,error,retryable?,retry_after_seconds?}`
+   records the actual cause. Retry delay defaults to bounded exponential backoff;
+   maximum eight attempts. Failed jobs remain visible and can be manually retried.
 
-```json
-{
-  "schema": "uomi.audio.v1",
-  "segmentId": "<sha256>",
-  "deviceId": "<hardware serial>",
-  "codec": "opus",
-  "sampleRate": 16000,
-  "channels": 1,
-  "durationMs": 20,
-  "frames": [
-    {
-      "id": "<serial>:<packet digest>:0",
-      "data": "<base64 Opus packet>",
-      "durationMs": 20,
-      "capturedAt": "2026-10-21T09:00:00.000Z",
-      "offsetMs": 0,
-      "recordTimestamp": 1792573200,
-      "timing": "device-utc",
-      "sequence": "9007199254740993",
-      "ringId": "1234567890123456789"
-    }
-  ]
-}
-```
+A process crash leaves an expiring lease. Another worker reclaims it with a new
+opaque token. Every heartbeat/result/failure is fenced by the current lease.
+The daemon stores completed chunk work locally so an interrupted recording can
+resume without repeating already finished provider calls. HTTP failures include
+status, server error and request ID; provider failures remain in job state.
 
-`capturedAt` is derived from the device UTC packet timestamp plus the frame's actual audio offset. Device timestamps have one-second resolution; subsecond offsets within a packet are derived, not extra device clock precision. Sequence and ring IDs are strings to preserve 64-bit values. `offsetMs` is relative to that packet, not the upload segment. When Omi records uptime instead of UTC, `capturedAt` is null and `timing` is `device-uptime`. The raw value is retained; Uomi does not silently invent a capture date. The device RTC is synced **after** downloading the existing snapshot, for subsequent recordings.
+Standard and detailed jobs are separate unique `(recording_id,mode)` records.
+Detailed output never replaces standard text. Optional segments use
+`{start_ms,end_ms,text,speaker?:string|null}` on the original recording timeline,
+including source gaps. Provider-supplied timestamps are preserved; plain text
+never produces invented timing/speaker assignments.
 
-## Multiple clients and retries
+## Release migration
 
-Exactly-once delivery requires receiver cooperation. Use a **unique database constraint on every `frames[].id`**, in a transaction, and only return 2xx after the transaction commits. A segment key alone is insufficient: different clients can choose different segment lengths. Identical frame IDs preserve identity across compression choices, segmentation changes and HTTP retries. Packet identity includes the device serial, ring ID (where provided), ring sequence, and original packet content. Stock firmware reclaims recordings on BLE transfer, before local storage or HTTP acknowledgement. Uomi negotiates custody retention when advertised, but does not require it. Local recordings are retained after HTTP success and removed only by explicit user action. Retrieval by another client after a stock transfer is not guaranteed. The ring is finite; firmware may overwrite old recordings when full. The UI reports the firmware's dropped-packet count.
+Apply web migrations through `0006_query_performance.sql` before starting the API worker.
+It creates jobs for existing unfinished recordings with primary audio. Import
+older Notion history through worker-authenticated `/api/migrations/notion`: POST
+`{reset:true}` only on the first request, then POST `{}` until `has_more:false`.
+GET the same endpoint for persisted status/error. Do not reset between batches; imported pending
+audio also receives a job. Verify a claim, heartbeat, completion and visible web
+result, then remove obsolete daemon public port/webhook configuration.
 
-The local cursor is advanced only after a complete packet is committed to SQLite. A failed upload never advances its per-packet delivery cursor. Freeing delivered local audio leaves compact deduplication tombstones. A second client can retrieve the same remaining ring range, and its receiver must deduplicate overlaps. Only one BLE client can generally connect to a device at a time; competing clients retry on a later sync. There is no distributed BLE connection lock.
-
-## Reference receiver
-
-`receiver/server.py` uses only the Python standard library. It validates the envelope, supports all three compression options, and stores original Opus frames and timing metadata transactionally in SQLite. Its unique frame ledger handles overlapping segments from different clients. It is a starting point for your backend, not a transcription service or a complete internet-facing deployment.
-
-```bash
-export UOMI_WEBHOOK_SECRET='choose-a-long-random-secret'
-python3 receiver/server.py --database /path/to/audio.sqlite
-```
-
-Place an HTTPS reverse proxy in front of `127.0.0.1:8787`, preserving `Content-Encoding`, `Idempotency-Key` and your secret header. Configure the app with `https://your-domain/audio`. Alternatively pass `--cert fullchain.pem --key privkey.pem` for direct TLS. Configure a matching `--secret-header` if changed in the app. Do not let an HTTP framework decompress the body twice.
-
-The receiver stores length-delimited individual Opus packets as BLOBs with metadata; these are not standalone `.opus` files. A downstream consumer can decode individual packets with libopus or mux them into an Ogg container. Unknown device-time recordings remain explicitly untimed until your application applies its own time-reconciliation policy.
+`POST /api/transcriber/completed` remains a compatibility import endpoint for an
+older daemon during rollout. It authenticates the old shared secret and cannot
+overwrite primary-owned recordings. New capture and transcription never call it.
+`transcriber_notifications` is retained only as historical migration state.

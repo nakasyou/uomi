@@ -1,4 +1,5 @@
-import { oggOpus, oggFrames } from './playback'
+import { oggOpus } from './playback'
+import { uploadManifest, uploadBody } from './upload'
 import {
   recordIndex,
   cooperativePlans,
@@ -9,7 +10,7 @@ import {
   type PlanningProgress,
   planningLabel,
 } from './catalog'
-import { forEachBounded, runPipeline, type PipelineProgress } from './pipeline'
+import { forEachBounded } from './pipeline'
 import type { AudioSegment } from './segments'
 import { LiveAssembler } from './live'
 import { Buffer } from 'buffer'
@@ -32,7 +33,7 @@ import {
   opusDuration,
   RecordAssembler,
 } from './protocol'
-import { periodicDue, segments } from './segments'
+import { periodicDue } from './segments'
 
 export class Engine {
   private liveUnsubscribe: (() => Promise<void>) | undefined
@@ -60,8 +61,11 @@ export class Engine {
         try {
           const frame = assembler.push(Buffer.from(data, 'base64'))
           if (frame) onFrame(frame)
-        } catch {
-          /* Discard malformed live packets; never persist debug audio. */
+        } catch (error) {
+          this.update({
+            droppedPackets: (BigInt(this.snapshot.droppedPackets) + 1n).toString(),
+            error: `Live packet rejected: ${String(error)}`,
+          })
         }
       })
       if (generation !== this.monitorGeneration) {
@@ -110,6 +114,53 @@ export class Engine {
     droppedPackets: '0',
   }
   constructor(private port: Port) {}
+  reportError(context: string, error: unknown) {
+    const detail = `${context}: ${error instanceof Error ? error.message : String(error)}`
+    this.update({ error: this.snapshot.error ? `${this.snapshot.error}\n${detail}` : detail })
+  }
+  private jobTimer: ReturnType<typeof setTimeout> | undefined
+  private jobIds: string[] = []
+  private jobsLoading = false
+  private async refreshUploadJobs() {
+    clearTimeout(this.jobTimer)
+    if (!this.port.uploadStatus || !this.jobIds.length || this.jobsLoading || this.disposed) return
+    this.jobsLoading = true
+    const s = this.snapshot.settings
+    const ids = [...this.jobIds]
+    try {
+      const jobs = await this.port.uploadStatus(s.endpoint, s.secretHeader, ids)
+      if (
+        this.disposed ||
+        s.endpoint !== this.snapshot.settings.endpoint ||
+        ids.join() !== this.jobIds.join()
+      )
+        return
+      if (ids.some((id) => !jobs.some((job) => job.id === id)))
+        throw Error('The server did not return every requested job.')
+      this.update({ uploadJobs: jobs, jobStatusError: null })
+    } catch (error) {
+      if (
+        !this.disposed &&
+        s.endpoint === this.snapshot.settings.endpoint &&
+        ids.join() === this.jobIds.join()
+      )
+        this.update({ jobStatusError: `Could not refresh transcription jobs: ${String(error)}` })
+    } finally {
+      this.jobsLoading = false
+      if (
+        !this.disposed &&
+        this.active &&
+        this.jobIds.length &&
+        (!this.snapshot.uploadJobs?.length ||
+          this.snapshot.uploadJobs.some(
+            (job) =>
+              job.transcription &&
+              !['done', 'completed', 'failed'].includes(job.transcription.status),
+          ))
+      )
+        this.jobTimer = setTimeout(() => void this.refreshUploadJobs(), 15000)
+    }
+  }
   private initialization: Promise<void> | undefined
   init() {
     return (this.initialization ??= this.initialize().catch((e) => {
@@ -125,6 +176,7 @@ export class Engine {
     }
   }
   private lastProgressNotification = 0
+  private progressNotificationTimer: ReturnType<typeof setTimeout> | undefined
   private update(p: Partial<Snapshot>) {
     const previous = this.snapshot.progress
     this.snapshot = { ...this.snapshot, ...p }
@@ -137,10 +189,22 @@ export class Engine {
         previous.detail === p.progress.detail &&
         p.progress.completed < p.progress.total &&
         now - this.lastProgressNotification < 150
-      )
+      ) {
+        if (!this.progressNotificationTimer)
+          this.progressNotificationTimer = setTimeout(
+            () => {
+              this.progressNotificationTimer = undefined
+              this.lastProgressNotification = Date.now()
+              if (!this.disposed) this.listeners.forEach((f) => f())
+            },
+            150 - (now - this.lastProgressNotification),
+          )
         return
+      }
       this.lastProgressNotification = now
     }
+    clearTimeout(this.progressNotificationTimer)
+    this.progressNotificationTimer = undefined
     this.listeners.forEach((f) => f())
   }
   private async initialize() {
@@ -168,6 +232,15 @@ export class Engine {
     } catch (e) {
       this.update({ error: e instanceof Error ? e.message : String(e) })
     }
+    const lastUploads = await this.port.get('lastUploads')
+    if (lastUploads) {
+      const stored = JSON.parse(lastUploads)
+      // Jobs belong to one destination; never send another server's identities.
+      if (stored.endpoint === this.snapshot.settings.endpoint && Array.isArray(stored.ids)) {
+        this.jobIds = stored.ids.filter((id: unknown) => typeof id === 'string').slice(-64)
+        void this.refreshUploadJobs()
+      }
+    }
     this.arm()
     // Bounded, transactional migration runs after the library is usable. The native
     // store accepts both formats throughout; no full-history JSON crosses JS.
@@ -187,10 +260,9 @@ export class Engine {
         if (!(await this.port.optimizeAudio!())) break
         await new Promise<void>((resolve) => setTimeout(resolve, 100))
       }
-    } catch {
+    } catch (error) {
       this.update({
-        storageMigrationError:
-          'Storage optimization paused. Existing recordings remain readable; restart to retry.',
+        storageMigrationError: `Storage optimization paused: ${String(error)}. Existing recordings remain readable; restart to retry.`,
       })
     } finally {
       this.optimizingAudio = false
@@ -393,8 +465,18 @@ export class Engine {
       this.update({ settings: previous })
       try {
         await this.port.schedule(previous)
-      } catch {}
+      } catch (restoreError) {
+        throw Error(
+          `Settings could not be scheduled: ${String(e)}. Restoring the previous schedule also failed: ${String(restoreError)}`,
+        )
+      }
       throw e
+    }
+    if (previous.endpoint !== settings.endpoint) {
+      clearTimeout(this.jobTimer)
+      this.jobIds = []
+      await this.port.remove('lastUploads')
+      this.update({ uploadJobs: [], jobStatusError: null })
     }
     this.update({
       settings,
@@ -483,13 +565,14 @@ export class Engine {
     // Serial Number String is optional on Omi, including stock consumer builds.
     // Normalize BlueZ adapter paths and Android MACs to the same identity.
     let serial = ''
+    const warnings: string[] = []
     try {
       serial = Buffer.from(await this.port.read(UUID.info, UUID.serial), 'base64')
         .toString('utf8')
         .replace(/\0/g, '')
         .trim()
-    } catch {
-      // Missing optional DIS metadata must not prevent pairing.
+    } catch (error) {
+      warnings.push(`Device serial unavailable; using Bluetooth identity: ${String(error)}`)
     }
     if (!serial || /^(unknown|0+|f{16})$/i.test(serial)) {
       const mac =
@@ -521,15 +604,17 @@ export class Engine {
     let battery: number | undefined
     try {
       battery = Buffer.from(await this.port.read(UUID.batteryService, UUID.battery), 'base64')[0]
-    } catch {}
+    } catch (error) {
+      warnings.push(`Battery reading unavailable: ${String(error)}`)
+    }
     let micGain: number | undefined
     try {
       const value = Buffer.from(await this.port.read(UUID.settings, UUID.micGain), 'base64')
       if (value.length === 1 && value[0] <= 8) micGain = value[0]
-    } catch {
-      /* Optional device control; recording sync must still work. */
+    } catch (error) {
+      warnings.push(`Microphone gain reading unavailable: ${String(error)}`)
     }
-    return { address, name, serial, firmware, battery, micGain }
+    return { address, name, serial, firmware, battery, micGain, warnings }
   }
   async importDevice() {
     if (!this.snapshot.settings.deviceAddress)
@@ -566,10 +651,11 @@ export class Engine {
         scope === 'device'
           ? 'Preparing Omi import'
           : scope === 'cloud'
-            ? 'Preparing Sites sync'
+            ? 'Preparing upload'
             : 'Preparing sync',
     })
     let syncFailed = false
+    let firstUploadError: unknown
     try {
       // Explicit manual actions are isolated; scheduled sync still runs both stages.
       if (scope !== 'device') {
@@ -577,6 +663,7 @@ export class Engine {
           await this.upload()
         } catch (e) {
           if (scope === 'cloud' || !s.deviceAddress) throw e
+          firstUploadError = e
         }
       }
       if (scope !== 'cloud' && s.deviceAddress) {
@@ -598,21 +685,28 @@ export class Engine {
         phase:
           scope === 'device'
             ? 'Omi recordings saved locally'
-            : 'Sync pass finished; queued audio is retained until Notion confirms save',
+            : this.snapshot.progress?.stage === 'upload'
+              ? this.snapshot.phase
+              : 'Sync complete',
       })
     } catch (e) {
       syncFailed = true
+      const diagnostics = [firstUploadError, e].filter(Boolean).map((error) => String(error))
       if (scope !== 'cloud') {
         try {
           await this.liveUnsubscribe?.()
-        } catch {}
+        } catch (error) {
+          diagnostics.push(`Bluetooth unsubscribe failed: ${String(error)}`)
+        }
         this.liveUnsubscribe = undefined
         try {
           await this.port.disconnect()
-        } catch {}
+        } catch (error) {
+          diagnostics.push(`Bluetooth disconnect failed: ${String(error)}`)
+        }
       }
       this.update({
-        error: e instanceof Error ? e.message : String(e),
+        error: [...new Set(diagnostics)].join('\n'),
         phase: 'Sync paused — recordings are kept locally',
         progress: null,
       })
@@ -620,25 +714,31 @@ export class Engine {
       try {
         if (scope !== 'cloud' && (s.mode !== 'realtime' || !this.liveUnsubscribe))
           await this.closeLink()
-      } catch {}
+      } catch (error) {
+        this.reportError('Bluetooth cleanup failed', error)
+      }
       if (syncFailed && scope === 'cloud') {
         // The pipeline has drained before reaching here. A read-only catalog
         // rebuild must not keep Retry/Settings disabled after the failure.
         this.update({ busy: false, progress: null })
         const originalError = this.snapshot.error
-        void this.refresh().catch(() => {
-          // Preserve the actionable upload error; the next sync refreshes again.
+        void this.refresh().catch((refreshError) => {
           if (!this.snapshot.busy && this.snapshot.error === originalError)
-            this.update({ loadingRecords: undefined })
+            this.update({
+              loadingRecords: undefined,
+              error: `${originalError}\nLocal catalog refresh failed: ${String(refreshError)}`,
+            })
         })
       } else {
         try {
           await this.refresh()
         } catch (e) {
-          if (!this.snapshot.error)
-            this.update({ error: e instanceof Error ? e.message : String(e) })
+          this.reportError('Local catalog refresh failed', e)
         }
-        this.update({ busy: false, progress: null })
+        this.update({
+          busy: false,
+          progress: this.snapshot.progress?.stage === 'upload' ? this.snapshot.progress : null,
+        })
       }
     }
   }
@@ -743,7 +843,9 @@ export class Engine {
           const baseline = Number(start - importStart)
           const requestId = `${Date.now()}:${start}:${Math.random().toString(36).slice(2)}`
           this.cancelDownload = () => {
-            void this.port.cancelImport?.(requestId).catch(() => {})
+            void this.port
+              .cancelImport?.(requestId)
+              .catch((error) => this.reportError('Import cancellation failed', error))
           }
           const progress = (metrics: import('./types').ImportMetrics) => {
             this.update({
@@ -876,7 +978,9 @@ export class Engine {
       this.cancelDownload = undefined
       try {
         await this.port.write(UUID.storage, UUID.control, Buffer.from([3]).toString('base64'))
-      } catch {}
+      } catch (error) {
+        this.reportError('Stopping device import failed', error)
+      }
       await unsubscribe()
     }
   }
@@ -932,77 +1036,319 @@ export class Engine {
     const s = this.snapshot.settings
     if (!s.endpoint || !this.snapshot.hasSecret)
       throw Error('Add your Sites upload URL and API key in Settings. Audio stays local.')
-    const indexes = this.inventory()
-    const plans = await (this.port.planAudio ?? cooperativePlans)(indexes, s.segmentSeconds, true)
-    const total = plans.reduce((n, p) => n + p.sourceFrames - p.deliveredFrames, 0)
-    let completed = 0, submitted = 0, verified = 0, staged = 0
-    const progress = (detail?: string) => ({
-      stage: 'upload' as const, completed, total, detail,
-      chunksTotal: plans.length, chunksSubmitted: submitted,
-      chunksCompleted: verified, chunksStaged: staged,
-    })
-    for (const plan of plans) {
-      if (Date.now() > this.deadline)
-        throw Error('Background time limit reached. Sync again to resume.')
-      if (this.syncReason === 'periodic' && !(await this.port.wifi()))
-        throw Error('Wi-Fi disconnected. Audio stays local.')
-      const frames = await this.loadLocalChunk(plan)
-      // Source-only chunks keep the wire contract simple; wall-clock gaps stay in packet metadata.
-      const originals = frames.filter((f) => f.timing !== 'synthetic-silence')
-      if (!originals.length) continue
-      const id = await this.port.hash(
-        Buffer.from(JSON.stringify(originals.map((f) => f.id))).toString('base64'),
+    const inventory = this.inventory()
+    const records = new Map(inventory.map((r) => [r.key, r]))
+    const plans = await (this.port.planAudio ?? cooperativePlans)(
+      inventory,
+      s.segmentSeconds,
+      true,
+      (value) => this.update({ progress: { stage: 'prepare', ...this.planProgress(value) } }),
+    )
+    const sourceIds = (plan: ChunkPlan) =>
+      plan.ranges.flatMap((range) =>
+        Array.from({ length: range.to - range.from }, (_, i) =>
+          frameId(records.get(range.key)!, range.from + i),
+        ),
       )
-      const segment = {
-        schema: 'uomi.audio.v1',
-        codec: 'opus',
-        sampleRate: 16000,
-        channels: 1,
-        deviceId: plan.deviceId,
-        durationMs: originals.reduce((n, f) => n + f.durationMs, 0),
-        frames: originals,
-        segmentId: id,
+    type Job = { plan: ChunkPlan; id: string }
+    const jobs: Job[] = []
+    const concurrency = 4
+    await forEachBounded(
+      plans,
+      async (plan) => {
+        const id = await this.port.hash(
+          Buffer.from(JSON.stringify(sourceIds(plan))).toString('base64'),
+        )
+        jobs.push({ plan, id })
+        this.update({
+          progress: {
+            stage: 'prepare',
+            completed: jobs.length,
+            total: plans.length,
+            unit: 'chunks',
+            detail: 'Preparing upload identities',
+          },
+        })
+      },
+      concurrency,
+    )
+    const known = new Map<string, import('./types').UploadStatus>()
+    const transcription = () => {
+      const result = { pending: 0, processing: 0, done: 0, failed: 0, errors: [] as string[] }
+      for (const value of known.values()) {
+        const job = value.transcription
+        if (!job) continue
+        if (job.status === 'completed' || job.status === 'done') result.done++
+        else if (job.status === 'failed') {
+          result.failed++
+          if (job.error) result.errors.push(`${value.id}: ${job.error}`)
+        } else if (job.status === 'processing') result.processing++
+        else result.pending++
       }
-      this.update({
-        phase: 'Saving audio to Sites',
-        progress: progress(`Sending chunk ${submitted + 1} of ${plans.length}`),
-      })
-      const canonical = await this.port.post(
+      return result
+    }
+    const checkStatus = async (batch: Job[]) => {
+      if (!this.port.uploadStatus) return []
+      const result = await this.port.uploadStatus(
         s.endpoint,
         s.secretHeader,
-        JSON.stringify(segment),
-        s.compression,
-        id,
+        batch.map((j) => j.id),
       )
-      submitted++
-      if (canonical !== true) {
-        staged++
-        this.update({ progress: progress('Cached audio is retained locally until Notion confirms it'), phase: 'Cached on Sites; waiting for Notion save. Sync again to confirm.' })
-        continue
-      }
-      // Only an explicit canonical Notion receipt permits local acknowledgement.
-      const accepted = new Set(originals.map((f) => f.id))
-      const puts: { key: string; value: string }[] = []
-      for (const range of plan.ranges) {
-        const raw = await this.port.get(range.key)
-        if (!raw) throw Error('Local audio disappeared before acknowledgement.')
-        const record: Recording = JSON.parse(raw)
-        if (record.notionTarget !== s.endpoint) record.uploaded = 0
-        while (
-          record.uploaded < record.frames.length &&
-          accepted.has(record.frames[record.uploaded].id)
+      const found = new Map(result.map((r) => [r.id, r]))
+      if (
+        batch.some(
+          (j) =>
+            !found.has(j.id) ||
+            !['missing', 'pending', 'saved', 'failed'].includes(found.get(j.id)!.status),
         )
-          record.uploaded++
-        record.notionTarget = s.endpoint
-        puts.push({ key: record.key, value: JSON.stringify(record) })
-      }
-      await this.writeBatch(puts)
-      completed += originals.length
-      verified++
-      this.update({ progress: progress() })
+      )
+        throw Error('Invalid upload status response. Audio stays local.')
+      for (const result of found.values()) known.set(result.id, result)
+      return batch.map((j) => found.get(j.id)!)
     }
+    if (this.port.uploadStatus)
+      for (let i = 0; i < jobs.length; i += 64) {
+        this.update({
+          phase: 'Checking server recordings',
+          progress: {
+            stage: 'check',
+            completed: i,
+            total: jobs.length,
+            unit: 'chunks',
+            detail: 'Checking existing uploads without sending audio',
+          },
+        })
+        for (const result of await checkStatus(jobs.slice(i, i + 64))) known.set(result.id, result)
+      }
+    const total = plans.reduce((n, p) => n + p.sourceFrames - p.deliveredFrames, 0)
+    let completed = 0,
+      submitted = 0,
+      verified = 0,
+      active = 0,
+      preparing = 0
+    let checkingSaves = false
+    let saveCheckedAt = this.port.uploadStatus ? Date.now() : undefined
+    const waiting = new Map<string, Job>()
+    const errors = new Map<string, string>()
+    const progress = (): SyncProgress => ({
+      stage: 'upload',
+      completed,
+      total,
+      unit: 'audio frames uploaded',
+      chunksTotal: plans.length,
+      chunksSubmitted: submitted,
+      chunksCompleted: verified,
+      chunksStaged: waiting.size,
+      chunksSaveFailed: errors.size,
+      transcription: transcription(),
+      chunksActive: active,
+      chunksPreparing: preparing,
+      checkingSaves,
+      saveCheckedAt,
+      concurrency,
+      updatedAt: Date.now(),
+    })
+    const report = () =>
+      this.update({
+        phase: checkingSaves ? 'Audio uploaded; checking server saves' : 'Uploading audio',
+        progress: progress(),
+      })
+    let acknowledgement = Promise.resolve()
+    const pending = new Map<string, Set<string>>()
+    const acknowledge = (job: Job) => {
+      const commit = acknowledgement.then(async () => {
+        const accepted = new Set(sourceIds(job.plan))
+        const updates: { key: string; uploaded: number; target: string }[] = []
+        for (const key of new Set(job.plan.ranges.map((r) => r.key))) {
+          const record = records.get(key)
+          if (!record) throw Error('Local audio disappeared before acknowledgement.')
+          const ids = pending.get(key) ?? new Set<string>()
+          for (let i = 0; i < record.frameCount; i++) {
+            const id = frameId(record, i)
+            if (accepted.has(id)) ids.add(id)
+          }
+          let uploaded = record.notionTarget === s.endpoint ? record.uploaded : 0
+          while (uploaded < record.frameCount && ids.delete(frameId(record, uploaded))) uploaded++
+          if (ids.size) pending.set(key, ids)
+          else pending.delete(key)
+          updates.push({ key, uploaded, target: s.endpoint })
+        }
+        if (this.port.acknowledgeAudio) {
+          for (let i = 0; i < updates.length; i += 256)
+            await this.port.acknowledgeAudio(updates.slice(i, i + 256))
+        } else {
+          const puts: { key: string; value: string }[] = []
+          for (const update of updates) {
+            const raw = await this.port.get(update.key)
+            if (!raw) throw Error('Local audio disappeared before acknowledgement.')
+            const record: Recording = JSON.parse(raw)
+            record.uploaded = update.uploaded
+            record.notionTarget = update.target
+            puts.push({ key: update.key, value: JSON.stringify(record) })
+          }
+          await this.writeBatch(puts)
+        }
+        for (const update of updates) {
+          const record = records.get(update.key)!
+          records.set(update.key, {
+            ...record,
+            uploaded: update.uploaded,
+            notionTarget: update.target,
+          })
+        }
+        verified++
+      })
+      acknowledgement = commit.catch(() => {})
+      return commit
+    }
+    let wakeMonitor: (() => void) | undefined
+    const transfer = () =>
+      forEachBounded(
+        jobs,
+        async (job) => {
+          preparing++
+          report()
+          let step: 'prepare' | 'send' | 'save' = 'prepare'
+          try {
+            if (Date.now() > this.deadline)
+              throw Error('Background time limit reached. Sync again to resume.')
+            if (this.syncReason === 'periodic' && !(await this.port.wifi()))
+              throw Error('Wi-Fi disconnected. Audio stays local.')
+            const status = known.get(job.id)
+            let canonical = status?.status === 'saved'
+            if (!status || status.status === 'missing') {
+              const frames = (await this.loadLocalChunk(job.plan)).filter(
+                (f) => f.timing !== 'synthetic-silence',
+              )
+              const audio = this.port.muxAudio ? await this.port.muxAudio(frames) : oggOpus(frames)
+              const sha256 = await this.port.hash(Buffer.from(audio).toString('base64'))
+              const manifest = uploadManifest(job.plan.deviceId, frames, job.id, sha256)
+              preparing--
+              step = 'send'
+              active++
+              report()
+              canonical =
+                (await this.port.post(
+                  s.endpoint,
+                  s.secretHeader,
+                  uploadBody(manifest, audio),
+                  'none',
+                  job.id,
+                  true,
+                )) === true
+              active--
+            } else preparing--
+            step = 'save'
+            submitted++
+            completed += job.plan.sourceFrames - job.plan.deliveredFrames
+            report()
+            if (canonical) await acknowledge(job)
+            else if (status?.status === 'failed')
+              errors.set(job.id, status.error ?? 'Server save failed')
+            else {
+              waiting.set(job.id, job)
+              wakeMonitor?.()
+            }
+          } finally {
+            if (step === 'prepare') preparing--
+            else if (step === 'send') active--
+            report()
+          }
+        },
+        concurrency,
+      )
+    let uploading = true
+    let stopMonitoring = false
+    let monitorDeadline = Infinity
+    let statusError: unknown
+    const monitor = async () => {
+      if (!this.port.uploadStatus) return
+      try {
+        while (!stopMonitoring && (uploading || waiting.size)) {
+          if (Date.now() > Math.min(monitorDeadline, this.deadline)) break
+          const pendingJobs = [...waiting.values()]
+          for (let i = 0; i < pendingJobs.length; i += 64) {
+            const batch = pendingJobs.slice(i, i + 64)
+            for (const status of await checkStatus(batch)) {
+              const job = waiting.get(status.id)
+              if (!job) continue
+              if (status.status === 'saved') {
+                await acknowledge(job)
+                waiting.delete(status.id)
+              } else if (status.status === 'failed' || status.status === 'missing') {
+                errors.set(
+                  status.id,
+                  status.error ?? 'Server no longer has this audio. Upload again to retry.',
+                )
+                waiting.delete(status.id)
+              }
+            }
+            saveCheckedAt = Date.now()
+            report()
+          }
+          if (!uploading && !waiting.size) break
+          await new Promise<void>((resolve) => {
+            const wake = () => {
+              clearTimeout(timer)
+              wakeMonitor = undefined
+              resolve()
+            }
+            const timer = setTimeout(wake, 3000)
+            wakeMonitor = wake
+          })
+        }
+      } catch (error) {
+        statusError = error
+      }
+    }
+    report()
+    const monitoring = monitor()
+    try {
+      await transfer()
+    } catch (error) {
+      stopMonitoring = true
+      throw error
+    } finally {
+      uploading = false
+      checkingSaves = waiting.size > 0 && !!this.port.uploadStatus
+      monitorDeadline = Date.now() + 60000
+      wakeMonitor?.()
+      if (!stopMonitoring && checkingSaves) report()
+      await monitoring
+      checkingSaves = false
+    }
+    if (statusError)
+      this.update({
+        error: `Could not refresh save status: ${String(statusError)}. Audio stays local.`,
+      })
+    if (this.port.uploadStatus && jobs.length && !statusError) {
+      try {
+        for (let i = 0; i < jobs.length; i += 64) await checkStatus(jobs.slice(i, i + 64))
+      } catch (error) {
+        this.update({ error: `Audio saved; job status could not be refreshed: ${String(error)}` })
+      }
+    }
+    if (jobs.length && this.port.uploadStatus) {
+      this.jobIds = jobs.map((job) => job.id).slice(-64)
+      await this.port.put('lastUploads', JSON.stringify({ endpoint: s.endpoint, ids: this.jobIds }))
+      this.update({ uploadJobs: [...known.values()].filter((job) => this.jobIds.includes(job.id)) })
+      clearTimeout(this.jobTimer)
+      if (this.active) this.jobTimer = setTimeout(() => void this.refreshUploadJobs(), 15000)
+    } else if (!jobs.length && this.jobIds.length) await this.refreshUploadJobs()
     await this.refresh()
-    // Retention stays conservative: remove only after explicit user action.
+    this.update({
+      phase: !plans.length
+        ? 'No audio waiting to upload'
+        : errors.size
+          ? 'Audio uploaded; server save needs attention'
+          : waiting.size
+            ? `Upload complete; ${waiting.size} chunks awaiting save confirmation`
+            : 'Upload complete; all audio safely saved',
+      error: errors.size
+        ? `Server save failures:\n${[...errors].map(([id, message]) => `${id}: ${message}`).join('\n')}\nOriginal audio stays on this device.`
+        : this.snapshot.error,
+      progress: progress(),
+    })
   }
   // Explicit deletion remains available independently of verified auto-removal.
   async clearDelivered() {
@@ -1020,13 +1366,25 @@ export class Engine {
   private async closeLink() {
     const unsubscribe = this.liveUnsubscribe
     this.liveUnsubscribe = undefined
+    let failure: unknown
     try {
       await unsubscribe?.()
-    } catch {}
-    await this.port.disconnect()
+    } catch (error) {
+      failure = error
+    }
+    try {
+      await this.port.disconnect()
+    } catch (error) {
+      throw Error(
+        `Bluetooth disconnect failed: ${String(error)}${failure ? `; unsubscribe failed: ${String(failure)}` : ''}`,
+      )
+    }
+    if (failure) throw Error(`Bluetooth unsubscribe failed: ${String(failure)}`)
   }
   async setActive(active: boolean) {
     this.active = active
+    if (!active) clearTimeout(this.jobTimer)
+    else if (this.jobIds.length) void this.refreshUploadJobs()
     if (active && this.port.optimizeAudio) void this.optimizeAudio()
     if (!active) await this.stopMonitor()
     if (!active && this.snapshot.settings.mode === 'manual') {
@@ -1043,16 +1401,22 @@ export class Engine {
     if ((s.mode === 'realtime' && !this.port.nativeTicks) || (s.mode === 'periodic' && this.active))
       this.timer = setTimeout(
         async () => {
-          await this.sync(s.mode === 'realtime' ? 'realtime' : 'periodic')
+          try {
+            await this.sync(s.mode === 'realtime' ? 'realtime' : 'periodic')
+          } catch (error) {
+            this.reportError('Scheduled sync failed', error)
+          }
           this.arm()
         },
         s.mode === 'realtime' ? s.segmentSeconds * 1000 : 60000,
       )
   }
   dispose() {
+    clearTimeout(this.jobTimer)
     this.disposed = true
-    void this.stopMonitor().catch(() => {})
+    void this.stopMonitor().catch((error) => console.error('Stopping audio monitor failed', error))
     clearTimeout(this.timer)
+    clearTimeout(this.progressNotificationTimer)
     this.listeners.clear()
   }
 }

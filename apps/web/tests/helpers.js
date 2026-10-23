@@ -3,7 +3,15 @@ import { readFileSync } from 'node:fs'
 import { Buffer } from 'buffer'
 export function fixture() {
   const sqlite = new DatabaseSync(':memory:')
-  for (const name of ['0000_index.sql', '0001_primary.sql', '0002_compact.sql', '0003_transcription.sql'])
+  for (const name of [
+    '0000_index.sql',
+    '0001_primary.sql',
+    '0002_compact.sql',
+    '0003_transcription.sql',
+    '0004_detailed_transcription.sql',
+    '0005_jobs.sql',
+    '0006_query_performance.sql',
+  ])
     sqlite.exec(readFileSync(new URL('../drizzle/' + name, import.meta.url), 'utf8'))
   const DB = {
     prepare(sql) {
@@ -40,7 +48,9 @@ export function fixture() {
   }
   const files = new Map()
   const BUCKET = {
-    async head(key) { return files.has(key) ? {} : null },
+    async head(key) {
+      return files.has(key) ? {} : null
+    },
     async put(key, data) {
       files.set(key, Buffer.from(data))
     },

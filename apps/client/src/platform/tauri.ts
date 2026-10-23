@@ -9,6 +9,9 @@ import type { Client } from './runtime'
 
 const api = paceTransport((request) => invoke('notion', { request }))
 const port: Port = {
+  acknowledgeAudio: (updates) =>
+    invoke('kv', { action: 'acknowledgeAudio', key: '', value: JSON.stringify(updates) }),
+  uploadStatus: (endpoint, header, ids) => invoke('upload_status', { endpoint, header, ids }),
   optimizeAudio: () => invoke('kv', { action: 'optimizeAudio', key: '', value: null }),
   cancelImport: (id) => invoke('cancel_import', { id }),
   importRing: async (request, progress) => {
@@ -78,8 +81,8 @@ const port: Port = {
   write: (service, char, value) => invoke('write', { service, char, value }),
   wifi: () => invoke('wifi'),
   schedule: (settings) => invoke('schedule', { settings }),
-  post: (endpoint, header, body, compression, id) =>
-    invoke('post', { endpoint, header, body, compression, id }),
+  post: (endpoint, header, body, compression, id, binary = false) =>
+    invoke('post', { endpoint, header, body, compression, id, binary }),
   subscribe: async (service, char, listener) => {
     const unlisten = await listen<{ char: string; data: string }>('uomi:ble', (event) => {
       if (event.payload.char === char) listener(event.payload.data)
@@ -117,20 +120,28 @@ export const tauriClient: Client = {
     (startup ??= (async () => {
       const periodic = await invoke<boolean>('is_periodic')
       await listen('uomi:tick', () => {
-        void engine.sync('realtime')
+        void engine
+          .sync('realtime')
+          .catch((error) => engine.reportError('Real-time sync failed', error))
       })
       await listen('uomi:periodic', () => {
-        void engine.sync('periodic')
+        void engine
+          .sync('periodic')
+          .catch((error) => engine.reportError('Periodic sync failed', error))
       })
       await listen<boolean>('uomi:active', (event) => {
-        void engine.setActive(event.payload)
+        void engine
+          .setActive(event.payload)
+          .catch((error) => engine.reportError('App lifecycle failed', error))
       })
       try {
         await engine.init()
         await engine.setActive(!periodic)
         if (!periodic)
           setTimeout(() => {
-            void invoke('smoke_ready')
+            void invoke('smoke_ready').catch((error) =>
+              engine.reportError('Desktop readiness check failed', error),
+            )
           }, 1500)
         if (periodic) {
           await engine.sync('periodic')

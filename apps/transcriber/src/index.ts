@@ -1,25 +1,21 @@
 #!/usr/bin/env bun
-import { sitesCallback } from './callbacks'
 import { mkdir, open, rm, readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { parseProvider } from '@nakasyou/ntranscribe'
-import { httpTransport, NotionStore } from '@uomi/notion'
-import { authorized, Daemon } from './daemon'
+import { hostname } from 'node:os'
+import { ApiWorker, errorDetail } from './api-worker'
 
 if (process.argv.includes('--help')) {
   console.log(
-    'Uomi transcriber\nNOTION_TOKEN, NOTION_DATABASE_ID, UOMI_WEBHOOK_SECRET are required.\nTRANSCRIBER_PROVIDER=codex | chrome-recognition\nHOST=127.0.0.1 PORT=8787 LANGUAGE=ja REQUEST_WAIT_SECONDS=10 TRANSCRIBER_SPLIT_SECONDS=600\nPending/Processing/Failed pages are recovered automatically at startup and every minute.\nOptional SITES_URL and SITES_ACCESS_TOKEN enable durable completion callbacks.\nRequires ffmpeg on PATH. Codex credentials stay on this machine.',
+    'Uomi API transcriber\nUOMI_API_URL and UOMI_CLIENT_SECRET are required.\nTRANSCRIBER_PROVIDER=chrome-recognition TRANSCRIBER_CONCURRENCY=2 TRANSCRIBER_SPLIT_SECONDS=600\nPolls durable API jobs, renews leases and reports progress/errors. Notion credentials and inbound webhooks are no longer used.\nRequires ffmpeg on PATH.',
   )
   process.exit(0)
 }
-const token = process.env.NOTION_TOKEN
-const database = process.env.NOTION_DATABASE_ID
-const secret = process.env.UOMI_WEBHOOK_SECRET
-if (!token || !database || !secret || secret.length < 24)
-  throw Error(
-    'Set NOTION_TOKEN, NOTION_DATABASE_ID and UOMI_WEBHOOK_SECRET (at least 24 characters).',
-  )
+const apiUrl = process.env.UOMI_API_URL
+const secret = process.env.UOMI_CLIENT_SECRET
+if (!apiUrl || !secret || secret.length < 24)
+  throw Error('Set UOMI_API_URL and UOMI_CLIENT_SECRET (at least 24 characters).')
 const stateDir =
   process.env.TRANSCRIBER_STATE_DIR ?? join(homedir(), '.local/share/uomi-transcriber')
 await mkdir(stateDir, { recursive: true, mode: 0o700 })
@@ -68,69 +64,92 @@ if (
     'Invalid PORT, REQUEST_WAIT_SECONDS (minimum 10), or TRANSCRIBER_SPLIT_SECONDS (1–1800).',
   )
 }
-const store = new NotionStore(httpTransport(token), database)
-const daemon = new Daemon(store, {
+const concurrency = Number(process.env.TRANSCRIBER_CONCURRENCY ?? 2)
+const pollMs = Number(process.env.TRANSCRIBER_POLL_SECONDS ?? 5) * 1000
+if (
+  !Number.isInteger(concurrency) ||
+  concurrency < 1 ||
+  concurrency > 8 ||
+  !Number.isFinite(pollMs) ||
+  pollMs < 1000
+) {
+  await rm(lockPath, { force: true })
+  throw Error('TRANSCRIBER_CONCURRENCY must be 1–8; TRANSCRIBER_POLL_SECONDS must be at least 1.')
+}
+const daemon = new ApiWorker({
+  url: apiUrl,
   secret,
-  sitesCallback: sitesCallback(process.env.SITES_URL,process.env.SITES_ACCESS_TOKEN),
-  provider: parseProvider(process.env.TRANSCRIBER_PROVIDER ?? 'codex'),
+  accessToken: process.env.SITES_ACCESS_TOKEN,
+  workerId: process.env.TRANSCRIBER_WORKER_ID ?? hostname(),
+  provider: parseProvider(process.env.TRANSCRIBER_PROVIDER ?? 'chrome-recognition'),
   language: process.env.LANGUAGE ?? 'ja',
   stateDir,
+  concurrency,
+  pollMs,
   requestWaitMs: wait * 1000,
   timeoutMs: 300000,
   splitSeconds,
 })
 let server: ReturnType<typeof Bun.serve>
 try {
-  await store.setup()
   server = Bun.serve({
     hostname: process.env.HOST ?? '127.0.0.1',
     port,
-    maxRequestBodySize: 8 * 1024 * 1024,
-    async fetch(request) {
+    fetch(request) {
       const url = new URL(request.url)
       if (request.method === 'GET' && url.pathname === '/health')
-        return Response.json({ status: 'ok', provider: daemon.config.provider, splitSeconds })
-      if (request.method !== 'POST' || !['/webhook', '/reserve'].includes(url.pathname))
-        return new Response('Not found', { status: 404 })
-      if (!authorized(request.headers.get('authorization'), secret))
-        return new Response('Unauthorized', { status: 401 })
-      try {
-        if (url.pathname === '/reserve')
-          return Response.json(await daemon.reserve(await request.json()))
-        const body = (await request.json()) as { pageId?: string }
-        const result = await daemon.accept(body.pageId)
-        return Response.json(result, { status: 202 })
-      } catch {
-        return Response.json(
-          {
-            error: 'Cannot accept this page. Check the page ID, database access and upload status.',
-          },
-          { status: 400 },
-        )
-      }
+        return Response.json({
+          status: daemon.lastError ? 'degraded' : 'ok',
+          provider: daemon.config.provider,
+          ...daemon.status,
+        })
+      return Response.json(
+        { error: 'This daemon pulls jobs from UOMI_API_URL; inbound webhooks have been removed.' },
+        { status: 410 },
+      )
     },
   })
-  await daemon
-    .recover()
-    .catch(() => console.error('Notion recovery paused; retrying on the next interval.'))
 } catch (error) {
   await rm(lockPath, { force: true })
   throw error
 }
-console.log(`Uomi transcriber listening on ${server.hostname}:${server.port}`)
-let recovery: Promise<unknown> = Promise.resolve()
-const recoveryTimer = setInterval(() => {
-  recovery = daemon
-    .recover()
-    .catch(() => console.error('Notion recovery paused; retrying on the next interval.'))
-}, 60000)
+console.log(
+  JSON.stringify({
+    status: 'started',
+    api: new URL(apiUrl).origin,
+    concurrency,
+    workerId: daemon.config.workerId,
+  }),
+)
 let stopping = false
+let wake: (() => void) | undefined
+const polling = (async () => {
+  let failures = 0
+  while (!stopping) {
+    try {
+      await daemon.poll()
+      failures = 0
+    } catch (error) {
+      failures++
+      console.error(JSON.stringify({ stage: 'claim', error: errorDetail(error), failures }))
+    }
+    if (stopping) break
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, Math.min(60000, pollMs * 2 ** Math.min(failures, 4)))
+      wake = () => {
+        clearTimeout(timer)
+        resolve()
+      }
+    })
+    wake = undefined
+  }
+})()
 async function stop() {
   if (stopping) return
   stopping = true
-  clearInterval(recoveryTimer)
+  wake?.()
   server.stop()
-  await recovery
+  await polling
   await daemon.close()
   await rm(lockPath, { force: true })
   process.exit(0)

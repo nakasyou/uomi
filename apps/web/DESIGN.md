@@ -11,5 +11,7 @@ holds date groups and bounded recording cards. A single large detail panel split
 real audio waveform from readable transcript. Transport stays below the panel.
 Mobile collapses the sidebar into a drawer and stacks waveform/transcript. Empty,
 loading and error states name the actual data state. A waveform is generated only
-from decoded audio, never simulated. Notion controls expose source resync and
-pending source saves independently from cached availability.
+from decoded audio, never simulated. Notion backup status is secondary and collapsed. Explicit migration imports earlier
+recordings without replacing server edits. Transcription stages, attempt counts and
+errors appear beside the transcript; retries have visible pending states. Keep
+copy concise, functional, and specific to the task.

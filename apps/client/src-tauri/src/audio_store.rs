@@ -115,27 +115,114 @@ pub fn unpack(raw: &str, bytes: &[u8]) -> Result<String> {
     Ok(record.to_string())
 }
 
-pub fn read(conn: &Connection, key: &str) -> Result<Option<String>> {
-    let raw: Option<String> = conn
-        .query_row("SELECT value FROM kv WHERE key=?1", [key], |r| r.get(0))
-        .optional()
-        .map_err(error)?;
-    let Some(raw) = raw else { return Ok(None) };
+pub fn stored_value(key: &str, raw: String, bytes: Option<Vec<u8>>) -> Result<String> {
     if !key.starts_with("record:") {
-        return Ok(Some(raw));
+        return Ok(raw);
     }
     let packed: Value = serde_json::from_str(&raw).map_err(error)?;
     if packed["binaryAudio"] != 1 {
-        return Ok(Some(raw));
+        return Ok(raw);
     }
-    let bytes: Vec<u8> = conn
-        .query_row(
-            "SELECT data FROM recording_audio WHERE key=?1",
-            [key],
-            |r| r.get(0),
+    unpack(&raw, &bytes.ok_or("Missing binary audio")?)
+}
+
+pub fn read(conn: &Connection, key: &str) -> Result<Option<String>> {
+    let row: Option<(String,Option<Vec<u8>>)> = conn.query_row(
+        "SELECT k.value,a.data FROM kv k LEFT JOIN recording_audio a ON a.key=k.key WHERE k.key=?1",
+        [key], |r| Ok((r.get(0)?,r.get(1)?))).optional().map_err(error)?;
+    row.map(|(raw, bytes)| stored_value(key, raw, bytes))
+        .transpose()
+}
+
+pub fn read_many(conn: &Connection, keys: &[String]) -> Result<Vec<Value>> {
+    if keys.len() > 256 {
+        return Err("Too many storage keys".into());
+    }
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let sql=format!("SELECT k.key,k.value,a.data FROM kv k LEFT JOIN recording_audio a ON a.key=k.key WHERE k.key IN ({})",vec!["?";keys.len()].join(","));
+    let mut query = conn.prepare_cached(&sql).map_err(error)?;
+    let mut rows = query
+        .query(rusqlite::params_from_iter(keys))
+        .map_err(error)?;
+    let mut values = std::collections::HashMap::new();
+    while let Some(row) = rows.next().map_err(error)? {
+        let key: String = row.get(0).map_err(error)?;
+        let value = stored_value(&key, row.get(1).map_err(error)?, row.get(2).map_err(error)?)?;
+        values.insert(key, value);
+    }
+    Ok(keys
+        .iter()
+        .filter_map(|key| {
+            values
+                .get(key)
+                .map(|value| json!({"key":key,"value":value}))
+        })
+        .collect())
+}
+
+// Acknowledgements touch metadata only. Original Opus BLOBs never cross IPC or
+// get decoded/repacked simply to advance a durable upload receipt.
+pub fn acknowledge(conn: &Connection, updates: &[Value]) -> Result<()> {
+    if updates.len() > 256 {
+        return Err("Too many acknowledgement updates".into());
+    }
+    let mut read = conn
+        .prepare_cached(
+            "SELECT k.value,i.value FROM kv k JOIN record_index i ON i.key=k.key WHERE k.key=?1",
         )
         .map_err(error)?;
-    Ok(Some(unpack(&raw, &bytes)?))
+    let mut write = conn
+        .prepare_cached("UPDATE kv SET value=?2 WHERE key=?1 AND value!=?2")
+        .map_err(error)?;
+    let mut index = conn
+        .prepare_cached("UPDATE record_index SET value=?2 WHERE key=?1 AND value!=?2")
+        .map_err(error)?;
+    for update in updates {
+        let key = update["key"]
+            .as_str()
+            .filter(|k| k.starts_with("record:"))
+            .ok_or("Invalid acknowledgement key")?;
+        let target = update["target"]
+            .as_str()
+            .ok_or("Missing acknowledgement target")?;
+        let uploaded = update["uploaded"]
+            .as_u64()
+            .ok_or("Invalid acknowledged frame count")?;
+        let (raw, summary): (String, String) = read
+            .query_row([key], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(error)?;
+        let mut summary: Value = serde_json::from_str(&summary).map_err(error)?;
+        if uploaded
+            > summary["frameCount"]
+                .as_u64()
+                .ok_or("Invalid recording frame count")?
+        {
+            return Err("Acknowledgement exceeds source frames".into());
+        }
+        if summary["notionTarget"] == target && summary["uploaded"].as_u64().unwrap_or(0) > uploaded
+        {
+            continue;
+        }
+        summary["uploaded"] = json!(uploaded);
+        summary["notionTarget"] = json!(target);
+        let mut stored: Value = serde_json::from_str(&raw).map_err(error)?;
+        let record = if stored["binaryAudio"] == 1 {
+            &mut stored["record"]
+        } else {
+            &mut stored
+        };
+        record["uploaded"] = json!(uploaded);
+        record["notionTarget"] = json!(target);
+        write
+            .execute(rusqlite::params![key, stored.to_string()])
+            .map_err(error)?;
+        index
+            .execute(rusqlite::params![key, summary.to_string()])
+            .map_err(error)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

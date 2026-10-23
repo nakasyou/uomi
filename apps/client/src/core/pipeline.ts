@@ -87,33 +87,35 @@ export async function runPipeline<T>(
 
 // Keep reconciliation bounded and drain active checks before propagating errors.
 export async function forEachBounded<T>(
-  source: AsyncIterable<T>,
+  source: Iterable<T> | AsyncIterable<T>,
   visit: (value: T) => Promise<void>,
+  concurrency = 2,
 ) {
+  if (!Number.isInteger(concurrency) || concurrency < 1) throw Error('Invalid concurrency')
   const running = new Set<Promise<void>>()
   let failed = false
-  let failure: unknown
+  const failures: unknown[] = []
   try {
     for await (const value of source) {
       if (failed) break
       const task = Promise.resolve()
         .then(() => visit(value))
         .catch((error) => {
-          if (!failed) {
-            failure = error
-            failed = true
-          }
+          failures.push(error)
+          failed = true
         })
       running.add(task)
       void task.then(() => running.delete(task))
-      if (running.size >= 2) await Promise.race(running)
+      if (running.size >= concurrency) await Promise.race(running)
     }
   } catch (error) {
-    if (!failed) {
-      failure = error
-      failed = true
-    }
+    failures.push(error)
+    failed = true
   }
   await Promise.all(running)
-  if (failed) throw failure
+  if (failures.length === 1) throw failures[0]
+  if (failures.length > 1)
+    throw Error(
+      failures.map((error) => (error instanceof Error ? error.message : String(error))).join('\n'),
+    )
 }
