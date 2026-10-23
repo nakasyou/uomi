@@ -1,6 +1,6 @@
 import { SyncProgressView } from './SyncProgress'
 import React, { useEffect, useState, useSyncExternalStore } from 'react'
-import { View, ScrollView, StyleSheet, Linking, useColorScheme } from 'react-native'
+import { View, ScrollView, StyleSheet, Linking, useColorScheme, StatusBar } from 'react-native'
 import {
   PaperProvider,
   useTheme,
@@ -23,6 +23,7 @@ export default function App() {
   return (
     <SafeAreaProvider>
       <PaperProvider theme={dark ? MD3DarkTheme : MD3LightTheme}>
+        <StatusBar barStyle={dark ? 'light-content' : 'dark-content'} />
         <SyncApp />
       </PaperProvider>
     </SafeAreaProvider>

@@ -249,3 +249,30 @@ provided, and response-stream/invalid-JSON failures retain the operation context
 All TypeScript projects, combined client/web/shared/daemon tests, production Site
 build and formatting/lint passed after these changes. Explicit storage diagnostics
 were added to distinguish source identity/index cost from allocated free pages.
+
+Live storage audit after diagnostics deployment
+`appgdep_6adb7455f4708191b4fc7e7be537623d` (source
+`76d41616e83ff71e45f745d6760bd7ea58f9c19a`, environment 11) succeeded through the
+connected production `index_status` tool. It reported 213 recordings / 145 audio
+copies and physical D1 size 121,171,968 bytes (115.56 MiB). The one additional
+recording/audio copy is the parent's synthetic native verification recording.
+
+Source ranges total 296,518 rows for 296,504 distinct prefixes, covering 1,317,449
+frames (mean 4.443 frames/range). Device strings occupy 6,226,908 bytes and prefix
+strings 25,797,038 bytes: 32,023,946 bytes (30.54 MiB) of identity payload before
+SQLite/index overhead. Only 14 rows exceed the distinct-prefix count (0.0047%),
+so useful range compaction is ruled out as a material remedy; distinct packet
+hashes cannot be combined without losing source identity correctness. The largest
+single recording has 11,013 ranges for 45,000 frames. Source identities and their
+repeated composite keys in the two secondary indexes plausibly dominate storage,
+but this is not a measured physical breakdown by table/index.
+
+Original plus normalized transcript payload is only 96,293 bytes; FTS data plus
+term payload is 89,929 bytes; legacy D1 manifest blobs total zero. Those payloads
+do not explain the large physical allocation. D1 allows page_size (4,096 bytes)
+but denies page_count and freelist_count with SQLITE_AUTH; these failures appear
+as diagnostic fields without breaking index_status. Exact allocation/free-page
+attribution and the cause of each earlier growth increment remain unmeasured.
+No lossy source compression, range rewrite, VACUUM or storage schema change was
+made during this read-only investigation. See docs/query-performance.md for the
+numbers and interpretation limits.

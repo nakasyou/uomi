@@ -69,3 +69,44 @@ PRAGMAs return their own diagnostic errors. These counters distinguish payload
 and identity/index overhead from allocated free space; physical D1 bytes alone do
 not establish duplicate data. Source identities include per-packet hashes, so
 combining ranges with different prefixes would lose deduplication correctness.
+
+## Live storage evidence after the diagnostics release
+
+The connected production `index_status` call after deployment
+`appgdep_6adb7455f4708191b4fc7e7be537623d` reported:
+
+| Measurement | Value |
+| --- | ---: |
+| Physical D1 size | 121,171,968 bytes (115.56 MiB) |
+| Recordings / primary audio copies | 213 / 145 |
+| Source ranges / distinct prefixes | 296,518 / 296,504 |
+| Frames / mean frames per range | 1,317,449 / 4.443 |
+| Source device strings | 6,226,908 UTF-8 bytes |
+| Source prefix strings | 25,797,038 UTF-8 bytes |
+| Combined source identity payload | 32,023,946 bytes (30.54 MiB) |
+| Original + normalized transcript text | 96,293 bytes |
+| FTS data + term payload | 89,929 bytes |
+| Legacy manifest blobs in D1 | 0 bytes |
+
+The difference between range count and distinct-prefix count is only **14 rows
+(0.0047%)**. Almost every range represents a different packet identity, rather
+than avoidable fragmentation of a shared prefix. Sorting/merging existing ranges
+therefore cannot materially reduce this data without incorrectly merging distinct
+packet hashes. Differences between packet prefixes must remain exact for source
+ownership and idempotency.
+
+Source identity strings alone occupy 30.54 MiB before SQLite record/page overhead.
+The WITHOUT ROWID source table's long `(device,prefix,start)` key is also carried
+by its `source_overlap` and `source_recording` secondary indexes. Identity and
+index cost is consequently a plausible dominant contributor to the physical size;
+this is an inference from measured payload/cardinality and the deployed schema,
+not a per-table physical allocation measurement. Transcript/FTS payloads and old
+manifest blobs are too small to explain the observed size.
+
+D1 returned `SQLITE_AUTH` for `PRAGMA page_count` and `PRAGMA freelist_count`.
+`page_size` returned 4,096 bytes. Allocation/free-page counts and free-page bytes
+therefore remain **unknown**; neither reclaimable free space nor exact attribution
+of the earlier size increase can be established from these counters. No source
+identity compression, range rewrite, VACUUM or storage migration was performed
+on the basis of this audit. A future lossless key representation change would
+need separate migration, source-identity and overlap-query verification.
