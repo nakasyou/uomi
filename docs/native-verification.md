@@ -73,3 +73,46 @@ This verifies native emulator UI, persistence, upload failure/retry, primary-sav
 acknowledgement, retention and real server/daemon state. Physical Omi Bluetooth
 capture, radio throughput and physical-phone battery/background behavior still
 require connected hardware. No physical Android device was attached.
+
+## Linux release artifact — 2026-10-24
+
+The existing `linux:package --bundles deb` workflow also built an optimized Linux
+release and a Debian-format archive:
+`apps/client/src-tauri/target/release/bundle/deb/Uomi_0.1.0_amd64.deb`.
+
+- Size: 8,085,542 bytes.
+- SHA-256: `883c9d5bccff3a4274bde9317d8f7e6a3383d1fc84d13a7bf91eb68c898e4d59`.
+- Package metadata: `uomi`, version `0.1.0`, architecture `amd64`.
+
+Archive inspection verified the release executable, desktop launcher and icons.
+The packaged executable differs from the build output only in Tauri's expected
+three-byte `DEB` versus `UNK` bundle marker. Its ELF interpreter exists and all
+163 loader dependency entries resolve in this build environment.
+
+**This is a Nix-built artifact, not a portable Debian release.** Its interpreter
+and libraries refer to `/nix/store`; arbitrary Debian machines cannot be assumed
+to satisfy those paths. It was not installed systemwide, and the existing user's
+`tauri dev` client was not replaced.
+
+The agent-workspace-linux skill was read; its workspace MCP tools were not
+exposed. Native-only QA instead used an explicitly authorized, wholly owned
+Xvfb display with bubblewrap, an overlaid fresh HOME, separate XDG directories,
+private D-Bus, and isolated keyring/service/network-status shims. The host root
+was read-only, `/run` hidden, and the network namespace disabled. No personal
+database, credentials or audio were copied into this sandbox.
+
+The first packaged WebKit launch revealed that Tauri's CSP nonce injection
+blocked React Native Web's dynamically created style element. Browser dev-server
+previews had not exposed this release-only defect. Static RN and icon-font
+style elements now receive Tauri's nonce and are reused by the frontend; the
+CSP remains unchanged. A rebuilt release rendered the intended Material layout
+in actual native WebKit. Settings navigation worked; changing the maximum chunk
+length from 600 to 120 seconds through the UI updated the isolated SQLite
+settings row. Terminating and relaunching the packaged app restored 120 in the
+UI. The isolated database contained zero audio rows throughout. No Linux HTTP,
+Bluetooth or microphone action was performed.
+
+The final release build, TypeScript check and all 78 client tests passed.
+Before/after render and settings/restart screenshots plus artifact metadata are
+retained under `/tmp/uomi-native-qa-evidence/`. The owned app, private D-Bus,
+Xvfb and sandbox directories were stopped/removed after the checks.
