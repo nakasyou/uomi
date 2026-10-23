@@ -433,3 +433,90 @@ Linux/Android artifact hashes are documented in docs/native-verification.md.
 Physical Omi Bluetooth capture and physical-phone background/battery behavior
 remain hardware verification limits. No user capture database was used as an
 upload fixture, and the existing running Linux client was not replaced.
+
+## FluidAudio speech planning and Mac deployment (2026-10-24 JST)
+
+Source `5a6505058fd9a8c7196441f3ac8ceb6926c7a7f5` adds the local Swift helper
+`apps/transcriber/fluid-audio`. On the M4 Mac mini, Apple Swift 6.2.4 compiled
+FluidAudio v0.17.7 exact revision `503b4bd1bbf7220882de39fe8ae6716aae4132da`.
+The helper streams 4,096-frame blocks from 16 kHz mono WAV into Silero VAD and
+LS-EEND DIHARD3/100 ms, retains original time, finalizes the last model window,
+and intersects finalized speaker intervals with detected speech. VAD speech
+without speaker attribution remains `speaker:null`; overlapping speaker intervals
+remain explicit. Speaker IDs identify model slots within one recording.
+
+The two immutable model revisions are LS-EEND
+`28ce1b1f8ef186729df63b3886fbaae7bc10c4a1` and Silero
+`b419383c55c110e2c9271fa6ee0ea83d03c70d96`. All ten model files (45,687,724 bytes)
+have fixed SHA256/size entries in `models.lock.json` and fixed-output Nix fetches.
+The production helper uses local CoreML loaders and explicit offline mode. Its
+Nix build uses the repository-owned offline SwiftPM manifest to omit the unused
+NeMo binary dependency; the installed Apple compiler is checked exactly as a host
+prerequisite. JSONL analysis progress is emitted every five source seconds and
+reaches 1 only after finalization and output writing.
+
+Verification used locally generated macOS `say` voices Samantha/Daniel and
+synthetic silence, with no personal recording content in the test fixtures:
+
+- Pure Swift assertions passed for clipping to duration, preserving silence gaps,
+  original offsets, overlaps, unknown attribution, explicit null encoding, and
+  empty output for silence.
+- Real deployed CoreML models returned two speaker slots for the sequential
+  25.953-second fixture (14 raw intervals, 20.624 seconds VAD speech, 2.024 seconds
+  unattributed speech). A 14.953-second overlapping fixture produced both speaker
+  slots and simultaneous intervals, with the final attributed speech retained
+  within 300 ms of EOF. Three seconds of silence returned zero intervals. Missing
+  models failed explicitly without an output plan. PCM Float32 input matched the
+  corresponding PCM16 plan exactly.
+- The deployed Nix helper completed the 26.011-second Float32 fixture under
+  `sandbox-exec` with all network access denied. Its plan exactly matched the
+  earlier result. This verifies local model loading independently of registry
+  availability.
+- Actual Google recognition on the synthetic sequential fixture observed a
+  maximum of two simultaneous requests. An initial probe encountered an HTTP 500.
+  A subsequent bounded three-attempt run completed on attempt 3: 16 total calls
+  for 14 speech slices plus two failed-call retries. Indexed checkpoints retained
+  completed slices between attempts. The two transient failures named
+  `speech-0.flac` and `speech-5.flac` and preserved bounded HTTP 500 diagnostics.
+  The completed result contained six nonempty transcript segments, 258 text
+  characters, speaker slots 0/1, and original offsets between 2,100 and 24,000 ms.
+  The source audio hash remained unchanged. Only text lengths/intervals were
+  printed in verification output.
+
+The Mac dotfiles source pin is now `5a65050`, unpacked source hash
+`1whm6y5d7naf56mbvm1y2rxkqxa0ja197c1k9m45jxqkyfxp0drc`.
+`pkgs/uomi-transcriber.nix` exports `getProvider` from the CLI-free provider
+library. `pkgs/uomi-fluid-segments.nix` imports the helper's repository-owned Nix
+recipe using the same Uomi source pin. The module supplies the absolute helper
+wrapper path and Google/Codex limits of 600/300 seconds. Unrelated dirty dotfiles,
+private credentials, existing logs, checkpoints, and previous GC roots were
+preserved.
+
+`nix build .#darwinConfigurations.mac-mini.system --out-link result-uomi-fluid`
+succeeded, producing closure
+`/nix/store/4qcf9faa0az5f6n6c8niwqi870dg1cl5-darwin-system-26.05.c3e90c8`.
+The generated user LaunchAgent from that closure was installed and reloaded at
+zero active jobs, following the documented service-only activation procedure;
+the global Darwin system profile was not switched. Old PID 94578 exited before
+replacement. Actual running PID **13871** uses launch script
+`/nix/store/76j0jk2r82pfclgmrz70c2v8qm6x9vjj-uomi-transcriber-launch` and bundle
+`/nix/store/7p5gy5722cv9sflsfz3fmhqhrwxbpvg6-uomi-transcriber-2026-10-24-5a65050/lib/uomi-transcriber/transcriber.mjs`.
+Its helper is
+`/nix/store/hbw3cwbkds8flhnkh1kx3776l4wh3vyl-uomi-fluid-segments-1.0.0-fluid-0.17.7/bin/uomi-fluid-segments`.
+The compiled worker bundle excludes upstream CLI side effects; helper `--version`
+reports the exact SDK/model pins.
+
+At `2026-10-23T16:03:02.931Z`, the new daemon's successful API poll was current and
+`/health` returned `status:"ok"`, `error:null`, `active:0`, `concurrency:2`,
+`splitSeconds:{google:600,codex:300}`, and
+`speech:{engine:"FluidAudio streaming",recognitionConcurrency:2,analysisConcurrency:1}`.
+Final synthetic CoreML fixtures also passed using this deployed helper and its
+immutable Nix model paths. Existing production job/checkpoint state was retained.
+
+The combined source checks passed all client/web/transcriber typechecks, 139 Node
+assertion tests (78 client + 61 web), 57 Bun tests, daemon/site builds, and the
+repository lint/format checks. The matching web speaker/timestamp UI was published
+successfully as Sites deployment `appgdep_6adb850e43608191aebc81f562c32f2c`, source
+`c8479cac6534ac3dc25f42816cb4018a184e8edc`, environment revision 11, at the existing
+private Uomi URL. Existing completed/failed recordings were not automatically
+requeued; a manual rerun uses the new pipeline.
