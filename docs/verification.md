@@ -212,3 +212,28 @@ shared/daemon tests, all TypeScript projects, production Site build, and format/
 with no warnings. Android's standalone local release APK is signed with the
 existing development certificate, has embedded Hermes bytecode and passes 16KB
 alignment/signature checks. It was not installed because no device is attached.
+
+Cutover repair: the first importer stopped at 96 pages on a non-JSON gateway 500;
+its cursor remained saved and a subsequent single-page retry succeeded. The run
+was terminal before any stop signal. A cutover audit then found that 0005's old
+cache ownership marker prevented a final source refresh and queued unnecessary
+baseline backup writes. Migration 0007 and guarded import logic correct this:
+untouched Notion baselines refresh once, edited/new primary records remain
+protected, baseline snapshots never write back to Notion, and missing audio can
+be hydrated independently without replacing titles or results. Race regressions
+cover primary edits during network fetch and competing hydration transactions.
+
+GitHub main `3a66119614d845a98438f80624a8b02ecbab9d87` is deployed through
+owner-private Sites operation `appgdep_6adb70fb19b081919e0837427420db88`, source
+`46d088e62a8eb27f08da16bfac8ffe308d4d3343`, environment 11. The full check passes
+125 Node client/web tests, 36 Bun shared/daemon tests, all typechecks and the
+production build; format/lint has zero warnings. D1 has notion_import_version.
+
+Mac mini's unchanged API worker was resumed (PID 87834), health ok and polling
+successfully. The explicit repair scan reset exactly once in process PID 87941,
+with private log migration-repair-0007.log and state migration-repair-run.json.
+It retains missing-source IDs and retries transient HTTP/network failures without
+resetting; the first two source pages were reimported successfully. Final exhaustive
+migration and physical-device verification remain outstanding. Running/paused
+migration status now follows its active database lease, rather than the mere
+presence of a saved cursor.
