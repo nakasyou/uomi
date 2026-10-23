@@ -122,3 +122,14 @@ test('authentication, CSRF, device key issue/revoke', async () => {
   assert.equal(r.status, 401)
   f.sqlite.close()
 })
+
+test('private Sites email identity supports the viewer and preserves CSRF checks', async () => {
+  const f = fixture()
+  const call = (method, extra = {}) => app.fetch(new Request('https://uomi.test/api/clients', {
+    method,
+    headers: { 'oai-authenticated-user-email': 'owner@example.org', ...extra },
+  }), f.env, f.ctx)
+  assert.equal((await call('GET')).status, 200)
+  assert.equal((await call('POST', { Origin: 'https://other.test' })).status, 403)
+  f.sqlite.close()
+})

@@ -98,8 +98,13 @@ export async function validateChunk(v: any) {
   if (total > 900000 || total !== v.durationMs) throw Error('Chunk duration mismatch')
   return ranges(v.frames)
 }
+// Dispatch supplies these headers only after private Site authentication.
+// Some hosted browser renderers provide email without the stable user ID.
+function visitor(request: Request) {
+  return request.headers.get('oai-authenticated-user-id') || request.headers.get('oai-authenticated-user-email')
+}
 async function authorize(request: Request, env: any) {
-  if (request.headers.get('oai-authenticated-user-id')) return 'owner'
+  if (visitor(request)) return 'owner'
   const secret = request.headers.get('X-Uomi-Secret')
   if (!secret || secret.length < 24) return null
   const hash = await digest(new TextEncoder().encode(secret))
@@ -561,7 +566,7 @@ export default {
       const path = new URL(request.url).pathname
       if (path === '/health') return json({ ok: true })
       if (path === '/mcp') {
-        if (request.method === 'POST' && request.headers.get('oai-authenticated-user-id')) {
+        if (request.method === 'POST' && visitor(request)) {
           const rpc: any = await request.clone().json()
           if (rpc.method === 'tools/call' && rpc.params?.name === 'index_status') {
             const count = await env.DB.prepare(
@@ -614,7 +619,7 @@ export default {
         return env.ASSETS ? env.ASSETS.fetch(request) : new Response('Not found', { status: 404 })
       const role = await authorize(request, env)
       if (!role) return json({ error: 'Authentication required' }, 401)
-      if (request.method !== 'GET' && request.headers.get('oai-authenticated-user-id')) {
+      if (request.method !== 'GET' && visitor(request)) {
         const origin = request.headers.get('Origin')
         if (origin && origin !== new URL(request.url).origin)
           return json({ error: 'Cross-origin write rejected' }, 403)
