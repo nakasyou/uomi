@@ -56,3 +56,8 @@ emptiness probe avoids the worst no-match future case. Full storage/daily
 aggregates remain explicit diagnostics (`index_status`), not ordinary searches or
 status polls. Temporary sorting for FTS result chronology is limited to matched
 candidates, rather than all recording history.
+
+`0007_notion_cutover.sql` further narrows `backup_due` to new uploads or changed
+primary recordings. Untouched historical Notion snapshots are excluded, and their
+old dirty backup revisions/leases are cleared before cutover refresh. This prevents
+a queue of stale cache snapshots from rewriting the historical source.

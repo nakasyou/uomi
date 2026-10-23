@@ -53,6 +53,61 @@ export async function readDetailedTranscript(store: NotionStore, page: any) {
     detailed_error: text(p['Detailed error']?.rich_text),
   }
 }
+// Fill missing original files without allowing an import to replace primary edits.
+async function hydrateMissingAudio(env: any, store: NotionStore, page: any, old: any) {
+  const id = old.id,
+    p = page.properties
+  const missing = ['Audio', 'Manifest'].filter((name) => !p[name]?.files?.[0]?.file?.url)
+  if (page.archived || page.in_trash || missing.length)
+    return {
+      id,
+      audio_imported: false,
+      warning: 'missing_audio',
+      missing_source_files: missing,
+      ...(page.archived || page.in_trash ? { source_archived: true } : {}),
+    }
+  const manifest = JSON.parse(
+    (await attachment(store.fileUrl(page, 'Manifest'), 6 * 1024 * 1024)).toString(),
+  )
+  validateManifest(manifest)
+  const spans = ranges(manifest.frameIds.map((id: string) => ({ id })))
+  const audio = await attachment(store.fileUrl(page, 'Audio'), 20 * 1024 * 1024)
+  if ((await hash(audio)) !== manifest.sha256)
+    throw Error('Notion audio hash does not match its manifest')
+  const key = `audio/${manifest.sha256}.ogg`,
+    manifestKey = await saveManifest(env, manifest)
+  await env.BUCKET.put(key, audio, {
+    httpMetadata: { contentType: 'audio/ogg' },
+    customMetadata: { sha256: manifest.sha256 },
+  })
+  // Update audio last: every statement observes the same missing-audio condition
+  // within this transaction. A concurrent hydration that won earlier makes all
+  // three statements no-ops, including source claim replacement.
+  const result = await env.DB.batch([
+    env.DB.prepare(
+      'DELETE FROM source_ranges WHERE recording_id=(SELECT rid FROM recordings WHERE id=? AND audio_key IS NULL AND notion_edited IS NOT NULL)',
+    ).bind(id),
+    env.DB.prepare(`INSERT INTO source_ranges SELECT ?,json_extract(value,'$.prefix'),json_extract(value,'$.start'),json_extract(value,'$.end'),
+      (SELECT rid FROM recordings WHERE id=?) FROM json_each(?) WHERE EXISTS(SELECT 1 FROM recordings WHERE id=? AND audio_key IS NULL AND notion_edited IS NOT NULL)`).bind(
+      manifest.deviceId,
+      id,
+      JSON.stringify(spans),
+      id,
+    ),
+    env.DB.prepare(
+      'UPDATE recordings SET audio_key=?,audio_sha=?,manifest_key=?,manifest_gzip=NULL WHERE id=? AND audio_key IS NULL AND notion_edited IS NOT NULL',
+    ).bind(key, manifest.sha256, manifestKey, id),
+  ])
+  const hydrated = !!result[2].meta.changes
+  if (hydrated && old.status !== 'Completed') await enqueue(env, id)
+  return {
+    id,
+    cached: hydrated,
+    hydrated,
+    audio_imported: hydrated,
+    ...(!hydrated ? { skipped: 'audio-already-present' } : {}),
+  }
+}
 export async function cachePage(env: any, page: any) {
   const store = new NotionStore(httpTransport(env.NOTION_TOKEN), env.NOTION_DATA_SOURCE_ID),
     p = page.properties,
@@ -64,13 +119,31 @@ export async function cachePage(env: any, page: any) {
     .first()
   const id = old?.id ?? canonicalId
   // Import is one-way: backups must never overwrite or delete primary edits/results.
-  if (old?.primary_owned)
+  const refreshBaseline =
+    old?.notion_edited != null && old.revision === 0 && old.notion_import_version === 0
+  if (old?.primary_owned && old.notion_edited != null && !old.audio_key && !refreshBaseline)
+    return hydrateMissingAudio(env, store, page, old)
+  if (old?.primary_owned && !refreshBaseline)
     return {
       id,
       skipped: 'primary-owned',
       ...(!old.audio_key ? { audio_imported: false, warning: 'missing_audio' } : {}),
     }
   if (page.archived || page.in_trash) {
+    if (old?.primary_owned) {
+      await env.DB.prepare(
+        'UPDATE recordings SET notion_import_version=1,backup_revision=revision WHERE id=? AND notion_edited IS NOT NULL AND revision=0 AND notion_import_version=0',
+      )
+        .bind(id)
+        .run()
+      return {
+        id,
+        skipped: 'archived-primary-preserved',
+        ...(!old.audio_key
+          ? { audio_imported: false, warning: 'missing_audio', source_archived: true }
+          : {}),
+      }
+    }
     await env.DB.batch([
       env.DB.prepare(
         'DELETE FROM source_ranges WHERE recording_id=(SELECT rid FROM recordings WHERE id=? AND primary_owned=0)',
@@ -85,14 +158,21 @@ export async function cachePage(env: any, page: any) {
     old.audio_key &&
     (await env.BUCKET.head(old.audio_key)) &&
     (old.manifest_gzip || (old.manifest_key && (await env.BUCKET.head(old.manifest_key))))
-  )
+  ) {
+    await env.DB.prepare(
+      'UPDATE recordings SET primary_owned=1,notion_import_version=1,backup_revision=revision WHERE id=? AND (primary_owned=0 OR (notion_edited IS NOT NULL AND revision=0 AND notion_import_version=0))',
+    )
+      .bind(id)
+      .run()
     return { id, unchanged: true }
-  let audioKey: string | null = null,
-    sha: string | null = null,
-    manifestKey: string | null = null
+  }
+  let audioKey: string | null = old?.audio_key ?? null,
+    sha: string | null = old?.audio_sha ?? null,
+    manifestKey: string | null = old?.manifest_key ?? null
   let sourceSpans: ReturnType<typeof ranges> = []
   const manifestUrl = p.Manifest?.files?.[0]?.file?.url
-  if (manifestUrl && p.Audio?.files?.[0]?.file?.url) {
+  const sourceFilesPresent = !!(manifestUrl && p.Audio?.files?.[0]?.file?.url)
+  if (sourceFilesPresent) {
     const manifest = JSON.parse(
       (await attachment(store.fileUrl(page, 'Manifest'), 6 * 1024 * 1024)).toString(),
     )
@@ -129,7 +209,7 @@ export async function cachePage(env: any, page: any) {
     status = p.Status?.select?.name ?? 'Pending'
   await env.DB.batch([
     env.DB.prepare(
-      "INSERT INTO recordings(id,recorded_at,finished_at,edited_at,device,status,url,text,audio_key,audio_sha,duration_ms,manifest_key,title,starred,backup_step,backup_page,notion_edited,search_text,search_version) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'done',?,?,?,1) ON CONFLICT(id) DO UPDATE SET recorded_at=excluded.recorded_at,finished_at=excluded.finished_at,edited_at=excluded.edited_at,device=excluded.device,status=excluded.status,url=excluded.url,text=excluded.text,audio_key=excluded.audio_key,audio_sha=excluded.audio_sha,duration_ms=excluded.duration_ms,manifest_key=excluded.manifest_key,manifest_gzip=NULL,title=excluded.title,starred=excluded.starred,backup_step='done',backup_page=excluded.backup_page,notion_edited=excluded.notion_edited,search_text=excluded.search_text,search_version=1 WHERE recordings.primary_owned=0",
+      "INSERT INTO recordings(id,recorded_at,finished_at,edited_at,device,status,url,text,audio_key,audio_sha,duration_ms,manifest_key,title,starred,backup_step,backup_page,notion_edited,search_text,search_version) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'done',?,?,?,1) ON CONFLICT(id) DO UPDATE SET recorded_at=excluded.recorded_at,finished_at=excluded.finished_at,edited_at=excluded.edited_at,device=excluded.device,status=excluded.status,url=excluded.url,text=excluded.text,audio_key=excluded.audio_key,audio_sha=excluded.audio_sha,duration_ms=excluded.duration_ms,manifest_key=excluded.manifest_key,manifest_gzip=CASE WHEN excluded.manifest_key IS NOT NULL THEN NULL ELSE recordings.manifest_gzip END,title=excluded.title,starred=excluded.starred,backup_step='done',backup_page=excluded.backup_page,notion_edited=excluded.notion_edited,search_text=excluded.search_text,search_version=1 WHERE (recordings.primary_owned=0 OR (recordings.notion_edited IS NOT NULL AND recordings.revision=0 AND recordings.notion_import_version=0))",
     ).bind(
       id,
       Number.isFinite(start) ? start : null,
@@ -150,7 +230,7 @@ export async function cachePage(env: any, page: any) {
       normalizeSearch(transcript),
     ),
     env.DB.prepare(
-      'UPDATE recordings SET detailed_status=?,detailed_text=?,detailed_error=?,transcript_segments=?,detailed_segments=? WHERE id=? AND primary_owned=0',
+      'UPDATE recordings SET detailed_status=?,detailed_text=?,detailed_error=?,transcript_segments=?,detailed_segments=? WHERE id=? AND (primary_owned=0 OR (notion_edited IS NOT NULL AND revision=0 AND notion_import_version=0))',
     ).bind(
       detailed.detailed_status,
       detailed.detailed_text,
@@ -159,24 +239,30 @@ export async function cachePage(env: any, page: any) {
       JSON.stringify(detailed.detailed_segments),
       id,
     ),
+    ...(sourceFilesPresent
+      ? [
+          env.DB.prepare(
+            'DELETE FROM source_ranges WHERE recording_id=(SELECT rid FROM recordings WHERE id=? AND (primary_owned=0 OR (notion_edited IS NOT NULL AND revision=0 AND notion_import_version=0)))',
+          ).bind(id),
+          env.DB.prepare(`INSERT INTO source_ranges SELECT ?,json_extract(value,'$.prefix'),json_extract(value,'$.start'),json_extract(value,'$.end'),
+      (SELECT rid FROM recordings WHERE id=?) FROM json_each(?) WHERE EXISTS(SELECT 1 FROM recordings WHERE id=? AND (primary_owned=0 OR (notion_edited IS NOT NULL AND revision=0 AND notion_import_version=0)))`).bind(
+            text(p.Device?.rich_text),
+            id,
+            JSON.stringify(sourceSpans),
+            id,
+          ),
+        ]
+      : []),
     env.DB.prepare(
-      'DELETE FROM source_ranges WHERE recording_id=(SELECT rid FROM recordings WHERE id=? AND primary_owned=0)',
+      'UPDATE recordings SET primary_owned=1,notion_import_version=1,backup_revision=revision WHERE id=? AND (primary_owned=0 OR (notion_edited IS NOT NULL AND revision=0 AND notion_import_version=0))',
     ).bind(id),
-    env.DB.prepare(`INSERT INTO source_ranges SELECT ?,json_extract(value,'$.prefix'),json_extract(value,'$.start'),json_extract(value,'$.end'),
-      (SELECT rid FROM recordings WHERE id=?) FROM json_each(?) WHERE EXISTS(SELECT 1 FROM recordings WHERE id=? AND primary_owned=0)`).bind(
-      text(p.Device?.rich_text),
-      id,
-      JSON.stringify(sourceSpans),
-      id,
-    ),
-    env.DB.prepare('UPDATE recordings SET primary_owned=1 WHERE id=?').bind(id),
   ])
   if (audioKey && status !== 'Completed') await enqueue(env, id)
   return {
     id,
     cached: true,
-    audio_imported: !!audioKey,
-    ...(!audioKey
+    audio_imported: sourceFilesPresent,
+    ...(!sourceFilesPresent
       ? {
           warning: 'missing_audio',
           missing_source_files: ['Audio', 'Manifest'].filter(

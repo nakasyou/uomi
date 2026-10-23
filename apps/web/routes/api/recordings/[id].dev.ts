@@ -2,6 +2,7 @@ import { defineHandler } from 'void'
 export const GET = defineHandler(() => ({
   id: 'preview',
   revision: 0,
+  updated_at: '2026-10-23T00:00:00.000Z',
   title: 'Interface verification sample',
   recorded_at: 1792713600000,
   duration_ms: 600000,

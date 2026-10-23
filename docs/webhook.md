@@ -46,8 +46,10 @@ never produces invented timing/speaker assignments.
 
 ## Release migration
 
-Apply web migrations through `0006_query_performance.sql` before starting the API worker.
-It creates jobs for existing unfinished recordings with primary audio. Import
+Apply web migrations through `0007_notion_cutover.sql` before starting the API worker.
+The job migration creates jobs for existing unfinished recordings with primary
+audio. The cutover migration prevents stale historical snapshots from being
+backed up into Notion and permits one guarded source refresh. Import
 older Notion history through worker-authenticated `/api/migrations/notion`: POST
 `{reset:true}` only on the first request, then POST `{}` until `has_more:false`.
 GET the same endpoint for persisted status/error. Do not reset between batches; imported pending

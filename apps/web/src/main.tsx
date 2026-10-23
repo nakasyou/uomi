@@ -16,6 +16,7 @@ type Job = {
 type Segment = { start_ms: number; end_ms: number; text: string; speaker?: string }
 type Recording = {
   revision?: number
+  updated_at?: string
   id: string
   title: string
   recorded_at: number | null
@@ -264,7 +265,9 @@ function App() {
         const previous = selectedRef.current
         const changed =
           previous?.id === id &&
-          (state.revision !== previous.revision || state.has_audio !== previous.has_audio)
+          (state.revision !== previous.revision ||
+            state.has_audio !== previous.has_audio ||
+            state.updated_at !== previous.updated_at)
         merge(id, state)
         if (changed) {
           const full = await api('/api/recordings/' + id, { signal: controller.signal })
@@ -699,10 +702,24 @@ function App() {
                             )}
                             <button
                               className="tonal"
-                              disabled={syncing}
-                              onClick={() => void syncNotion()}
+                              disabled={!!busy}
+                              onClick={() => {
+                                const id = selected.id
+                                void action('import-audio', async () => {
+                                  const result = await api(`/api/recordings/${id}/resync`, {
+                                    method: 'POST',
+                                    body: '{}',
+                                  })
+                                  merge(id, await api(`/api/recordings/${id}`))
+                                  if (result.warning)
+                                    setNotice(
+                                      `Notion import: ${result.warning}${result.missing_source_files?.length ? ` (${result.missing_source_files.join(', ')})` : ''}`,
+                                    )
+                                  else setNotice('Audio imported.', 'success')
+                                })
+                              }}
                             >
-                              Import audio
+                              {busy === 'import-audio' ? 'Importing…' : 'Import audio'}
                             </button>
                           </>
                         )}
@@ -1043,14 +1060,20 @@ function App() {
               ? 'Import complete'
               : migration.status === 'running'
                 ? 'Import in progress'
-                : migration.status === 'failed'
-                  ? 'Import needs attention'
-                  : 'Not imported yet'}
+                : migration.status === 'paused'
+                  ? 'Import paused'
+                  : migration.status === 'failed'
+                    ? 'Import needs attention'
+                    : 'Not imported yet'}
           </p>
         )}
         {migration?.error && <p className="error">{migration.error}</p>}
         <button className="tonal" disabled={syncing} onClick={() => void syncNotion()}>
-          {syncing ? `Importing · ${synced}` : 'Import from Notion'}
+          {syncing
+            ? `Importing · ${synced}`
+            : migration?.status === 'paused' || migration?.status === 'failed'
+              ? 'Resume import'
+              : 'Import from Notion'}
         </button>
         {syncing && (
           <button

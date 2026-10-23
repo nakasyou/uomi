@@ -293,6 +293,13 @@ test('worker historical import is bounded and resumable; repeated or archived ba
     let data = await r.json()
     assert.equal(data.has_more, true)
     assert.equal(data.updates[0].skipped, 'primary-owned')
+    let progress = await (await app.fetch(req('GET'), f.env, f.ctx)).json()
+    assert.equal(progress.status, 'paused')
+    assert.equal(progress.lease_until, 0)
+    f.sqlite.prepare('UPDATE resync_state SET lease_until=? WHERE id=1').run(Date.now() + 60000)
+    progress = await (await app.fetch(req('GET'), f.env, f.ctx)).json()
+    assert.equal(progress.status, 'running')
+    f.sqlite.prepare('UPDATE resync_state SET lease_until=0 WHERE id=1').run()
     r = await app.fetch(req('POST', {}), f.env, f.ctx)
     data = await r.json()
     assert.equal(data.has_more, false)
@@ -305,6 +312,38 @@ test('worker historical import is bounded and resumable; repeated or archived ba
     assert.equal(row.audio_key, 'audio/test.ogg')
   } finally {
     globalThis.fetch = original
+    f.sqlite.close()
+  }
+})
+
+test('migration reports an active lease separately from a saved resumable cursor', async () => {
+  const f = fixture()
+  try {
+    f.sqlite
+      .prepare(
+        "INSERT INTO resync_state(id,cursor,since,started,lease_until) VALUES(1,'{}','1970-01-01T00:00:00.000Z','2026-10-23T00:00:00.000Z',0)",
+      )
+      .run()
+    const read = async () => {
+      const r = await app.fetch(
+        new Request('https://uomi.test/api/migrations/notion', {
+          headers: { 'oai-authenticated-user-id': 'owner' },
+        }),
+        f.env,
+        f.ctx,
+      )
+      return r.json()
+    }
+    assert.equal((await read()).status, 'paused')
+    f.sqlite.prepare('UPDATE resync_state SET lease_until=? WHERE id=1').run(Date.now() + 30000)
+    assert.equal((await read()).status, 'running')
+    f.sqlite
+      .prepare(
+        "UPDATE resync_state SET lease_until=0,last_error='Temporary gateway failure' WHERE id=1",
+      )
+      .run()
+    assert.equal((await read()).status, 'failed')
+  } finally {
     f.sqlite.close()
   }
 })

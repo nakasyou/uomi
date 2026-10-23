@@ -70,7 +70,8 @@ are returned to browser code.
   creation is searched by recording ID; absent pages remain explicitly unconfirmed.
 - `GET/POST /api/migrations/notion`: worker/owner-only bounded import; POST
   `{reset:true}` once, then `{}` until `has_more:false`. GET returns persisted
-  state and the last import error.
+  state, active lease expiry and the last import error. An unfinished cursor
+  without an active lease is `paused`; `running` requires a live request lease.
 - `POST /api/resync` `{reset?:boolean}`: migrate one historical Notion page
   per request; repeat while `has_more`. Reset starts a complete scan. Progress
   persists. `POST /api/recordings/:id/resync` imports one legacy page.
@@ -90,7 +91,7 @@ both segment arrays are primary D1 data and are included in optional Notion back
 
 Keep existing `0000`–`0003` migrations unchanged. Apply
 `0004_detailed_transcription.sql`, `0005_jobs.sql`, then
-`0006_query_performance.sql` before publishing. The last adds virtual sort keys and
+`0006_query_performance.sql`, then `0007_notion_cutover.sql` before publishing. The query-performance migration adds virtual sort keys and
 indexes verified with realistic query plans; see [query performance](../../docs/query-performance.md). Existing
 recording IDs, audio keys and transcripts survive. Existing audio-bearing pending
 recordings receive durable standard jobs. Existing cached audio becomes primary.
@@ -99,9 +100,17 @@ Historical import downloads/validates audio and manifests before committing,
 imports standard/detailed transcripts and preserves original IDs and source timing.
 Missing original Audio/Manifest attachments are reported as `warning:missing_audio`
 with `audio_imported:false`; metadata import can continue so incomplete sources
-can be enumerated. It scans active/archived pages with resumable cursors and splits capped queries
-by creation windows. A failed download does not advance the cursor. Once imported,
-a recording is primary-owned: later imports and archived backups cannot overwrite
+can be enumerated. When a previously missing source finishes uploading, per-record
+import can hydrate verified audio/manifest/source claims without replacing primary
+title, transcripts, segments, statuses or revision, even after primary edits. A
+concurrent hydration winner or source-claim conflict cannot overwrite existing
+audio; claims and file references change transactionally. It scans active/archived pages with resumable cursors and splits capped queries
+by creation windows. A failed download does not advance the cursor. The cutover migration permits one refresh of untouched historical Notion snapshots
+(`notion_edited` present, revision zero, import version zero), then records import
+version one and an already-backed-up revision. Background backup never writes
+untouched Notion snapshots back into their source. New uploads and primary edits
+are protected throughout, including concurrent edits during source downloads.
+Once imported, a recording is primary-owned: later imports and archived backups cannot overwrite
 its edits/results or delete it. D1/R2 must be retained and backed up as primary data.
 Legacy completion callbacks remain for a staged migration but do not overwrite
 primary-owned recordings; no normal capture/transcription path sends webhooks.

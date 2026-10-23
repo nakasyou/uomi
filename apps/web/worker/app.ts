@@ -329,6 +329,7 @@ export async function backup(env: any, id: string) {
   let row = await env.DB.prepare('SELECT * FROM recordings WHERE id=? AND audio_key IS NOT NULL')
     .bind(id)
     .first()
+  if (row?.notion_edited != null && row.revision === 0) return
   if (!row || (row.backup_step === 'done' && row.backup_revision >= row.revision)) return
   if (!env.NOTION_TOKEN || !env.NOTION_DATA_SOURCE_ID || row.backup_next_attempt > now) return
   if (row.backup_step === 'done') row.backup_step = 'transcript'
@@ -473,7 +474,7 @@ export async function backup(env: any, id: string) {
 }
 
 export const pendingBackupsSql =
-  "SELECT id FROM recordings WHERE audio_key IS NOT NULL AND backup_until<? AND backup_next_attempt<=? AND (backup_step NOT IN ('done','legacy') OR backup_revision<revision) ORDER BY backup_next_attempt,backup_until LIMIT 2"
+  "SELECT id FROM recordings WHERE audio_key IS NOT NULL AND (notion_edited IS NULL OR revision>0) AND backup_until<? AND backup_next_attempt<=? AND (backup_step NOT IN ('done','legacy') OR backup_revision<revision) ORDER BY backup_next_attempt,backup_until LIMIT 2"
 async function resumeBackups(env: any) {
   if (!env.NOTION_TOKEN || !env.NOTION_DATA_SOURCE_ID) return
   const rows = await env.DB.prepare(pendingBackupsSql).bind(Date.now(), Date.now()).all()
@@ -503,13 +504,16 @@ async function api(request: Request, env: any, ctx: any, role: string) {
       return json({
         status: !state
           ? 'not_started'
-          : state.last_error
-            ? 'failed'
-            : state.cursor
-              ? 'running'
-              : state.since === '1970-01-01T00:00:00.000Z'
-                ? 'not_started'
-                : 'completed',
+          : state.lease_until > Date.now()
+            ? 'running'
+            : state.last_error
+              ? 'failed'
+              : state.cursor
+                ? 'paused'
+                : state.since === '1970-01-01T00:00:00.000Z'
+                  ? 'not_started'
+                  : 'completed',
+        lease_until: state?.lease_until ?? 0,
         has_more: !!state?.cursor,
         watermark: state?.since ?? null,
         started: state?.started ?? null,
@@ -773,6 +777,7 @@ async function api(request: Request, env: any, ctx: any, role: string) {
         detailed_segments: JSON.parse(row.detailed_segments),
         id: row.id,
         revision: row.revision,
+        updated_at: row.edited_at,
         title: row.title,
         recorded_at: row.recorded_at,
         duration_ms: row.duration_ms ?? row.finished_at - row.recorded_at,

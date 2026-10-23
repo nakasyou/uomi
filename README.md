@@ -81,7 +81,7 @@ bun run transcriber
 
 Sites provisions `DB` and `BUCKET`, keeps the existing private Site/plugin identity,
 and applies the immutable SQL migrations in `apps/web/drizzle`. Apply through
-`0006_query_performance.sql` before serving the new API. See the
+`0007_notion_cutover.sql` before serving the new API. See the
 [query-plan evidence](docs/query-performance.md). Existing audio-bearing pending records
 receive standard transcription jobs in that migration; public recording IDs and
 original audio remain unchanged. See [web API and operations](apps/web/README.md).
