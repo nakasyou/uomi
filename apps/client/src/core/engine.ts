@@ -935,7 +935,12 @@ export class Engine {
     const indexes = this.inventory()
     const plans = await (this.port.planAudio ?? cooperativePlans)(indexes, s.segmentSeconds, true)
     const total = plans.reduce((n, p) => n + p.sourceFrames - p.deliveredFrames, 0)
-    let completed = 0
+    let completed = 0, submitted = 0, verified = 0, staged = 0
+    const progress = (detail?: string) => ({
+      stage: 'upload' as const, completed, total, detail,
+      chunksTotal: plans.length, chunksSubmitted: submitted,
+      chunksCompleted: verified, chunksStaged: staged,
+    })
     for (const plan of plans) {
       if (Date.now() > this.deadline)
         throw Error('Background time limit reached. Sync again to resume.')
@@ -960,7 +965,7 @@ export class Engine {
       }
       this.update({
         phase: 'Saving audio to Sites',
-        progress: { stage: 'upload', completed, total, detail: 'Saving one audio chunk' },
+        progress: progress(`Sending chunk ${submitted + 1} of ${plans.length}`),
       })
       const canonical = await this.port.post(
         s.endpoint,
@@ -969,11 +974,13 @@ export class Engine {
         s.compression,
         id,
       )
+      submitted++
       if (canonical !== true) {
-        this.update({ phase: 'Cached on Sites; waiting for Notion save. Sync again to confirm.' })
+        staged++
+        this.update({ progress: progress('Cached audio is retained locally until Notion confirms it'), phase: 'Cached on Sites; waiting for Notion save. Sync again to confirm.' })
         continue
       }
-      // A 2xx response means R2 and D1 are durable. Never acknowledge before it.
+      // Only an explicit canonical Notion receipt permits local acknowledgement.
       const accepted = new Set(originals.map((f) => f.id))
       const puts: { key: string; value: string }[] = []
       for (const range of plan.ranges) {
@@ -991,7 +998,8 @@ export class Engine {
       }
       await this.writeBatch(puts)
       completed += originals.length
-      this.update({ progress: { stage: 'upload', completed, total } })
+      verified++
+      this.update({ progress: progress() })
     }
     await this.refresh()
     // Retention stays conservative: remove only after explicit user action.

@@ -15,6 +15,13 @@
       "when": 1792750000000,
       "tag": "0001_primary",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1792757000000,
+      "tag": "0002_compact",
+      "breakpoints": true
     }
   ]
 }

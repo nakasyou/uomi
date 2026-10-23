@@ -2,14 +2,15 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { DatabaseSync } from 'node:sqlite'
 import { readFileSync } from 'node:fs'
+import { normalizeSearch } from '../worker/search.js'
 import worker, { searchPlan, time } from '../worker/index.js'
 function database() {
   const db = new DatabaseSync(':memory:')
-  db.exec(readFileSync(new URL('../drizzle/0000_index.sql', import.meta.url), 'utf8'))
+  for (const name of ['0000_index.sql','0001_primary.sql','0002_compact.sql']) db.exec(readFileSync(new URL('../drizzle/' + name, import.meta.url), 'utf8'))
   return db
 }
 function insert(db, id, start, end, text) {
-  db.prepare('INSERT INTO recordings VALUES(?,?,?,?,?,?,?,?)').run(
+  db.prepare('INSERT INTO recordings(id,recorded_at,finished_at,edited_at,device,status,url,text,search_text,search_version) VALUES(?,?,?,?,?,?,?,?,?,1)').run(
     id,
     start,
     end,
@@ -18,8 +19,8 @@ function insert(db, id, start, end, text) {
     'Completed',
     'https://notion.so/test',
     text,
+    normalizeSearch(text),
   )
-  db.prepare('INSERT INTO transcripts VALUES(?,?)').run(id, text)
 }
 test('Japanese substrings, phrase escaping, and SQL injection remain literal', () => {
   const db = database()
@@ -35,7 +36,7 @@ test('Japanese substrings, phrase escaping, and SQL injection remain literal', (
   }
   const p = searchPlan({ query: "' OR 1=1 --" })
   assert.equal(db.prepare(p.sql).all(...p.args).length, 0)
-  assert.throws(() => searchPlan({ query: 'ab' }))
+  assert.throws(() => searchPlan({ query: 'a' }))
   db.close()
 })
 test('half-open overlap boundaries and keyset pagination', () => {
@@ -87,7 +88,7 @@ test('identity required; discovery, tools and tool errors implement MCP', async 
     })
   ).json()
   assert.equal(res.result.isError, true)
-  assert.match(res.result.content[0].text, /Configure/)
+  assert.match(res.result.content[0].text, /Notion credentials/)
 })
 test('trigram index is used for search', () => {
   const db = database()
@@ -113,5 +114,41 @@ test('unknown-clock results paginate without dropping dated recordings', () => {
       .map((r) => r.id),
     ['b', 'c'],
   )
+  db.close()
+})
+
+test('normalized kana, width, case, spaces and two-character literal fallback share search semantics', () => {
+  const db = database()
+  const raw = '学校 生活 ＣｈａｔＧＰＴ ｶﾀｶﾅ 100% _x'
+  insert(db, 'a', 0, 100, raw)
+  for (const query of ['学校', '学校生活', 'chat gpt', 'かたかな', 'カタカナ', '０％', '_x']) {
+    const p = searchPlan({ query })
+    assert.deepEqual(db.prepare(p.sql).all(...p.args).map(x => x.id), ['a'], query)
+  }
+  for (const query of ['0_', '%x', 'かたなく']) {
+    const p = searchPlan({ query })
+    assert.equal(db.prepare(p.sql).all(...p.args).length, 0, query)
+  }
+  assert.equal(db.prepare('SELECT text FROM recordings').get().text, raw)
+  const rid = db.prepare('SELECT rid FROM recordings').get().rid
+  db.prepare('UPDATE recordings SET text=?,search_text=? WHERE id=?').run('別の原文', normalizeSearch('別の原文'), 'a')
+  let p = searchPlan({ query: '学校生活' })
+  assert.equal(db.prepare(p.sql).all(...p.args).length, 0)
+  p = searchPlan({ query: '別の原文' })
+  assert.equal(db.prepare(p.sql).all(...p.args)[0].id, 'a')
+  assert.equal(db.prepare('SELECT rid FROM recordings').get().rid, rid)
+  db.prepare('DELETE FROM recordings WHERE id=?').run('a')
+  assert.equal(db.prepare(p.sql).all(...p.args).length, 0)
+  assert.equal(db.prepare("SELECT count(*) n FROM sqlite_master WHERE name='transcripts_content'").get().n, 0)
+  db.close()
+})
+
+test('compact positionless index verifies order and multiplicity against normalized source', () => {
+  const db = database()
+  insert(db, 'a', 0, 100, 'abcdef')
+  for (const query of ['abcdef', 'abcabc', 'defabc']) {
+    const p = searchPlan({ query })
+    assert.equal(db.prepare(p.sql).all(...p.args).length, query === 'abcdef' ? 1 : 0)
+  }
   db.close()
 })

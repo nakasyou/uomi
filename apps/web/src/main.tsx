@@ -127,7 +127,7 @@ function App() {
     setLoading(true)
     setError('')
     try {
-      if (search && [...search].length < 3) {
+      if (search && [...search].length < 2) {
         setItems([])
         setCursor(null)
         return
@@ -358,8 +358,8 @@ function App() {
               <button onClick={() => void load()}>Try again</button>
             </div>
           )}
-          {search && [...search].length < 3 ? (
-            <p className="list-message">Enter at least 3 characters to search.</p>
+          {search && [...search].length < 2 ? (
+            <p className="list-message">Enter at least 2 characters to search.</p>
           ) : items.length === 0 && !loading ? (
             <div className="list-message">
               <h2>{search ? 'No matching recordings' : 'Your recordings will appear here'}</h2>

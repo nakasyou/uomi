@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs'
 import { Buffer } from 'buffer'
 export function fixture() {
   const sqlite = new DatabaseSync(':memory:')
-  for (const name of ['0000_index.sql', '0001_primary.sql'])
+  for (const name of ['0000_index.sql', '0001_primary.sql', '0002_compact.sql'])
     sqlite.exec(readFileSync(new URL('../drizzle/' + name, import.meta.url), 'utf8'))
   const DB = {
     prepare(sql) {
@@ -40,6 +40,7 @@ export function fixture() {
   }
   const files = new Map()
   const BUCKET = {
+    async head(key) { return files.has(key) ? {} : null },
     async put(key, data) {
       files.set(key, Buffer.from(data))
     },
