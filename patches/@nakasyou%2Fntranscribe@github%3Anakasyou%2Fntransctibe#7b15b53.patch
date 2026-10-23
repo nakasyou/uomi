@@ -14,3 +14,145 @@ index 288a7a218c7b47655210c800be8eea8ba8f9d515..f87e50f9673cb789795a506dfd36fb36
    },
    "scripts": {
      "start": "bun src/index.ts",
+diff --git a/src/http-error.ts b/src/http-error.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..58cb99a0ee9db065dde2443771f81caaf25e9fbb
+--- /dev/null
++++ b/src/http-error.ts
+@@ -0,0 +1,45 @@
++/** Keep provider failures actionable without retaining credentials or large HTML responses. */
++function redact(value: string): string {
++  return value
++    .replace(/https?:\/\/[^\s<>"']+/gi, (url) => { try { const parsed = new URL(url); return parsed.origin + parsed.pathname } catch { return '[redacted-url]' } })
++    .replace(/\bBearer\s+[^\s"'<>]+/gi, 'Bearer [redacted]')
++    .replace(/\b(?:AIza[A-Za-z0-9_-]{20,}|sk-[A-Za-z0-9_-]{6,})\b/g, '[redacted]')
++    .replace(/((?:["']?)(?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|authorization|secret)["']?\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi, '$1[redacted]')
++    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' ')
++    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ')
++    .replace(/<[^>]+>/g, ' ')
++    .replace(/[\x00-\x1f\x7f\s]+/g, ' ')
++    .trim()
++}
++export async function httpErrorDetail(response: Response): Promise<string> {
++  const parts: string[] = []
++  const requestId = response.headers.get('x-request-id') ?? response.headers.get('x-goog-request-id') ?? response.headers.get('cf-ray')
++  if (requestId) parts.push(`request_id=${redact(requestId).slice(0, 160)}`)
++  const reader = response.body?.getReader()
++  if (reader) {
++    const chunks: Uint8Array[] = []; let size = 0
++    try {
++      while (size < 8192) {
++        const next = await reader.read(); if (next.done) break
++        const bytes = next.value.subarray(0, 8192 - size); chunks.push(bytes); size += bytes.length
++      }
++      const raw = Buffer.concat(chunks).toString('utf8')
++      let detail = raw
++      try {
++        const data = JSON.parse(raw), error = data.error ?? data
++        detail = [error.code, error.status, error.type, typeof error === 'string' ? error : error.message].filter((v) => typeof v === 'string' || typeof v === 'number').join(': ')
++      } catch { /* HTML/plain-text errors are sanitized below. */ }
++      if (detail) parts.push(redact(detail).slice(0, 1000))
++    } catch (error) {
++      parts.push(`error response read failed: ${redact(error instanceof Error ? error.message : String(error)).slice(0, 200)}`)
++    } finally {
++      await reader.cancel().catch(() => { /* The original HTTP failure is retained. */ })
++    }
++  }
++  return parts.length ? `; ${parts.join('; ')}` : ''
++}
++export async function providerHttpError(response: Response, phase: string) {
++  return Object.assign(new Error(`${phase} HTTP ${response.status}${await httpErrorDetail(response)}`), {
++    status: response.status, retryAfter: response.headers.get('retry-after'),
++  })
++}
+diff --git a/src/providers/chrome.ts b/src/providers/chrome.ts
+index 7fc62f6fdb2a45a21d3c55169c9337c79f10ba1f..64c97ecf58e0244e06fcd90e0982f81709871c8d 100644
+--- a/src/providers/chrome.ts
++++ b/src/providers/chrome.ts
+@@ -1,3 +1,4 @@
++import { providerHttpError } from '../http-error'
+ import { mkdtemp, readFile, rm } from 'node:fs/promises'
+ import { execFile } from 'node:child_process'
+ import { tmpdir } from 'node:os'
+@@ -176,15 +177,15 @@ export async function* recognizeFlac(
+     body: Buffer.from(audio),
+     signal,
+   }).then(async (response) => {
++    if (!response.ok) throw await providerHttpError(response, 'Speech upstream')
+     await response.body?.cancel()
+-    if (!response.ok) throw new Error(`Speech upstream HTTP ${response.status}`)
+   })
+   // Abort the other request immediately if either fails, and handle rejections.
+   void downstream.catch((error) => controller.abort(error))
+   void upstream.catch((error) => controller.abort(error))
+   try {
+     const response = await downstream
+-    if (!response.ok) throw new Error(`Speech downstream HTTP ${response.status}`)
++    if (!response.ok) throw await providerHttpError(response, 'Speech downstream')
+     if (!response.body) throw new Error('Missing recognition response body')
+     for await (const event of decodeEvents(response.body)) {
+       if (event.status) throw new Error(`Speech recognition status ${event.status}`)
+diff --git a/src/providers/codex.ts b/src/providers/codex.ts
+index 5c23ccd5c777a07a2072b29ebda0359d2dfff5fa..e1f8e4da5a0c8e1fe487f5b498dd51f5293cb402 100644
+--- a/src/providers/codex.ts
++++ b/src/providers/codex.ts
+@@ -1,3 +1,4 @@
++import { httpErrorDetail } from '../http-error'
+ import { readFile } from 'node:fs/promises'
+ import { homedir } from 'node:os'
+ import { basename, join } from 'node:path'
+@@ -36,13 +37,14 @@ export class TranscriptionHttpError extends Error {
+     public readonly status: number,
+     public readonly browserChallenge: boolean,
+     public readonly retryAfter: string | null,
++    detail = '',
+   ) {
+     const hint = browserChallenge
+       ? ' The server requested a browser challenge; check the desktop User-Agent and network route.'
+       : status === 401
+         ? ' Sign in again with codex login.'
+         : ''
+-    super(`Transcription failed (HTTP ${status}).${hint}`)
++    super(`Transcription failed (HTTP ${status}).${hint}${detail}`)
+     this.name = 'TranscriptionHttpError'
+   }
+ }
+@@ -138,15 +140,15 @@ async function transcribeCodexFile(
+       signal:
+         options.timeoutMs === null ? undefined : AbortSignal.timeout(options.timeoutMs ?? 90_000),
+     })
+-  } catch {
+-    throw new Error('Transcription request failed or timed out.')
++  } catch (error) {
++    throw new Error(`Transcription request failed or timed out: ${error instanceof Error ? error.message : String(error)}`, { cause: error })
+   }
+   if (!response.ok) {
+-    await response.body?.cancel()
+     throw new TranscriptionHttpError(
+       response.status,
+       response.headers.get('cf-mitigated') === 'challenge',
+       response.headers.get('retry-after'),
++      await httpErrorDetail(response),
+     )
+   }
+   const result: unknown = await response.json()
+diff --git a/src/transcribe.ts b/src/transcribe.ts
+index c1d27487f3dd1c1c0e0ae3f86aa3769fbe618374..42a4a4d4e87f5e71273cfdc2e80c65729519cdca 100644
+--- a/src/transcribe.ts
++++ b/src/transcribe.ts
+@@ -73,9 +73,13 @@ export async function transcribe(
+         chunks.push(chunk)
+         await options.onChunk?.(chunk, index)
+       } catch (error) {
+-        throw new Error(
+-          `Chunk ${index + 1}/${files.length} failed: ${error instanceof Error ? error.message : 'Transcription failed.'}`,
++        const wrapped = new Error(
++          `Chunk ${index + 1}/${files.length} failed: ${error instanceof Error ? error.message : String(error)}`,
++          { cause: error },
+         )
++        if (error && typeof error === 'object')
++          Object.assign(wrapped, { status: 'status' in error ? error.status : undefined, retryAfter: 'retryAfter' in error ? error.retryAfter : undefined })
++        throw wrapped
+       }
+     }
+     return {

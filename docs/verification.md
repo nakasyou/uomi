@@ -276,3 +276,17 @@ attribution and the cause of each earlier growth increment remain unmeasured.
 No lossy source compression, range rewrite, VACUUM or storage schema change was
 made during this read-only investigation. See docs/query-performance.md for the
 numbers and interpretation limits.
+
+Native Android end-to-end verification passed in an owned emulator with one
+labeled synthetic tone upload: HTTP 401 retained the original audio, retry saved
+the primary copy, restart preserved acknowledgements, and the real daemon job
+completed on its second attempt after a transient speech-provider HTTP 400.
+See docs/native-verification.md for exact retention checks, APK hash and cleanup.
+
+That provider failure exposed an upstream diagnostic gap. The patched provider
+now reads at most 8 KiB of failure response and retains bounded sanitized message,
+code and request ID, while preserving HTTP status/retry metadata through chunk
+wrapping. Credential redaction, bounded stream cancellation and real ffmpeg chunk
+error propagation have regressions. All 21 transcriber tests, its typecheck/build,
+and repository formatting/lint pass. Remote Nix applies this same repository patch;
+activation of that next pinned source is recorded separately after verification.

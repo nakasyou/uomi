@@ -75,18 +75,18 @@ combining ranges with different prefixes would lose deduplication correctness.
 The connected production `index_status` call after deployment
 `appgdep_6adb7455f4708191b4fc7e7be537623d` reported:
 
-| Measurement | Value |
-| --- | ---: |
-| Physical D1 size | 121,171,968 bytes (115.56 MiB) |
-| Recordings / primary audio copies | 213 / 145 |
-| Source ranges / distinct prefixes | 296,518 / 296,504 |
-| Frames / mean frames per range | 1,317,449 / 4.443 |
-| Source device strings | 6,226,908 UTF-8 bytes |
-| Source prefix strings | 25,797,038 UTF-8 bytes |
-| Combined source identity payload | 32,023,946 bytes (30.54 MiB) |
-| Original + normalized transcript text | 96,293 bytes |
-| FTS data + term payload | 89,929 bytes |
-| Legacy manifest blobs in D1 | 0 bytes |
+| Measurement                           |                          Value |
+| ------------------------------------- | -----------------------------: |
+| Physical D1 size                      | 121,171,968 bytes (115.56 MiB) |
+| Recordings / primary audio copies     |                      213 / 145 |
+| Source ranges / distinct prefixes     |              296,518 / 296,504 |
+| Frames / mean frames per range        |              1,317,449 / 4.443 |
+| Source device strings                 |          6,226,908 UTF-8 bytes |
+| Source prefix strings                 |         25,797,038 UTF-8 bytes |
+| Combined source identity payload      |   32,023,946 bytes (30.54 MiB) |
+| Original + normalized transcript text |                   96,293 bytes |
+| FTS data + term payload               |                   89,929 bytes |
+| Legacy manifest blobs in D1           |                        0 bytes |
 
 The difference between range count and distinct-prefix count is only **14 rows
 (0.0047%)**. Almost every range represents a different packet identity, rather
