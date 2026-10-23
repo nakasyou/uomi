@@ -43,7 +43,7 @@ test('stage, retry, canonical acknowledgement, fast search and audio are separat
   assert.equal(r.status, 202)
   assert.equal((await r.json()).notion_saved, false)
   await Promise.all(f.tasks)
-  assert.equal(f.files.size, 1)
+  assert.equal(f.files.size, 2)
   assert.equal(f.sqlite.prepare('SELECT backup_step FROM recordings').get().backup_step, 'page')
   r = await app.fetch(request('/api/chunks', 'POST', v, headers), f.env, f.ctx)
   assert.equal(r.status, 202)
@@ -52,7 +52,7 @@ test('stage, retry, canonical acknowledgement, fast search and audio are separat
       "UPDATE recordings SET backup_step='done',text='分散ファクトチェック',status='Completed'",
     )
     .run()
-  f.sqlite.prepare('INSERT INTO transcripts VALUES(?,?)').run(v.segmentId, '分散ファクトチェック')
+  f.sqlite.prepare('UPDATE recordings SET search_text=?,search_version=1 WHERE id=?').run('分散ふぁくとちぇっく', v.segmentId)
   r = await app.fetch(request('/api/chunks', 'POST', v, headers), f.env, f.ctx)
   assert.equal((await r.json()).notion_saved, true)
   r = await app.fetch(request('/api/recordings?q=' + encodeURIComponent('ファクト')), f.env, f.ctx)
@@ -131,5 +131,20 @@ test('private Sites email identity supports the viewer and preserves CSRF checks
   }), f.env, f.ctx)
   assert.equal((await call('GET')).status, 200)
   assert.equal((await call('POST', { Origin: 'https://other.test' })).status, 403)
+  f.sqlite.close()
+})
+
+test('index status reports storage payloads without assuming D1 physical size is available locally', async () => {
+  const f = fixture()
+  const response = await app.fetch(request('/mcp', 'POST', {
+    jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'index_status' },
+  }), f.env, f.ctx)
+  const rpc = await response.json()
+  const status = JSON.parse(rpc.result.content[0].text)
+  assert.equal(status.storage.transcript_utf8_bytes, 0)
+  assert.equal(status.storage.manifest_gzip_bytes, 0)
+  assert.equal(status.storage.database_bytes, null)
+  assert.ok(status.storage.fts_data_bytes > 0)
+  assert.deepEqual(status.storage.daily, [])
   f.sqlite.close()
 })

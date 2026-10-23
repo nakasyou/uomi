@@ -1,7 +1,8 @@
+import { resync } from './notion-cache.ts'
+import { searchCondition } from './search.js'
 const VERSION = '2026-07-28'
 const json = (data, status = 200) =>
   Response.json(data, { status, headers: { 'Cache-Control': 'no-store' } })
-const plain = (values) => (values ?? []).map((v) => v.plain_text ?? v.text?.content ?? '').join('')
 const object = (properties) => ({
   type: 'object',
   properties,
@@ -11,9 +12,9 @@ const tools = [
   {
     name: 'search_transcripts',
     description:
-      'Search the local Uomi full-text index. Literal substring, case-insensitive. Optional recording overlap range uses ISO-8601 timestamps with timezone. Results are recording-level, not word-level. Check index_status for freshness; sync_index advances a bounded page.',
+      'Search the local Uomi full-text index. Normalized substring: NFKC, lowercase, kana and whitespace folding. Two characters use a literal LIKE scan; longer queries use compact trigram candidates with exact verification. Optional recording overlap range uses ISO-8601 timestamps with timezone. Results are recording-level, not word-level. Check index_status for freshness; sync_index advances a bounded page.',
     inputSchema: object({
-      query: { type: 'string', minLength: 3, maxLength: 200 },
+      query: { type: 'string', minLength: 2, maxLength: 200 },
       from: { type: 'string' },
       to: { type: 'string' },
       limit: { type: 'integer', minimum: 1, maximum: 50 },
@@ -61,7 +62,7 @@ const tools = [
 ].map((t) => ({
   ...t,
   annotations: {
-    readOnlyHint: t.name !== 'sync_index',
+    readOnlyHint: !['sync_index', 'index_status'].includes(t.name),
     destructiveHint: false,
     idempotentHint: true,
     openWorldHint: t.name === 'sync_index',
@@ -98,11 +99,10 @@ export function searchPlan(a) {
     throw Error('from must precede to.')
   let join = ''
   if (a.query !== undefined) {
-    if (typeof a.query !== 'string' || [...a.query].length < 3 || a.query.length > 200)
-      throw Error('query must be 3–200 characters.')
-    join = ' JOIN transcripts ON transcripts.id=r.id'
-    clauses.push('transcripts MATCH ?')
-    args.push('\"' + a.query.replaceAll('\"', '\"\"') + '\"')
+    const condition = searchCondition(a.query)
+    join = condition.join
+    clauses.push(condition.sql)
+    args.push(...condition.values)
   }
   if (a.cursor) {
     let c
@@ -127,149 +127,16 @@ export function searchPlan(a) {
     limit,
   }
 }
-async function notion(env, path, body) {
-  const res = await fetch('https://api.notion.com/v1' + path, {
-    method: body ? 'POST' : 'GET',
-    headers: {
-      Authorization: `Bearer ${env.NOTION_TOKEN}`,
-      'Notion-Version': '2025-09-03',
-      'Content-Type': 'application/json',
-    },
-    body: body ? JSON.stringify(body) : undefined,
-    signal: AbortSignal.timeout(15000),
-  })
-  if (!res.ok)
-    throw Error(
-      `Notion HTTP ${res.status}; retry later${res.headers.get('retry-after') ? ' (Retry-After ' + res.headers.get('retry-after') + ')' : ''}.`,
-    )
-  return res.json()
-}
-async function boundedJson(response, max = 512 * 1024) {
-  if (!response.ok) throw Error('Transcript download failed.')
-  const reader = response.body.getReader()
-  let size = 0,
-    parts = []
-  try {
-    while (true) {
-      const { done, value } = await reader.read()
-      if (done) break
-      size += value.length
-      if (size > max) throw Error('Transcript exceeds 512 KiB index limit.')
-      parts.push(value)
-    }
-  } finally {
-    await reader.cancel()
-  }
-  const out = new Uint8Array(size)
-  let offset = 0
-  for (const p of parts) {
-    out.set(p, offset)
-    offset += p.length
-  }
-  return JSON.parse(new TextDecoder().decode(out))
-}
-async function sync(env) {
-  if (!env.NOTION_TOKEN || !env.NOTION_DATA_SOURCE_ID)
-    throw Error('Configure NOTION_TOKEN and NOTION_DATA_SOURCE_ID in Sites runtime secrets.')
-  const now = Date.now()
-  const lock = await env.DB.prepare(
-    'UPDATE sync_state SET lease_until=? WHERE id=1 AND lease_until < ?',
-  )
-    .bind(now + 300000, now)
-    .run()
-  if (!lock.meta.changes) throw Error('Index sync is already running; retry later.')
-  try {
-    const state = await env.DB.prepare('SELECT * FROM sync_state WHERE id=1').first()
-    const cycle = state.cycle_start ?? new Date(now).toISOString()
-    if (state.scanned >= 9990)
-      throw Error(
-        'Notion query is approaching its 10,000-result ceiling. Partitioned backfill is required; coverage is incomplete.',
-      )
-    const page = await notion(env, `/data_sources/${env.NOTION_DATA_SOURCE_ID}/query`, {
-      page_size: 10,
-      ...(state.cursor ? { start_cursor: state.cursor } : {}),
-      filter: {
-        timestamp: 'last_edited_time',
-        last_edited_time: { on_or_after: state.watermark },
-      },
-      sorts: [{ timestamp: 'last_edited_time', direction: 'ascending' }],
-    })
-    for (const p of page.results) {
-      const old = await env.DB.prepare('SELECT edited_at FROM recordings WHERE id=?')
-        .bind(p.id)
-        .first()
-      if (old?.edited_at === p.last_edited_time) continue
-      const props = p.properties,
-        start = props.recorded_at_ms?.number ?? Date.parse(props['Recorded at']?.date?.start),
-        end =
-          props.record_finished_at_ms?.number ?? start + (props['Duration (s)']?.number ?? 0) * 1000
-      // Unknown wall clocks cannot participate reliably in time ranges.
-      const file = props.Transcript?.files?.[0]
-      let text = plain(props['Transcript preview']?.rich_text)
-      if (file?.file?.url) {
-        const url = new URL(file.file.url)
-        if (url.protocol !== 'https:') throw Error('Invalid transcript attachment URL.')
-        const data = await boundedJson(
-          await fetch(url, {
-            signal: AbortSignal.timeout(20000),
-            redirect: 'manual',
-          }),
-        )
-        if (data.schema !== 'uomi.transcript.v1' || typeof data.text !== 'string')
-          throw Error('Invalid Uomi transcript schema.')
-        text = data.text
-      }
-      await env.DB.batch([
-        env.DB.prepare(
-          'INSERT INTO recordings(id,recorded_at,finished_at,edited_at,device,status,url,text) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET recorded_at=excluded.recorded_at,finished_at=excluded.finished_at,edited_at=excluded.edited_at,device=excluded.device,status=excluded.status,url=excluded.url,text=excluded.text',
-        ).bind(
-          p.id,
-          Number.isFinite(start) ? start : null,
-          Number.isFinite(end) ? end : null,
-          p.last_edited_time,
-          plain(props.Device?.rich_text),
-          props.Status?.select?.name ?? 'Pending',
-          p.url ?? '',
-          text,
-        ),
-        env.DB.prepare('DELETE FROM transcripts WHERE id=?').bind(p.id),
-        env.DB.prepare('INSERT INTO transcripts(id,text) VALUES(?,?)').bind(p.id, text),
-      ])
-    }
-    // Only checkpoint a whole successful page. Retried upserts are safe.
-    await env.DB.prepare(
-      'UPDATE sync_state SET scanned=?,cursor=?,cycle_start=?,watermark=? WHERE id=1',
-    )
-      .bind(
-        page.has_more ? state.scanned + page.results.length : 0,
-        page.has_more ? page.next_cursor : null,
-        page.has_more ? cycle : null,
-        page.has_more ? state.watermark : new Date(Date.parse(cycle) - 60000).toISOString(),
-      )
-      .run()
-    return {
-      processed: page.results.length,
-      has_more: page.has_more,
-      coverage:
-        'Incremental index; archived/deleted Notion pages require explicit removal/rebuild. Search is not a live source of truth.',
-    }
-  } finally {
-    await env.DB.prepare('UPDATE sync_state SET lease_until=0 WHERE id=1').run()
-  }
-}
 async function call(env, name, a) {
   if (!env.DB) throw Error('D1 binding DB is unavailable.')
-  if (name === 'sync_index') return sync(env)
+  if (name === 'sync_index') return resync(env)
   if (name === 'index_status')
     return {
       configured: !!(env.NOTION_TOKEN && env.NOTION_DATA_SOURCE_ID),
       ...(await env.DB.prepare('SELECT count(*) AS recordings FROM recordings').first()),
-      sync: await env.DB.prepare(
-        'SELECT watermark,cursor IS NOT NULL AS has_more,cycle_start FROM sync_state WHERE id=1',
-      ).first(),
       limitations: [
         'Time filters operate on recording intervals, not individual words.',
-        'Notion archived/deleted pages are retained until an explicit rebuild.',
+        'Notion resync refreshes active and archived pages.',
         'Sync is explicit and bounded; repeat sync_index to catch up.',
       ],
     }

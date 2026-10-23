@@ -1,3 +1,4 @@
+import { SyncProgressView } from './SyncProgress'
 import React, { useEffect, useState, useSyncExternalStore } from 'react'
 import { View, ScrollView, StyleSheet, Linking, useColorScheme } from 'react-native'
 import {
@@ -9,10 +10,8 @@ import {
   Button,
   TextInput,
   SegmentedButtons,
-  ProgressBar,
   Snackbar,
   Divider,
-  ActivityIndicator,
   List,
 } from 'react-native-paper'
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context'
@@ -93,19 +92,7 @@ function SyncApp() {
                   : 'Ready to sync'}
             </Text>
             <Text variant="bodyLarge">{state.phase}</Text>
-            {state.progress && (
-              <>
-                <ProgressBar
-                  progress={
-                    state.progress.total ? state.progress.completed / state.progress.total : 0
-                  }
-                  indeterminate={!state.progress.total}
-                />
-                <Text>
-                  {state.progress.detail ?? `${state.progress.completed} / ${state.progress.total}`}
-                </Text>
-              </>
-            )}
+            {state.progress && <SyncProgressView progress={state.progress} transfer={state.transfer} />}
             {state.error && (
               <Text accessibilityRole="alert" style={{ color: theme.colors.error }}>
                 {state.error}

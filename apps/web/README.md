@@ -1,15 +1,15 @@
 # Uomi Web Recorder
 
 Void 1.2 / React viewer + private Sites MCP. Single owner, multiple capture devices.
-**Notion is canonical.** D1 stores rebuildable metadata/transcripts/FTS; R2 stores
-rebuildable original audio copies plus staged uploads waiting for Notion.
+**Notion is canonical.** D1 stores rebuildable metadata, original/normalized transcripts and compact FTS; R2 stores
+rebuildable audio and compact manifest copies plus staged uploads waiting for Notion.
 
 ## Flow
 
 1. Capture client stores original Omi packets locally, groups bounded chunks and
    POSTs one `uomi.audio.v1` chunk to `/api/chunks` with an idempotency key.
 2. Worker validates Opus packets and identity, muxes original bytes to Ogg, stores
-   R2 audio and a transactional D1 row/source interval claims. A 202 receipt means
+   R2 audio/manifest objects and a transactional D1 row/source interval claims. A 202 receipt means
    staged only, **not** saved in Notion. The client retains local audio.
 3. `waitUntil` advances Notion save checkpoints: page → audio → manifest → attach
    → readback/hash verification → transcript → done. A durable D1 lease and
@@ -17,7 +17,7 @@ rebuildable original audio copies plus staged uploads waiting for Notion.
 4. Reposting the same chunk advances outstanding work without duplicating it;
    only a confirmed canonical save returns `notion_saved:true`. Manual clearing
    on the client is permitted only after this acknowledgement. Automatic local
-   deletion is disabled. A hash mismatch or overlapping differently sized chunk
+   deletion is disabled. A hash mismatch or partially overlapping chunk
    fails visibly rather than claiming success or deleting source audio.
 5. The existing transcriber daemon processes Notion Pending pages. Resync imports
    its resulting transcripts into D1. There is no server transcription model.
@@ -33,7 +33,7 @@ All data routes require Sites visitor identity, or a revocable device key via
 
 - `POST /api/chunks`: max 12 MiB JSON, 900 seconds/45,000 Opus packets, 1,500 ranges.
 - `GET /api/recordings`: bounded newest-first cursor pages, `q` literal substring
-  (minimum 3 characters), `from`/`to` overlap filters and `starred=1`.
+  (minimum 2 characters after normalization), `from`/`to` overlap filters and `starred=1`.
 - `GET /api/recordings/:id`: cached metadata and full transcript.
 - `GET /api/recordings/:id/audio`: authenticated R2 streaming with byte ranges.
 - `PATCH /api/recordings/:id`: write title/star to Notion, then update cache.
@@ -76,3 +76,26 @@ builds `apps/web` and packages its Worker/client assets plus the same migrations
 The GitHub PR does not auto-deploy. Android/BLE and Linux native behavior still
 need hardware verification; JS protocol, storage and acknowledgement flows have
 automated tests.
+
+## Storage/search format v2
+
+`recordings.rid` is a stable INTEGER PRIMARY KEY; public `id` and Notion page IDs
+remain unchanged. Source interval foreign keys and FTS doc IDs use `rid`. The
+source range table uses WITHOUT ROWID. The old unused sync_state is removed.
+
+Original text is retained for display and UTF-16 offsets. Search text is NFKC,
+lowercase, katakana-to-hiragana folded, NFC, with Unicode whitespace/zero-width
+spaces removed. This does not equate phonetic spellings with English names.
+Two-code-point queries use escaped LIKE on normalized text, constrained by dates
+when supplied. Longer queries intersect unique trigrams in external-content FTS5
+with detail=none/columnsize=0 and verify substring order/multiplicity with instr.
+FTS no longer stores a second text/UUID copy or token positions.
+
+New manifests are gzip-compressed range runs in content-addressed R2 objects;
+Notion's canonical v1 manifest is unchanged. D1 stores their keys and source claims.
+Legacy D1 blobs and text normalization migrate in bounded restart-safe batches
+through index_status or search (100 records and one manifest per invocation).
+Public search is explicit about incomplete migration instead of dropping rows.
+Clear a legacy blob only after an R2 readback/hash check succeeds. Deleted objects
+can be restored through Notion resync. Freed SQLite pages may remain allocated
+for reuse; a smaller payload does not imply an immediately smaller database file.

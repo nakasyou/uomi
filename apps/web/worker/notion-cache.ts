@@ -1,3 +1,5 @@
+import { normalizeSearch } from './search.js'
+import { saveManifest } from './manifest.ts'
 import { Buffer } from 'buffer'
 import { ranges } from './source-ranges.ts'
 import { NotionStore, httpTransport, validateManifest } from '@uomi/notion'
@@ -41,8 +43,7 @@ export async function cachePage(env: any, page: any) {
     return { id, skipped: 'pending-source-write' }
   if (page.archived || page.in_trash) {
     await env.DB.batch([
-      env.DB.prepare('DELETE FROM source_ranges WHERE recording_id=?').bind(id),
-      env.DB.prepare('DELETE FROM transcripts WHERE id=?').bind(id),
+      env.DB.prepare('DELETE FROM source_ranges WHERE recording_id=(SELECT rid FROM recordings WHERE id=?)').bind(id),
       env.DB.prepare('DELETE FROM recordings WHERE id=?').bind(id),
     ])
     return { id, removed: true }
@@ -51,12 +52,13 @@ export async function cachePage(env: any, page: any) {
     old &&
     old.notion_edited === page.last_edited_time &&
     old.audio_key &&
-    (await env.BUCKET.head(old.audio_key))
+    (await env.BUCKET.head(old.audio_key)) &&
+    (old.manifest_gzip || (old.manifest_key && await env.BUCKET.head(old.manifest_key)))
   )
     return { id, unchanged: true }
   let audioKey: string | null = null,
     sha: string | null = null,
-    packed: ArrayBuffer | null = null
+    manifestKey: string | null = null
   let sourceSpans: ReturnType<typeof ranges> = []
   const manifestUrl = p.Manifest?.files?.[0]?.file?.url
   if (manifestUrl && p.Audio?.files?.[0]?.file?.url) {
@@ -74,10 +76,7 @@ export async function cachePage(env: any, page: any) {
       httpMetadata: { contentType: 'audio/ogg' },
       customMetadata: { sha256: sha },
     })
-    packed = await new Response(
-      new Blob([JSON.stringify(manifest)]).stream().pipeThrough(new CompressionStream('gzip')),
-    ).arrayBuffer()
-    if (packed.byteLength > 1024 * 1024) throw Error('Compressed manifest exceeds cache limit')
+    manifestKey = await saveManifest(env, manifest)
   }
   let transcript = text(p['Transcript preview']?.rich_text)
   if (p.Transcript?.files?.[0]?.file?.url) {
@@ -96,7 +95,7 @@ export async function cachePage(env: any, page: any) {
     status = p.Status?.select?.name ?? 'Pending'
   await env.DB.batch([
     env.DB.prepare(
-      "INSERT INTO recordings(id,recorded_at,finished_at,edited_at,device,status,url,text,audio_key,audio_sha,duration_ms,manifest_gzip,title,starred,backup_step,backup_page,notion_edited) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'done',?,?) ON CONFLICT(id) DO UPDATE SET recorded_at=excluded.recorded_at,finished_at=excluded.finished_at,edited_at=excluded.edited_at,device=excluded.device,status=excluded.status,url=excluded.url,text=excluded.text,audio_key=excluded.audio_key,audio_sha=excluded.audio_sha,duration_ms=excluded.duration_ms,manifest_gzip=excluded.manifest_gzip,title=excluded.title,starred=excluded.starred,backup_step='done',backup_page=excluded.backup_page,notion_edited=excluded.notion_edited",
+      "INSERT INTO recordings(id,recorded_at,finished_at,edited_at,device,status,url,text,audio_key,audio_sha,duration_ms,manifest_key,title,starred,backup_step,backup_page,notion_edited,search_text,search_version) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'done',?,?,?,1) ON CONFLICT(id) DO UPDATE SET recorded_at=excluded.recorded_at,finished_at=excluded.finished_at,edited_at=excluded.edited_at,device=excluded.device,status=excluded.status,url=excluded.url,text=excluded.text,audio_key=excluded.audio_key,audio_sha=excluded.audio_sha,duration_ms=excluded.duration_ms,manifest_key=excluded.manifest_key,manifest_gzip=NULL,title=excluded.title,starred=excluded.starred,backup_step='done',backup_page=excluded.backup_page,notion_edited=excluded.notion_edited,search_text=excluded.search_text,search_version=1",
     ).bind(
       id,
       Number.isFinite(start) ? start : null,
@@ -109,15 +108,16 @@ export async function cachePage(env: any, page: any) {
       audioKey,
       sha,
       duration,
-      packed,
+      manifestKey,
       title,
       starred,
       page.id,
       page.last_edited_time,
+      normalizeSearch(transcript),
     ),
-    env.DB.prepare('DELETE FROM source_ranges WHERE recording_id=?').bind(id),
+    env.DB.prepare('DELETE FROM source_ranges WHERE recording_id=(SELECT rid FROM recordings WHERE id=?)').bind(id),
     ...sourceSpans.map((range) =>
-      env.DB.prepare('INSERT INTO source_ranges VALUES(?,?,?,?,?)').bind(
+      env.DB.prepare('INSERT INTO source_ranges VALUES(?,?,?,?,(SELECT rid FROM recordings WHERE id=?))').bind(
         text(p.Device?.rich_text),
         range.prefix,
         range.start,
@@ -125,8 +125,6 @@ export async function cachePage(env: any, page: any) {
         id,
       ),
     ),
-    env.DB.prepare('DELETE FROM transcripts WHERE id=?').bind(id),
-    env.DB.prepare('INSERT INTO transcripts(id,text) VALUES(?,?)').bind(id, transcript),
   ])
   return { id, cached: true }
 }

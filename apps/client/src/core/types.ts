@@ -63,6 +63,8 @@ export interface SyncProgress {
   pipeline?: PipelineProgress
   chunkIndex?: number
   chunksTotal?: number
+  chunksSubmitted?: number
+  chunksStaged?: number
   chunksCompleted?: number
   completed: number
   total: number
