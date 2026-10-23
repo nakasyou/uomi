@@ -69,6 +69,8 @@ test('daemon verifies audio, runs ffmpeg, writes transcript to Notion and ignore
       `http://127.0.0.1:${server.port}/`,
     )
   let calls = 0
+  let providerStarted!: () => void
+  const providerReady = new Promise<void>(resolve => { providerStarted = resolve })
   const daemon = new Daemon(
     store,
     {
@@ -85,12 +87,16 @@ test('daemon verifies audio, runs ffmpeg, writes transcript to Notion and ignore
       expect(options?.splitSeconds).toBe(900)
       expect(options?.provider).toBe('chrome-recognizetion')
       calls++
+      await daemon.recover()
+      expect(callbacks).toBe(0)
+      providerStarted()
       expect((await readFile(file)).length).toBeGreaterThan(0)
       return { text: 'Test transcript' }
     },
   )
   try {
     expect(await daemon.accept(page.id)).toEqual({ accepted: true })
+    await providerReady
     await daemon.close()
     expect(calls).toBe(1)
     expect(callbacks).toBe(1)

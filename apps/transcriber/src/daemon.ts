@@ -45,7 +45,11 @@ export class Daemon {
     readonly store: NotionStore,
     readonly config: Config,
     private recognize: typeof transcribe = transcribe,
-  ) { this.callbacks = new CompletionOutbox(join(config.stateDir,'completion-outbox'),config.sitesCallback,config.secret) }
+  ) { this.callbacks = new CompletionOutbox(join(config.stateDir,'completion-outbox'),config.sitesCallback,config.secret, async (id) => {
+    const page = await this.store.page(id)
+    return !page.archived && !page.in_trash &&
+      page.properties.Status?.select?.name === 'Completed' && await this.store.owns(page)
+  }) }
   async reserve(value: unknown): Promise<{ pageId: string }> {
     if (this.closing) throw Error('Daemon is shutting down.')
     this.coordinator ??= new ReservationCoordinator(this.store, this.config.stateDir)
