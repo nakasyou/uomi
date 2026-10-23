@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+import { sitesCallback } from './callbacks'
 import { mkdir, open, rm, readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
@@ -8,7 +9,7 @@ import { authorized, Daemon } from './daemon'
 
 if (process.argv.includes('--help')) {
   console.log(
-    'Uomi transcriber\nNOTION_TOKEN, NOTION_DATABASE_ID, UOMI_WEBHOOK_SECRET are required.\nTRANSCRIBER_PROVIDER=codex | chrome-recognition\nHOST=127.0.0.1 PORT=8787 LANGUAGE=ja REQUEST_WAIT_SECONDS=10 TRANSCRIBER_SPLIT_SECONDS=600\nPending/Processing/Failed pages are recovered automatically at startup and every minute.\nRequires ffmpeg on PATH. Codex credentials stay on this machine.',
+    'Uomi transcriber\nNOTION_TOKEN, NOTION_DATABASE_ID, UOMI_WEBHOOK_SECRET are required.\nTRANSCRIBER_PROVIDER=codex | chrome-recognition\nHOST=127.0.0.1 PORT=8787 LANGUAGE=ja REQUEST_WAIT_SECONDS=10 TRANSCRIBER_SPLIT_SECONDS=600\nPending/Processing/Failed pages are recovered automatically at startup and every minute.\nOptional SITES_URL and SITES_ACCESS_TOKEN enable durable completion callbacks.\nRequires ffmpeg on PATH. Codex credentials stay on this machine.',
   )
   process.exit(0)
 }
@@ -70,6 +71,7 @@ if (
 const store = new NotionStore(httpTransport(token), database)
 const daemon = new Daemon(store, {
   secret,
+  sitesCallback: sitesCallback(process.env.SITES_URL,process.env.SITES_ACCESS_TOKEN),
   provider: parseProvider(process.env.TRANSCRIBER_PROVIDER ?? 'codex'),
   language: process.env.LANGUAGE ?? 'ja',
   stateDir,
