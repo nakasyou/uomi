@@ -1,3 +1,6 @@
+import { searchCondition } from './search.js'
+import { optimizeCache } from './maintenance.ts'
+import { loadManifest, saveManifest } from './manifest.ts'
 import { Buffer } from 'buffer'
 import { oggOpus, oggFrames, stripSyntheticGaps, opusDuration } from '@uomi/audio'
 import { NotionStore, httpTransport, type AudioManifest } from '@uomi/notion'
@@ -42,16 +45,6 @@ async function bytes(request: Request, max = MAX_BODY) {
 }
 async function body(request: Request, max = MAX_BODY) {
   return JSON.parse((await bytes(request, max)).toString())
-}
-async function pack(value: any) {
-  return new Response(
-    new Blob([JSON.stringify(value)]).stream().pipeThrough(new CompressionStream('gzip')),
-  ).arrayBuffer()
-}
-async function unpack(value: any) {
-  return new Response(
-    new Blob([new Uint8Array(value)]).stream().pipeThrough(new DecompressionStream('gzip')),
-  ).json() as Promise<AudioManifest>
 }
 export async function validateChunk(v: any) {
   if (
@@ -135,7 +128,7 @@ async function ingest(request: Request, env: any, ctx: any) {
     )
   }
   const overlaps = await env.DB.prepare(
-    `SELECT DISTINCT s.recording_id FROM source_ranges s JOIN json_each(?) j ON s.prefix=json_extract(j.value,'$.prefix') AND s.start<json_extract(j.value,'$.end') AND s.end>json_extract(j.value,'$.start') WHERE s.device=? LIMIT 9`,
+    `SELECT DISTINCT r.id AS recording_id FROM source_ranges s JOIN recordings r ON r.rid=s.recording_id JOIN json_each(?) j ON s.prefix=json_extract(j.value,'$.prefix') AND s.start<json_extract(j.value,'$.end') AND s.end>json_extract(j.value,'$.start') WHERE s.device=? LIMIT 9`,
   )
     .bind(JSON.stringify(spans), value.deviceId)
     .all()
@@ -145,13 +138,13 @@ async function ingest(request: Request, env: any, ctx: any) {
     const expected = new Map(value.frames.map((f: any) => [f.id, f]))
     for (const item of overlaps.results) {
       const saved = await env.DB.prepare(
-        'SELECT audio_key,manifest_gzip,backup_step FROM recordings WHERE id=?',
+        'SELECT audio_key,manifest_gzip,manifest_key,backup_step FROM recordings WHERE id=?',
       )
         .bind(item.recording_id)
         .first()
       if (!saved || saved.backup_step !== 'done')
         return json({ error: 'Overlapping source save is still pending; retry later.' }, 409)
-      const manifest = await unpack(saved.manifest_gzip),
+      const manifest = await loadManifest(env, saved),
         object = await env.BUCKET.get(saved.audio_key)
       if (!object)
         return json({ error: 'Resync the overlapping recording from Notion before retrying.' }, 409)
@@ -213,8 +206,7 @@ async function ingest(request: Request, env: any, ctx: any) {
         frames: 1,
       })
   })
-  const metadata = await pack(manifest)
-  if (metadata.byteLength > 1024 * 1024) throw Error('Chunk metadata too large')
+  const manifestKey = await saveManifest(env, manifest)
   const key = `audio/${sha}.ogg`
   await env.BUCKET.put(key, audio, {
     httpMetadata: { contentType: 'audio/ogg' },
@@ -225,7 +217,7 @@ async function ingest(request: Request, env: any, ctx: any) {
   try {
     await env.DB.batch([
       env.DB.prepare(
-        "INSERT INTO recordings(id,recorded_at,finished_at,edited_at,device,status,url,text,audio_key,audio_sha,duration_ms,manifest_gzip,backup_step) VALUES(?,?,?,?,?,'Pending','','',?,?,?,?,'page')",
+        "INSERT INTO recordings(id,recorded_at,finished_at,edited_at,device,status,url,text,audio_key,audio_sha,duration_ms,manifest_key,backup_step) VALUES(?,?,?,?,?,'Pending','','',?,?,?,?,'page')",
       ).bind(
         id,
         start,
@@ -235,10 +227,10 @@ async function ingest(request: Request, env: any, ctx: any) {
         key,
         sha,
         value.durationMs,
-        metadata,
+        manifestKey,
       ),
       ...spans.map((s) =>
-        env.DB.prepare('INSERT INTO source_ranges VALUES(?,?,?,?,?)').bind(
+        env.DB.prepare('INSERT INTO source_ranges VALUES(?,?,?,?,(SELECT rid FROM recordings WHERE id=?))').bind(
           value.deviceId,
           s.prefix,
           s.start,
@@ -296,7 +288,7 @@ export async function backup(env: any, id: string) {
         signal: AbortSignal.timeout(Math.max(1000, Math.min(7000, deadline - Date.now()))),
       })) as typeof fetch)
     const store = new NotionStore(transport, env.NOTION_DATA_SOURCE_ID)
-    const manifest = await unpack(row.manifest_gzip)
+    const manifest = await loadManifest(env, row)
     while (Date.now() < deadline - 2500) {
       if (row.backup_step === 'page') {
         await store.setup()
@@ -367,6 +359,11 @@ export async function backup(env: any, id: string) {
   }
 }
 
+async function requireSearchReady(env: any) {
+  const state = await optimizeCache(env)
+  if (state.search_remaining) throw Error('Search index upgrade in progress; retry to continue the bounded migration')
+}
+
 async function api(request: Request, env: any, ctx: any, role: string) {
   const url = new URL(request.url),
     path = url.pathname,
@@ -383,10 +380,11 @@ async function api(request: Request, env: any, ctx: any, role: string) {
     let join = ''
     const query = url.searchParams.get('q')
     if (query) {
-      if ([...query].length < 3 || query.length > 200) throw Error('Search needs 3–200 characters')
-      join = ' JOIN transcripts ON transcripts.id=r.id'
-      clauses.push('transcripts MATCH ?')
-      args.push('"' + query.replaceAll('"', '""') + '"')
+      await requireSearchReady(env)
+      const condition = searchCondition(query)
+      join = condition.join
+      clauses.push(condition.sql)
+      args.push(...condition.values)
     }
     for (const [param, op, col] of [
       ['from', '>', 'finished_at'],
@@ -568,10 +566,32 @@ export default {
       if (path === '/mcp') {
         if (request.method === 'POST' && visitor(request)) {
           const rpc: any = await request.clone().json()
+          if (rpc.method === 'tools/call' && rpc.params?.name === 'search_transcripts') await requireSearchReady(env)
           if (rpc.method === 'tools/call' && rpc.params?.name === 'index_status') {
             const count = await env.DB.prepare(
               "SELECT count(*) AS recordings,sum(audio_key IS NOT NULL) AS cached_audio,sum(backup_step NOT IN ('done','legacy')) AS pending_notion_saves FROM recordings",
             ).first()
+            const optimization = await optimizeCache(env)
+            const storage = await env.DB.prepare(
+              `SELECT coalesce(sum(length(CAST(text AS BLOB))),0) AS transcript_utf8_bytes,
+              coalesce(sum(length(text)),0) AS transcript_characters,
+              coalesce(sum(length(CAST(search_text AS BLOB))),0) AS normalized_utf8_bytes,
+              coalesce(sum(length(manifest_gzip)),0) AS manifest_gzip_bytes,
+              sum(manifest_key IS NOT NULL) AS r2_manifests FROM recordings`,
+            ).all()
+            const fts = await env.DB.prepare(
+              `SELECT 0 AS fts_content_bytes,
+              (SELECT coalesce(sum(length(block)),0) FROM transcripts_data) AS fts_data_bytes,
+              (SELECT coalesce(sum(length(term)),0) FROM transcripts_idx) AS fts_term_bytes,
+              0 AS fts_docsize_bytes`,
+            ).first()
+            const daily = await env.DB.prepare(
+              `SELECT date(recorded_at/1000,'unixepoch','+9 hours') AS day_jst,
+              count(*) AS recordings, sum(length(CAST(text AS BLOB))) AS transcript_utf8_bytes,
+              sum(length(text)) AS transcript_characters,
+              sum(max(0,coalesce(finished_at,recorded_at)-recorded_at)) AS recorded_ms
+              FROM recordings WHERE recorded_at IS NOT NULL GROUP BY day_jst ORDER BY day_jst`,
+            ).all()
             const state = await env.DB.prepare(
               'SELECT since,cursor IS NOT NULL AS has_more,started FROM resync_state WHERE id=1',
             ).first()
@@ -587,6 +607,14 @@ export default {
                       source: 'Notion',
                       ...count,
                       sync: state,
+                      optimization,
+                      storage: {
+                        database_bytes: storage.meta?.size_after ?? null,
+                        ...storage.results[0],
+                        ...fts,
+                        note: 'Database bytes are physical D1 size. Component bytes are payload only, excluding SQLite page/B-tree overhead; FTS data may include pending merge segments.',
+                        daily: daily.results,
+                      },
                       limitations: [
                         'Recording-level time ranges; no word timestamps.',
                         'Run sync_index or Web Recorder source resync to refresh persistent caches.',

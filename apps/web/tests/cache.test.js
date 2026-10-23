@@ -86,7 +86,7 @@ test('Notion source can rebuild audio, transcript and metadata into empty caches
     },
     BUCKET: {
       put: async (key, value) => {
-        savedAudio = value
+        if (key.startsWith('audio/')) savedAudio = value
       },
     },
   }
