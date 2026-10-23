@@ -388,3 +388,48 @@ passed. Historical Completed status without a corresponding completed job no
 longer implies that no speech was detected; missing text is shown as unavailable.
 The API daemon remains on verified source `084fd8d`; later changes concern UI,
 Android secondary diagnostics and evidence rather than its runtime implementation.
+
+The sole source-media warning was subsequently resolved as an exact duplicate
+reservation, without modifying either primary record. The empty Uploading page
+`401f60d4-5c99-8169-9aca-d9e3c4031db1` retains a stable Recording ID. The live
+Linux client's read-only SQLite catalog contained an exact reservation-ID mapping
+and a chunk index for that same Recording ID, pointing to completed canonical page
+`401f60d4-5c99-81ff-b01a-f7a939f2813e`. Its original Notion Manifest has 3,728 source
+frames; the complete frame-ID-list digest equals the stable Recording ID
+`6281e9890e58909c53529abae76b420e66264a152aeb0d2c03b98e0127d84ccd`.
+No approximate timestamp match or reconstruction was used.
+
+The existing canonical D1 row is Completed and matches the source duration of
+74,560 ms. A bounded authenticated read of its actual R2 audio returned 400,342
+bytes whose SHA-256 is
+`2e73749a373e0bb08b013f95f4509a9db62d2b6c1e6cea3fddb1932a646f26c2`, exactly matching
+both D1 and the original Notion manifest. The current primary manifest independently
+has the same audio hash, source Recording ID, 3,728 frames and full frame-ID digest.
+The audio endpoint returned HTTP 206 with the complete hash-verified object;
+manifest retrieval returned HTTP 200. Audio contents remained only in memory and
+were not printed or retained in audit files.
+
+Thus the one HTTP 404 identifies an empty duplicate reservation, not a lost original
+capture: its exact completed original already exists in primary storage. The
+placeholder metadata was preserved, and no attachment, deletion, re-upload or
+artificial additional audio row was performed. Current local packet-boundary lookup
+did not prove retained originals for this chunk; that separate question was not
+needed once the existing canonical primary copy was cryptographically verified.
+
+The final delayed-list response regression is published from GitHub runtime
+source `8b5a993` through owner-private Sites deployment
+`appgdep_6adb7a4898ec8191b8a49f74faf9a383`, Sites source
+`0dc98fb1102dc032557a92f344cc0ccadb100d07`, environment revision 11.
+All 56 web tests, typecheck, production build and format/lint passed. Confirmed
+edits now survive stale list responses as well as stale detail/status responses;
+overlapping pagination preserves order and does not duplicate rows.
+
+The Linux client correction is GitHub source `316af02`. Actual packaged WebKit
+verification found and corrected nonce-blocked React Native Web styles while
+retaining the existing CSP. The corrected release renders normally, saves native
+settings and restores them after restart in an isolated empty-profile sandbox.
+Android emulator upload/auth-error/retry/retention/restart verification and the
+Linux/Android artifact hashes are documented in docs/native-verification.md.
+Physical Omi Bluetooth capture and physical-phone background/battery behavior
+remain hardware verification limits. No user capture database was used as an
+upload fixture, and the existing running Linux client was not replaced.

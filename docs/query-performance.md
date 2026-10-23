@@ -136,3 +136,29 @@ rows matched `notion_edited IS NOT NULL AND revision=0 AND notion_import_version
 All 179 rows with Notion import provenance had import version 1; primary rows
 without that provenance are intentionally outside the historical-baseline marker.
 No schema, source identity or range rewrite was performed for this investigation.
+
+## Canonical-media coverage clarification
+
+The final 213 metadata rows / 212 primary audio copies do **not** demonstrate a
+lost original. The unfinished reservation
+`401f60d4-5c99-8169-9aca-d9e3c4031db1` has an already migrated canonical copy,
+`401f60d4-5c99-81ff-b01a-f7a939f2813e`. Both metadata rows retain duration 74,560 ms
+and the same recorded-at value. The canonical D1 row binds the completed source
+page, original audio SHA-256 and compressed R2 manifest.
+
+An authenticated full read of the current canonical R2 audio returned 400,342
+bytes with SHA-256
+`2e73749a373e0bb08b013f95f4509a9db62d2b6c1e6cea3fddb1932a646f26c2`, matching
+both D1 and the verified source manifest. The current API manifest contains 3,728
+frame IDs, duration 74,560 ms, and stable Recording ID
+`6281e9890e58909c53529abae76b420e66264a152aeb0d2c03b98e0127d84ccd`.
+SHA-256 of JSON.stringify of its **complete** frame-ID list equals that stable ID;
+this verifies exact frame identity rather than only timestamp or boundary similarity.
+The [canonical original audio](https://uomi-transcript-search.nakasyou.chatgpt.site/api/recordings/401f60d4-5c99-81ff-b01a-f7a939f2813e/audio)
+remains private and requires authenticated access.
+
+The prior 404 applies to the unfinished reservation's own media route, not to a
+missing unique original. Both metadata rows were preserved. No additional media
+attachment, duplicate source claims, deletion or schema change was performed just
+to make the metadata/audio counters equal. Exact live binding and source-read
+proof is recorded in docs/verification.md.
