@@ -4,7 +4,7 @@ export interface SitesCallback { url: string; accessToken: string }
 export class CompletionOutbox {
   private flushing = false
   private delivery: Promise<void> | undefined
-  constructor(private directory: string, private config: SitesCallback | undefined, private secret: string, private fetcher: typeof fetch = fetch) {}
+  constructor(private directory: string, private config: SitesCallback | undefined, private secret: string, private ready: (id: string) => Promise<boolean>, private fetcher: typeof fetch = fetch) {}
   async enqueue(id: string) {
     if (!this.config) return
     if (!/^[a-f0-9]{32}$/i.test(id)) throw Error('Invalid callback page ID')
@@ -40,6 +40,9 @@ export class CompletionOutbox {
         if (state.nextAt>Date.now()) continue
         attempted++
         try {
+          // Entries are persisted before the Notion commit for crash recovery.
+          // Recheck canonical state on every delivery, including after restart.
+          if (!(await this.ready(file.slice(0,-5)))) { attempted--; continue }
           const response=await this.fetcher(this.config.url,{method:'POST',redirect:'manual',signal:AbortSignal.timeout(25000),
             headers:{'Content-Type':'application/json','X-Uomi-Webhook-Secret':this.secret,'OAI-Sites-Authorization':`Bearer ${this.config.accessToken}`},body:JSON.stringify({pageId:file.slice(0,-5)})})
           if (response.status!==200) { await response.body?.cancel(); throw Error('Completion callback not committed') }
