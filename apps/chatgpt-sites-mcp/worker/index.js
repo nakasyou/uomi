@@ -239,7 +239,7 @@ async function sync(env) {
         const data = await boundedJson(
           await fetch(url, {
             signal: AbortSignal.timeout(20000),
-            redirect: "error",
+            redirect: "manual",
           }),
         );
         if (
