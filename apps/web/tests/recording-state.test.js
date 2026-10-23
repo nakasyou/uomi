@@ -1,0 +1,31 @@
+import { test } from 'node:test'
+import assert from 'node:assert/strict'
+import { mergeRecording } from '../src/recording-state.ts'
+test('a late recording response cannot undo a confirmed edit or cutover refresh', () => {
+  const edited = {
+    id: 'recording',
+    title: 'New title',
+    starred: true,
+    revision: 3,
+    updated_at: '2026-10-23T12:00:00Z',
+  }
+  const late = mergeRecording(edited, {
+    title: 'Old title',
+    starred: false,
+    revision: 2,
+    updated_at: '2026-10-23T11:00:00Z',
+  })
+  assert.equal(late, edited)
+  assert.equal(
+    mergeRecording(edited, {
+      title: 'Old snapshot',
+      revision: 3,
+      updated_at: '2026-10-23T11:00:00Z',
+    }),
+    edited,
+  )
+  const progress = mergeRecording(edited, { revision: 3, stage: 'transcribing' })
+  assert.equal(progress.title, 'New title')
+  assert.equal(progress.stage, 'transcribing')
+  assert.equal(mergeRecording(edited, { title: 'Later title', revision: 4 }).title, 'Later title')
+})

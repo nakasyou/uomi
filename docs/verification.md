@@ -237,3 +237,15 @@ resetting; the first two source pages were reimported successfully. Final exhaus
 migration and physical-device verification remain outstanding. Running/paused
 migration status now follows its active database lease, rather than the mere
 presence of a saved cursor.
+
+Further reliability checks: backup status now compares the confirmed backup
+revision with the current primary revision; an old completed checkpoint alone
+cannot claim a new edit is saved. Unconfigured backups and missing source audio
+return explicit errors on retry. Concurrent rename/star updates change only their
+provided fields in one atomic UPDATE RETURNING, with a regression forcing both
+requests to read the same original row. Late browser responses cannot roll back
+confirmed edits. API deadlines remain active when a lifecycle abort signal is
+provided, and response-stream/invalid-JSON failures retain the operation context.
+All TypeScript projects, combined client/web/shared/daemon tests, production Site
+build and formatting/lint passed after these changes. Explicit storage diagnostics
+were added to distinguish source identity/index cost from allocated free pages.

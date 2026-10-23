@@ -1,3 +1,5 @@
+import { backupState } from './backup-state.ts'
+import { storageDiagnostics } from './storage-diagnostics.ts'
 import { refreshTranscript, webhookAuthorized } from './transcriber.ts'
 import { searchCondition } from './search.js'
 import { optimizeCache } from './maintenance.ts'
@@ -185,7 +187,7 @@ async function ingest(request: Request, env: any, ctx: any) {
   if (manifest.sha256 !== sha) throw new ApiError('Ogg audio hash mismatch')
   const spans = ranges(manifest.frameIds.map((id) => ({ id })))
   const old = await env.DB.prepare(
-    'SELECT audio_sha,backup_step,id AS recording_id FROM recordings WHERE id=?1 UNION ALL SELECT a.audio_sha,r.backup_step,r.id AS recording_id FROM chunk_aliases a JOIN recordings r ON r.id=a.recording_id WHERE a.id=?1 LIMIT 1',
+    'SELECT audio_sha,backup_step,backup_error,backup_until,backup_revision,revision,audio_key,id AS recording_id FROM recordings WHERE id=?1 UNION ALL SELECT a.audio_sha,r.backup_step,r.backup_error,r.backup_until,r.backup_revision,r.revision,r.audio_key,r.id AS recording_id FROM chunk_aliases a JOIN recordings r ON r.id=a.recording_id WHERE a.id=?1 LIMIT 1',
   )
     .bind(id)
     .first()
@@ -198,7 +200,9 @@ async function ingest(request: Request, env: any, ctx: any) {
         id,
         sha256: sha,
         saved: true,
-        notion_saved: old.backup_step === 'done',
+        notion_saved: backupState(env, old).backup_saved,
+        ...backupState(env, old),
+        backup_step: old.backup_step,
         duplicate: true,
         transcription: jobView(
           await env.DB.prepare(
@@ -220,16 +224,20 @@ async function ingest(request: Request, env: any, ctx: any) {
     // Decode packets only when comparing an upload with existing source claims.
     const uploadedPackets = oggFrames(audio)
     const expected = new Map(manifest.frameIds.map((id, i) => [id, uploadedPackets[i]]))
-    let notionSaved = true
+    let notionSaved = true,
+      overlapBackup: ReturnType<typeof backupState> | undefined
     for (const item of overlaps.results) {
       const saved = await env.DB.prepare(
-        'SELECT audio_key,manifest_gzip,manifest_key,backup_step FROM recordings WHERE id=?',
+        'SELECT audio_key,manifest_gzip,manifest_key,backup_step,backup_error,backup_until,backup_revision,revision FROM recordings WHERE id=?',
       )
         .bind(item.recording_id)
         .first()
       if (!saved)
         return json({ error: 'Overlapping source save is still pending; retry later.' }, 409)
-      notionSaved &&= ['done', 'legacy'].includes(saved.backup_step)
+      const state = backupState(env, saved)
+      notionSaved &&= state.backup_saved
+      if (!overlapBackup || (overlapBackup.backup_saved && !state.backup_saved))
+        overlapBackup = state
       const manifest = await loadManifest(env, saved),
         object = await env.BUCKET.get(saved.audio_key)
       if (!object)
@@ -260,7 +268,15 @@ async function ingest(request: Request, env: any, ctx: any) {
       )
         .bind(id, sha, canonicalId)
         .run()
-      return json({ id, sha256: sha, saved: true, notion_saved: notionSaved, duplicate: true })
+      return json({
+        id,
+        sha256: sha,
+        saved: true,
+        notion_saved: notionSaved,
+        duplicate: true,
+        ...overlapBackup,
+        backup_saved: notionSaved,
+      })
     }
     return json(
       {
@@ -319,7 +335,22 @@ async function ingest(request: Request, env: any, ctx: any) {
   }
   const transcription = jobView(await enqueue(env, id))
   ctx.waitUntil(backup(env, id))
-  return json({ id, sha256: sha, saved: true, notion_saved: false, transcription }, 201)
+  return json(
+    {
+      id,
+      sha256: sha,
+      saved: true,
+      notion_saved: false,
+      transcription,
+      ...backupState(env, {
+        audio_key: key,
+        backup_step: 'page',
+        backup_revision: -1,
+        revision: 0,
+      }),
+    },
+    201,
+  )
 }
 
 // Durable checkpoints are authoritative. waitUntil is only an opportunistic runner.
@@ -549,7 +580,7 @@ async function api(request: Request, env: any, ctx: any, role: string) {
     )
       throw new ApiError('Expected 1–64 chunk IDs')
     const { results } = await env.DB.prepare(
-      'SELECT id,id AS recording_id,backup_step,backup_error,backup_until FROM recordings WHERE id IN (SELECT value FROM json_each(?1)) UNION ALL SELECT a.id,r.id AS recording_id,r.backup_step,r.backup_error,r.backup_until FROM chunk_aliases a JOIN recordings r ON r.id=a.recording_id WHERE a.id IN (SELECT value FROM json_each(?1))',
+      'SELECT id,id AS recording_id,backup_step,backup_error,backup_until,backup_revision,revision,audio_key FROM recordings WHERE id IN (SELECT value FROM json_each(?1)) UNION ALL SELECT a.id,r.id AS recording_id,r.backup_step,r.backup_error,r.backup_until,r.backup_revision,r.revision,r.audio_key FROM chunk_aliases a JOIN recordings r ON r.id=a.recording_id WHERE a.id IN (SELECT value FROM json_each(?1))',
     )
       .bind(JSON.stringify(ids))
       .all()
@@ -575,7 +606,8 @@ async function api(request: Request, env: any, ctx: any, role: string) {
           id,
           status: row ? 'saved' : 'missing',
           error: null,
-          backup_status: row?.backup_step ?? null,
+          ...(row ? backupState(env, row) : { backup_status: null, backup_saved: false }),
+          backup_step: row?.backup_step ?? null,
           backup_error: row?.backup_error ?? null,
           transcription: jobView(jobRows.get(row?.recording_id)),
         }
@@ -629,7 +661,7 @@ async function api(request: Request, env: any, ctx: any, role: string) {
       args.push(c.time, c.id)
     }
     const { results } = await env.DB.prepare(
-      `SELECT r.id,r.title,r.recorded_at,r.finished_at,r.duration_ms,r.status,r.starred,r.backup_step,r.backup_error,r.audio_key IS NOT NULL AS has_audio,(SELECT json_object('id',j.id,'status',j.status,'stage',j.stage,'progress',j.progress,'attempt',j.attempt,'error',j.error,'updated_at',j.updated_at) FROM transcription_jobs j WHERE j.recording_id=r.id AND j.mode='standard') AS transcription_json,substr(r.text,1,240) AS preview FROM recordings r${join}${clauses.length ? ' WHERE ' + clauses.join(' AND ') : ''} ORDER BY r.sort_time DESC,r.id DESC LIMIT ?`,
+      `SELECT r.id,r.title,r.recorded_at,r.finished_at,r.duration_ms,r.status,r.starred,r.revision,r.backup_revision,r.backup_until,r.backup_step,r.backup_error,r.audio_key IS NOT NULL AS has_audio,(SELECT json_object('id',j.id,'status',j.status,'stage',j.stage,'progress',j.progress,'attempt',j.attempt,'error',j.error,'updated_at',j.updated_at) FROM transcription_jobs j WHERE j.recording_id=r.id AND j.mode='standard') AS transcription_json,substr(r.text,1,240) AS preview FROM recordings r${join}${clauses.length ? ' WHERE ' + clauses.join(' AND ') : ''} ORDER BY r.sort_time DESC,r.id DESC LIMIT ?`,
     )
       .bind(...args, limit + 1)
       .all()
@@ -637,6 +669,7 @@ async function api(request: Request, env: any, ctx: any, role: string) {
     return json({
       results: results.slice(0, limit).map((r: any) => ({
         ...r,
+        ...backupState(env, r),
         transcription: r.transcription_json ? JSON.parse(r.transcription_json) : null,
         transcription_json: undefined,
       })),
@@ -653,7 +686,7 @@ async function api(request: Request, env: any, ctx: any, role: string) {
     const [, id, action] = match
     if (action === 'status' && method === 'GET') {
       const status =
-        await env.DB.prepare(`SELECT r.id,r.revision,r.status,r.detailed_status,r.backup_step,r.backup_error,r.audio_key IS NOT NULL AS has_audio,r.edited_at AS updated_at,
+        await env.DB.prepare(`SELECT r.id,r.revision,r.status,r.detailed_status,r.backup_revision,r.backup_until,r.backup_step,r.backup_error,r.audio_key IS NOT NULL AS has_audio,r.edited_at AS updated_at,
         (SELECT json_object('id',j.id,'recording_id',j.recording_id,'mode',j.mode,'status',j.status,'stage',j.stage,'progress',j.progress,'attempt',j.attempt,'error',j.error,'lease_until',j.lease_until,'updated_at',j.updated_at,'available_at',j.available_at) FROM transcription_jobs j WHERE j.recording_id=r.id AND mode='standard') AS transcription_json,
         (SELECT json_object('id',j.id,'recording_id',j.recording_id,'mode',j.mode,'status',j.status,'stage',j.stage,'progress',j.progress,'attempt',j.attempt,'error',j.error,'lease_until',j.lease_until,'updated_at',j.updated_at,'available_at',j.available_at) FROM transcription_jobs j WHERE j.recording_id=r.id AND mode='detailed') AS detailed_json
         FROM recordings r WHERE r.id=?`)
@@ -662,6 +695,7 @@ async function api(request: Request, env: any, ctx: any, role: string) {
       if (!status) return json({ error: 'Recording not found' }, 404)
       return json({
         ...status,
+        ...backupState(env, status),
         has_audio: !!status.has_audio,
         transcription: status.transcription_json ? JSON.parse(status.transcription_json) : null,
         detailed_transcription: status.detailed_json ? JSON.parse(status.detailed_json) : null,
@@ -727,6 +761,14 @@ async function api(request: Request, env: any, ctx: any, role: string) {
       return new Response(object.body, { status, headers })
     }
     if (action === 'backup' && method === 'POST') {
+      if (!env.NOTION_TOKEN || !env.NOTION_DATA_SOURCE_ID)
+        throw new ApiError('Notion backup is not configured', 503, 'backup_not_configured')
+      if (!row.audio_key)
+        throw new ApiError(
+          'Import the original audio before backing up this recording',
+          409,
+          'audio_unavailable',
+        )
       await env.DB.prepare('UPDATE recordings SET backup_next_attempt=0 WHERE id=?').bind(id).run()
       if (row.backup_step === 'uncertain') {
         const store = new NotionStore(httpTransport(env.NOTION_TOKEN), env.NOTION_DATA_SOURCE_ID)
@@ -754,17 +796,25 @@ async function api(request: Request, env: any, ctx: any, role: string) {
         throw new ApiError('Invalid title')
       if (data.starred !== undefined && typeof data.starred !== 'boolean')
         throw new ApiError('Invalid starred flag')
-      await env.DB.prepare(
-        'UPDATE recordings SET title=?,starred=?,primary_owned=1,revision=revision+1 WHERE id=?',
+      const fields: string[] = [],
+        values: any[] = []
+      if (data.title !== undefined) {
+        fields.push('title=?')
+        values.push(data.title)
+      }
+      if (data.starred !== undefined) {
+        fields.push('starred=?')
+        values.push(Number(data.starred))
+      }
+      if (!fields.length) throw new ApiError('Provide title or starred')
+      const updated = await env.DB.prepare(
+        `UPDATE recordings SET ${fields.join(',')},primary_owned=1,revision=revision+1,edited_at=? WHERE id=? RETURNING revision,edited_at AS updated_at,title,starred`,
       )
-        .bind(
-          data.title ?? row.title,
-          data.starred === undefined ? row.starred : Number(data.starred),
-          id,
-        )
-        .run()
+        .bind(...values, new Date().toISOString(), id)
+        .first()
+      if (!updated) throw new ApiError('Recording not found', 404, 'not_found')
       ctx.waitUntil(backup(env, id))
-      return json({ saved: true })
+      return json({ saved: true, ...updated, starred: !!updated.starred })
     }
     if (!action && method === 'GET') {
       const jobs = await env.DB.prepare('SELECT * FROM transcription_jobs WHERE recording_id=?')
@@ -776,7 +826,6 @@ async function api(request: Request, env: any, ctx: any, role: string) {
         segments: JSON.parse(row.transcript_segments),
         detailed_segments: JSON.parse(row.detailed_segments),
         id: row.id,
-        revision: row.revision,
         updated_at: row.edited_at,
         title: row.title,
         recorded_at: row.recorded_at,
@@ -788,6 +837,7 @@ async function api(request: Request, env: any, ctx: any, role: string) {
         detailed_error: row.detailed_error,
         starred: !!row.starred,
         has_audio: !!row.audio_key,
+        ...backupState(env, row),
         backup_step: row.backup_step,
         backup_error: row.backup_error,
         backup_attempts: row.backup_attempts,
@@ -909,6 +959,7 @@ export default {
                         ).results,
                       },
                       storage: {
+                        ...(await storageDiagnostics(env)),
                         database_bytes: storage.meta?.size_after ?? null,
                         ...storage.results[0],
                         ...fts,

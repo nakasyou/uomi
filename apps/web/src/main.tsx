@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import { api } from './api'
+import { mergeRecording } from './recording-state'
 import './style.css'
 
 type Job = {
@@ -26,6 +27,10 @@ type Recording = {
   starred: boolean
   has_audio: boolean
   backup_step: string
+  backup_status?: string
+  backup_saved?: boolean
+  backup_configured?: boolean
+  backup_revision?: number
   backup_error: string | null
   preview?: string
   text?: string
@@ -187,9 +192,10 @@ function App() {
     else dialog.current?.close()
   }, [settings])
   function merge(id: string, data: Partial<Recording>) {
-    setSelected((r) => (r?.id === id ? { ...r, ...data } : r))
-    if (selectedRef.current?.id === id) selectedRef.current = { ...selectedRef.current, ...data }
-    setItems((rs) => rs.map((r) => (r.id === id ? { ...r, ...data } : r)))
+    setSelected((r) => (r?.id === id ? mergeRecording(r, data) : r))
+    if (selectedRef.current?.id === id)
+      selectedRef.current = mergeRecording(selectedRef.current, data)
+    setItems((rs) => rs.map((r) => (r.id === id ? mergeRecording(r, data) : r)))
   }
   async function load(next?: string) {
     const gen = ++requestId.current
@@ -307,9 +313,17 @@ function App() {
     const r = selectedRef.current
     if (!r) return
     await action('patch', async () => {
-      await api('/api/recordings/' + r.id, { method: 'PATCH', body: JSON.stringify(data) })
-      merge(r.id, data)
-      setRename(null)
+      const result = await api('/api/recordings/' + r.id, {
+        method: 'PATCH',
+        body: JSON.stringify(data),
+      })
+      merge(r.id, {
+        title: result.title ?? data.title ?? r.title,
+        starred: result.starred ?? data.starred ?? r.starred,
+        revision: result.revision ?? r.revision,
+        updated_at: result.updated_at ?? r.updated_at,
+      })
+      if (selectedRef.current?.id === r.id) setRename(null)
     })
   }
   async function transcribe(mode: 'standard' | 'detailed') {
@@ -728,17 +742,24 @@ function App() {
                     <details className="backup-status">
                       <summary>
                         Notion backup ·{' '}
-                        {selected.backup_error
-                          ? 'Needs attention'
-                          : ['done', 'legacy'].includes(selected.backup_step)
-                            ? 'Saved'
-                            : selected.backup_step === 'disabled'
-                              ? 'Off'
-                              : 'Pending'}
+                        {{
+                          disabled: 'Off',
+                          missing_audio: 'Original audio unavailable',
+                          saved: 'Saved',
+                          uncertain: 'Needs review',
+                          processing: 'Saving…',
+                          retry: 'Needs attention',
+                          pending: 'Pending',
+                        }[selected.backup_status ?? 'pending'] ?? 'Pending'}
                       </summary>
                       {selected.backup_error && <p className="error">{selected.backup_error}</p>}
                       <button
-                        disabled={!!busy}
+                        disabled={
+                          !!busy ||
+                          ['disabled', 'missing_audio', 'saved', 'processing'].includes(
+                            selected.backup_status ?? '',
+                          )
+                        }
                         onClick={() =>
                           void action('backup', async () => {
                             await api(`/api/recordings/${selected.id}/backup`, {

@@ -61,3 +61,11 @@ candidates, rather than all recording history.
 primary recordings. Untouched historical Notion snapshots are excluded, and their
 old dirty backup revisions/leases are cleared before cutover refresh. This prevents
 a queue of stale cache snapshots from rewriting the historical source.
+
+Storage diagnostics deliberately run only for an explicit `index_status` request.
+They report source-range cardinality, frame spans, UTF-8 identity bytes and the
+largest recordings, plus supported SQLite allocation/free-page counters. Unsupported
+PRAGMAs return their own diagnostic errors. These counters distinguish payload
+and identity/index overhead from allocated free space; physical D1 bytes alone do
+not establish duplicate data. Source identities include per-packet hashes, so
+combining ranges with different prefixes would lose deduplication correctness.

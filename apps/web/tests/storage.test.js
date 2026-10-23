@@ -56,7 +56,7 @@ test('stage, retry, canonical acknowledgement, fast search and audio are separat
     .prepare('UPDATE recordings SET search_text=?,search_version=1 WHERE id=?')
     .run('分散ふぁくとちぇっく', v.segmentId)
   r = await app.fetch(request('/api/chunks', 'POST', v, headers), f.env, f.ctx)
-  assert.equal((await r.json()).notion_saved, true)
+  assert.equal((await r.json()).notion_saved, false)
   r = await app.fetch(request('/api/recordings?q=' + encodeURIComponent('ファクト')), f.env, f.ctx)
   assert.equal((await r.json()).results.length, 1)
   r = await app.fetch(request(`/api/recordings/${v.segmentId}/audio`), f.env, f.ctx)
@@ -196,13 +196,13 @@ test('client Ogg is stored byte-for-byte, retries retain canonical acknowledgeme
   assert.deepEqual(f.files.get(`audio/${manifest.sha256}.ogg`), audio)
   f.sqlite.prepare("UPDATE recordings SET backup_step='done'").run()
   const retry = await app.fetch(binaryRequest(manifest, audio), f.env, f.ctx)
-  assert.equal((await retry.json()).notion_saved, true)
+  assert.equal((await retry.json()).notion_saved, false)
   const legacy = await app.fetch(
     request('/api/chunks', 'POST', v, { 'Idempotency-Key': v.segmentId }),
     f.env,
     f.ctx,
   )
-  assert.equal((await legacy.json()).notion_saved, true)
+  assert.equal((await legacy.json()).notion_saved, false)
   assert.equal(f.sqlite.prepare('SELECT count(*) AS n FROM recordings').get().n, 1)
   f.sqlite.close()
 })
@@ -254,7 +254,7 @@ test('binary overlap compares original packets and cannot acknowledge changed so
   v.segmentId = await digest(new TextEncoder().encode(JSON.stringify(v.frames.map((f) => f.id))))
   const subset = await binaryChunk(v)
   const same = await app.fetch(binaryRequest(subset.manifest, subset.audio), f.env, f.ctx)
-  assert.equal((await same.json()).notion_saved, true)
+  assert.equal((await same.json()).notion_saved, false)
   v.frames[0] = { ...v.frames[0], data: 'mAI=' }
   const changed = await binaryChunk(v)
   const different = await app.fetch(binaryRequest(changed.manifest, changed.audio), f.env, f.ctx)
