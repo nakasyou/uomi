@@ -572,6 +572,26 @@ export default {
             const count = await env.DB.prepare(
               "SELECT count(*) AS recordings,sum(audio_key IS NOT NULL) AS cached_audio,sum(backup_step NOT IN ('done','legacy')) AS pending_notion_saves FROM recordings",
             ).first()
+            const storage = await env.DB.prepare(
+              `SELECT coalesce(sum(length(CAST(text AS BLOB))),0) AS transcript_utf8_bytes,
+              coalesce(sum(length(text)),0) AS transcript_characters,
+              coalesce(sum(length(manifest_gzip)),0) AS manifest_gzip_bytes
+              FROM recordings`,
+            ).all()
+            const fts = await env.DB.prepare(
+              `SELECT
+              (SELECT coalesce(sum(length(CAST(c0 AS BLOB))+length(CAST(c1 AS BLOB))),0) FROM transcripts_content) AS fts_content_bytes,
+              (SELECT coalesce(sum(length(block)),0) FROM transcripts_data) AS fts_data_bytes,
+              (SELECT coalesce(sum(length(term)),0) FROM transcripts_idx) AS fts_term_bytes,
+              (SELECT coalesce(sum(length(sz)),0) FROM transcripts_docsize) AS fts_docsize_bytes`,
+            ).first()
+            const daily = await env.DB.prepare(
+              `SELECT date(recorded_at/1000,'unixepoch','+9 hours') AS day_jst,
+              count(*) AS recordings, sum(length(CAST(text AS BLOB))) AS transcript_utf8_bytes,
+              sum(length(text)) AS transcript_characters,
+              sum(max(0,coalesce(finished_at,recorded_at)-recorded_at)) AS recorded_ms
+              FROM recordings WHERE recorded_at IS NOT NULL GROUP BY day_jst ORDER BY day_jst`,
+            ).all()
             const state = await env.DB.prepare(
               'SELECT since,cursor IS NOT NULL AS has_more,started FROM resync_state WHERE id=1',
             ).first()
@@ -587,6 +607,13 @@ export default {
                       source: 'Notion',
                       ...count,
                       sync: state,
+                      storage: {
+                        database_bytes: storage.meta?.size_after ?? null,
+                        ...storage.results[0],
+                        ...fts,
+                        note: 'Database bytes are physical D1 size. Component bytes are payload only, excluding SQLite page/B-tree overhead; FTS data may include pending merge segments.',
+                        daily: daily.results,
+                      },
                       limitations: [
                         'Recording-level time ranges; no word timestamps.',
                         'Run sync_index or Web Recorder source resync to refresh persistent caches.',

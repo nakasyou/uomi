@@ -133,3 +133,18 @@ test('private Sites email identity supports the viewer and preserves CSRF checks
   assert.equal((await call('POST', { Origin: 'https://other.test' })).status, 403)
   f.sqlite.close()
 })
+
+test('index status reports storage payloads without assuming D1 physical size is available locally', async () => {
+  const f = fixture()
+  const response = await app.fetch(request('/mcp', 'POST', {
+    jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'index_status' },
+  }), f.env, f.ctx)
+  const rpc = await response.json()
+  const status = JSON.parse(rpc.result.content[0].text)
+  assert.equal(status.storage.transcript_utf8_bytes, 0)
+  assert.equal(status.storage.manifest_gzip_bytes, 0)
+  assert.equal(status.storage.database_bytes, null)
+  assert.ok(status.storage.fts_data_bytes > 0)
+  assert.deepEqual(status.storage.daily, [])
+  f.sqlite.close()
+})
