@@ -18,3 +18,19 @@ export function mergeRecording<T extends { revision?: number; updated_at?: strin
     return current
   return { ...current, ...patch }
 }
+
+/** A delayed list response must respect edits confirmed while its request was in flight. */
+export function mergeRecordingPage<
+  T extends { id: string; revision?: number; updated_at?: string },
+>(current: T[], incoming: T[], append = false): T[] {
+  const known = new Map(current.map((recording) => [recording.id, recording]))
+  const page = incoming.map((recording) =>
+    mergeRecording(known.get(recording.id) ?? recording, recording),
+  )
+  if (!append) return page
+  const byId = new Map(page.map((recording) => [recording.id, recording]))
+  return [
+    ...current.map((recording) => byId.get(recording.id) ?? recording),
+    ...page.filter((recording) => !known.has(recording.id)),
+  ]
+}

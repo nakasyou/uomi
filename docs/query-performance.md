@@ -110,3 +110,29 @@ of the earlier size increase can be established from these counters. No source
 identity compression, range rewrite, VACUUM or storage migration was performed
 on the basis of this audit. A future lossless key representation change would
 need separate migration, source-identity and overlap-query verification.
+
+## Completed-import growth comparison
+
+At the migration-complete snapshot, production reported 213 recordings and 212
+primary audio copies, 542,568 source ranges for 542,549 distinct prefixes, and
+2,405,385 frames. Physical D1 size was 223,580,160 bytes (213.22 MiB). Source device
+strings occupied 11,393,958 bytes and prefixes 47,203,388 bytes, totaling
+58,597,346 bytes (55.88 MiB) of identity payload before indexes/SQLite overhead.
+Only 19 rows exceeded distinct prefixes (0.0035%), again ruling out useful range
+merging as a material storage remedy.
+
+Compared with the earlier 296,518-range snapshot above, the importer added
+246,050 source ranges and 102,408,192 physical bytes (97.66 MiB): approximately
+416.21 physical bytes per additional range. Total physical bytes per range stayed
+near 409–412 across the two observations. This observed near-linear growth is
+stronger evidence that live source-identity cardinality and its indexed long keys
+explain the main growth, rather than recording count or transcript volume. It
+still does not measure physical bytes by table or rule out some free-page
+contribution: D1 continues to deny the allocation/free-page counters.
+
+The final recording-ownership audit paginated all 213 unique rows using Sites'
+returned continuation offsets and checked all eligibility fields. Exactly zero
+rows matched `notion_edited IS NOT NULL AND revision=0 AND notion_import_version=0`.
+All 179 rows with Notion import provenance had import version 1; primary rows
+without that provenance are intentionally outside the historical-baseline marker.
+No schema, source identity or range rewrite was performed for this investigation.

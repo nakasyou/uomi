@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import { api } from './api'
-import { mergeRecording } from './recording-state'
+import { mergeRecording, mergeRecordingPage } from './recording-state'
 import './style.css'
 
 type Job = {
@@ -220,11 +220,7 @@ function App() {
       if (next) p.set('cursor', next)
       const data = await api('/api/recordings?' + p)
       if (gen !== requestId.current) return
-      setItems((old) =>
-        next
-          ? [...old, ...data.results.filter((r: Recording) => !old.some((x) => x.id === r.id))]
-          : data.results,
-      )
+      setItems((old) => mergeRecordingPage(old, data.results, !!next))
       setCursor(data.next_cursor)
       if (!next && !selectedRef.current && data.results[0]) void choose(data.results[0])
     } catch (e) {

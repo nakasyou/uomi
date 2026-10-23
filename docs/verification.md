@@ -315,3 +315,76 @@ historical missing-audio warning identified source page
 absent. `has_more` remained true; these observations do not establish exhaustive
 migration or final unresolved counts. Later hydration can resolve earlier warnings,
 so final source IDs must be reconciled with authoritative storage after exhaustion.
+
+The explicit cutover repair scan completed on 2026-10-24 at 00:02 JST. Process
+87941 exited after 210 bounded API pages containing 209 source-record events;
+all 209 returned recording IDs were distinct. The event audit counted 168 cached,
+11 unchanged, and 30 primary-owned skips. There were 167 distinct audio imports
+in this pass; unchanged records already had their audio and manifest verified.
+No transient retries occurred during the repair pass. A subsequent independent
+GET confirmed `status: completed`, `has_more: false`, `lease_until: 0`,
+`started: null`, and `error: null`. This is pagination exhaustion plus a committed
+server completion receipt, rather than an inference from an idle process.
+
+Actual object availability was then tested for every one of those 209 recording
+IDs through the production authenticated audio endpoint, with four concurrent
+requests and `Range: bytes=0-0`. Exactly 208 returned HTTP 206 with one byte; the
+sole HTTP 404 was `401f60d4-5c99-8169-9aca-d9e3c4031db1`. Its Notion source has both
+Audio and Manifest attachments missing, and the importer reported this explicitly.
+It was not later hydrated in this pass. The other 208 probes verify real served
+objects, rather than merely non-null database keys. No personal audio contents
+were printed or retained in the verification report. Protected run state, event
+log, distinct-ID summary and object-probe metadata remain on Mac mini under
+`~/.config/uomi-transcriber/migration-repair-*`.
+
+Three representative historical Completed recordings with blank primary text
+were independently checked against the original protected Notion REST data:
+`401f60d4-5c99-8110-a398-fbfa53d13f8d`,
+`401f60d4-5c99-818e-813c-f37a18a6a0f4`, and
+`401f60d4-5c99-814c-b4a4-e8b7405a4104`.
+Each source had one Audio, Manifest and Transcript attachment. Its
+`uomi.transcript.v1` attachment already contained text length zero and zero segments;
+Transcript preview length was zero, and the page contained no child blocks or
+descendants. Only lengths/counts/field names were observed. The current primary
+copies agree with these three current source attachments. These checks do not
+prove that source contents were unchanged before the cutover, establish the origin
+of every other historical blank, or prove that the audio contains no speech.
+
+Final recording-ownership proof used complete bounded Sites table pagination,
+following every returned continuation offset (including projection-limited pages),
+and verified 213 unique recording IDs with all eligibility fields present.
+Exactly **zero** rows match the remaining untouched-cutover predicate
+`notion_edited IS NOT NULL AND revision=0 AND notion_import_version=0`.
+All 179 Notion-provenance rows have `notion_import_version=1`. This is a complete
+row audit, not an inference from a partial sample or the finished cursor alone.
+
+The sole missing primary audio record is
+`401f60d4-5c99-8169-9aca-d9e3c4031db1`. Its metadata remains present: title and
+recorded-at fields exist, duration is 74,560 ms, status is Uploading and stored
+text length is zero. Both audio_key and manifest_key are null. Its source page
+ID matches the recording ID; notion_edited is 2026-10-22T07:50:00Z, revision is 0,
+and import version is 1. Thus its missing source audio is explicitly represented,
+without a fabricated primary file or claim of a pending cutover refresh. No title,
+transcript content or device identity was included in this proof output.
+
+At the completed-import storage snapshot, production has 213 recordings / 212
+audio copies and 542,568 source ranges for 542,549 distinct prefixes, covering
+2,405,385 frames. Physical D1 size is 223,580,160 bytes (213.22 MiB); device plus
+prefix string payload is 58,597,346 bytes (55.88 MiB). Compared with the earlier
+296,518-range / 121,171,968-byte observation, growth is 246,050 ranges and
+102,408,192 physical bytes, approximately 416.21 bytes per added range. The
+near-linear relationship strengthens the live identity/index-cardinality
+explanation. Only 19 rows exceed distinct-prefix count (0.0035%), so merging
+ranges cannot materially reduce storage safely. Physical table/index breakdown
+and free-page contribution remain unknown because D1 denies those PRAGMAs.
+No schema or source-range rewrite was made. See docs/query-performance.md for the
+comparison and the limits of this evidence.
+
+Final web publication succeeded from GitHub runtime source `1eaf8f2` through
+owner-private Sites deployment `appgdep_6adb78308e248191b5b69d037dff1388`,
+Sites source `870b21ba5f686368f44b8044bc87e08f08fe296d`, environment revision 11.
+All 55 web tests, its typecheck, production build and repository format/lint
+passed. Historical Completed status without a corresponding completed job no
+longer implies that no speech was detected; missing text is shown as unavailable.
+The API daemon remains on verified source `084fd8d`; later changes concern UI,
+Android secondary diagnostics and evidence rather than its runtime implementation.
