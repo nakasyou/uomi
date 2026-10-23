@@ -13,6 +13,9 @@
         "vite-plus": "1.3.0",
       },
     },
+    "apps/chatgpt-sites-mcp": {
+      "name": "@uomi/chatgpt-sites-mcp",
+    },
     "apps/client": {
       "name": "@uomi/client",
       "version": "0.1.0",
@@ -508,6 +511,8 @@
     "@types/yargs-parser": ["@types/yargs-parser@21.0.3", "", {}, "sha512-I4q9QU9MQv4oEOz4tAHJtNz1cwuLxn2F3xcc2iV5WdqLPpUnj30aUuxt1mAxYTG+oe8CZMV/+6rU4S4gRDzqtQ=="],
 
     "@uomi/audio": ["@uomi/audio@workspace:packages/audio"],
+
+    "@uomi/chatgpt-sites-mcp": ["@uomi/chatgpt-sites-mcp@workspace:apps/chatgpt-sites-mcp"],
 
     "@uomi/client": ["@uomi/client@workspace:apps/client"],
 

@@ -2,7 +2,9 @@
 
 A local-first Omi client with direct Notion storage and a Bun transcription daemon.
 English UI, Material 3, React Native on Android and React Native Web in Tauri on Linux.
-No Workers, D1, Queues, R2, S3 or hosted application server is required.
+No Workers, D1, Queues, R2, S3 or hosted application server is required for the client or transcriber.
+The optional [ChatGPT Sites MCP](apps/chatgpt-sites-mcp/README.md) adds private
+transcript search using a derived D1 index.
 
 ## Workspace
 
