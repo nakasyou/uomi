@@ -624,7 +624,7 @@ export function httpTransport(token: string, fetcher: typeof fetch = fetch): Tra
       method: request.method,
       headers,
       body,
-      redirect: 'error',
+      redirect: 'manual',
       signal: AbortSignal.timeout(120000),
     })
     if (!response.ok) {
