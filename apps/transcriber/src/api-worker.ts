@@ -1,9 +1,18 @@
-import { createHash, randomUUID } from 'node:crypto'
-import { mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { transcribe, type Provider, type Transcription } from '@nakasyou/ntranscribe'
+import {
+  getProvider,
+  type TranscribeOptions,
+  type Provider,
+  type Transcription,
+} from '@nakasyou/ntranscribe'
 import { validateManifest } from '@uomi/notion'
+import { saveCheckpoint } from './checkpoint'
+export { saveCheckpoint } from './checkpoint'
+import { audioProcess, WorkSlots } from './process'
+import { transcribeSpeech } from './speech-transcription'
 
 export interface Job {
   id: string
@@ -27,6 +36,7 @@ export interface WorkerConfig {
   concurrency: number
   splitSeconds: number
   codexSplitSeconds?: number
+  fluidCommand?: string
   requestWaitMs: number
   timeoutMs: number
   pollMs: number
@@ -42,23 +52,11 @@ export class ApiError extends Error {
 export function errorDetail(error: unknown): string {
   return (error instanceof Error ? `${error.name}: ${error.message}` : String(error)).slice(0, 4000)
 }
-/** Concurrent or abandoned leases must never share an intermediate checkpoint file. */
-export async function saveCheckpoint(path: string, chunks: Transcription[], signal: AbortSignal) {
-  signal.throwIfAborted()
-  const temporary = `${path}.${randomUUID()}.tmp`
-  try {
-    await writeFile(temporary, JSON.stringify(chunks), { mode: 0o600 })
-    signal.throwIfAborted()
-    await rename(temporary, path)
-  } finally {
-    await rm(temporary, { force: true }).catch((error) => {
-      console.error(JSON.stringify({ stage: 'checkpoint_cleanup', error: errorDetail(error) }))
-    })
-  }
-}
 /** Durable ownership lives in the web database; local checkpoints only avoid repeated provider work. */
 export class ApiWorker {
   private active = new Set<Promise<void>>()
+  private recognitionSlots = new WorkSlots(2)
+  private analysisSlots = new WorkSlots(1)
   private stopped = false
   private polling = false
   private nextRequest = 0
@@ -67,7 +65,10 @@ export class ApiWorker {
   lastPollAt: string | null = null
   constructor(
     readonly config: WorkerConfig,
-    private recognize = transcribe,
+    private recognize: (path: string, options?: TranscribeOptions) => Promise<Transcription> = (
+      path,
+      options = {},
+    ) => getProvider(options.provider).transcribeFile(path, options),
     private http: typeof fetch = fetch,
   ) {
     const url = new URL(config.url)
@@ -84,6 +85,7 @@ export class ApiWorker {
         google: this.config.splitSeconds,
         codex: this.config.codexSplitSeconds ?? 300,
       },
+      speech: { engine: 'FluidAudio streaming', recognitionConcurrency: 2, analysisConcurrency: 1 },
       lastPollAt: this.lastPollAt,
       error: this.lastError,
     }
@@ -218,9 +220,11 @@ export class ApiWorker {
     let progress = 0
     let heartbeatBusy = false
     let heartbeatFailures = 0
+    let lastHeartbeat = 0
     const beat = async () => {
       if (heartbeatBusy) return
       heartbeatBusy = true
+      lastHeartbeat = Date.now()
       try {
         await this.request(
           `/api/jobs/${encodeURIComponent(job.id)}/heartbeat`,
@@ -262,122 +266,139 @@ export class ApiWorker {
       const provider = job.mode === 'detailed' ? 'codex' : this.config.provider
       const splitSeconds =
         provider === 'codex' ? (this.config.codexSplitSeconds ?? 300) : this.config.splitSeconds
-      const fingerprint = createHash('sha256')
-        .update(
-          JSON.stringify([
-            job.recording_id,
-            job.mode,
-            manifest.sha256,
-            provider,
-            this.config.language,
-            splitSeconds,
-          ]),
-        )
-        .digest('hex')
       await mkdir(this.config.stateDir, { recursive: true, mode: 0o700 })
-      const checkpoint = join(this.config.stateDir, `api-${fingerprint}.json`)
-      let chunks: Transcription[] = []
-      try {
-        const saved = JSON.parse(await readFile(checkpoint, 'utf8'))
-        if (!Array.isArray(saved) || saved.some((v: any) => typeof v.text !== 'string'))
-          throw Error('Invalid checkpoint contents.')
-        chunks = saved
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'ENOENT')
-          throw Error(`Cannot read transcription checkpoint ${checkpoint}: ${errorDetail(error)}`)
-      }
       directory = await mkdtemp(join(tmpdir(), 'uomi-api-'))
       const path = join(directory, 'audio.ogg')
-      // Preserve recording time, including gaps, so future provider segment times use the same timeline as playback.
       await writeFile(path, audio, { mode: 0o600 })
-      stage = 'decoding'
-      await beat()
-      controller.signal.throwIfAborted()
-      const split = Bun.spawn(
-        [
-          'ffmpeg',
-          '-hide_banner',
-          '-loglevel',
-          'error',
-          '-nostdin',
-          '-i',
-          path,
-          '-map',
-          '0:a:0',
-          '-ac',
-          '1',
-          '-ar',
-          '16000',
-          '-c:a',
-          'flac',
-          '-f',
-          'segment',
-          '-segment_time',
-          String(splitSeconds),
-          '-reset_timestamps',
-          '1',
-          join(directory, 'chunk-%06d.flac'),
-        ],
-        { stdout: 'ignore', stderr: 'pipe' },
-      )
-      let decodeTimedOut = false
-      const decodeTimer = setTimeout(() => {
-        decodeTimedOut = true
-        split.kill()
-      }, 120000)
-      const kill = () => split.kill()
-      controller.signal.addEventListener('abort', kill, { once: true })
-      const stderr = await new Response(split.stderr).text()
-      const code = await split.exited
-      clearTimeout(decodeTimer)
-      if (decodeTimedOut) throw Error('ffmpeg decoding exceeded 120 seconds.')
-      controller.signal.removeEventListener('abort', kill)
-      controller.signal.throwIfAborted()
-      if (code !== 0) throw Error(`ffmpeg exited ${code}: ${stderr.slice(-2000)}`)
-      const files = (await readdir(directory))
-        .filter((name) => /^chunk-\d+\.flac$/.test(name))
-        .sort()
-      if (!files.length || chunks.length > files.length)
-        throw Error('Audio split does not match transcription checkpoint.')
-      for (let i = chunks.length; i < files.length; i++) {
-        stage = 'transcribing'
-        progress = i / files.length
+      let checkpoint: string
+      let content: { text: string; segments: unknown[] }
+      if (provider !== 'codex') {
+        const speech = await transcribeSpeech({
+          audioPath: path,
+          directory,
+          stateDir: this.config.stateDir,
+          helper: this.config.fluidCommand ?? 'uomi-fluid-segments',
+          audioSha: manifest.sha256,
+          recordingId: job.recording_id,
+          mode: job.mode,
+          language: this.config.language,
+          durationMs: manifest.durationMs,
+          splitSeconds,
+          timeoutMs: this.config.timeoutMs,
+          signal: controller.signal,
+          analyze: (work) => this.analysisSlots.run(controller.signal, work),
+          recognize: (audioPath, options, signal) =>
+            this.recognitionSlots.run(signal, () => this.recognize(audioPath, options)),
+          stage: async (value, valueProgress) => {
+            const changed = stage !== value
+            stage = value
+            progress = valueProgress
+            if (changed || Date.now() - lastHeartbeat >= 3000) await beat()
+          },
+        })
+        checkpoint = speech.checkpoint
+        content = { text: speech.text, segments: speech.segments }
+      } else {
+        const fingerprint = createHash('sha256')
+          .update(
+            JSON.stringify([
+              job.recording_id,
+              job.mode,
+              manifest.sha256,
+              provider,
+              this.config.language,
+              splitSeconds,
+            ]),
+          )
+          .digest('hex')
+        await mkdir(this.config.stateDir, { recursive: true, mode: 0o700 })
+        checkpoint = join(this.config.stateDir, `api-${fingerprint}.json`)
+        let chunks: Transcription[] = []
+        try {
+          const saved = JSON.parse(await readFile(checkpoint, 'utf8'))
+          if (!Array.isArray(saved) || saved.some((v: any) => typeof v.text !== 'string'))
+            throw Error('Invalid checkpoint contents.')
+          chunks = saved
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT')
+            throw Error(`Cannot read transcription checkpoint ${checkpoint}: ${errorDetail(error)}`)
+        }
+        stage = 'decoding'
         await beat()
         controller.signal.throwIfAborted()
-        await this.pace(controller.signal)
-        const result = await this.recognize(join(directory, files[i]), {
-          provider,
-          language: this.config.language,
-          timeoutMs: this.config.timeoutMs,
-          splitSeconds,
-        })
-        controller.signal.throwIfAborted()
-        chunks.push(result)
-        await saveCheckpoint(checkpoint, chunks, controller.signal)
+        await audioProcess(
+          [
+            'ffmpeg',
+            '-hide_banner',
+            '-loglevel',
+            'error',
+            '-nostdin',
+            '-i',
+            path,
+            '-map',
+            '0:a:0',
+            '-ac',
+            '1',
+            '-ar',
+            '16000',
+            '-c:a',
+            'flac',
+            '-f',
+            'segment',
+            '-segment_time',
+            String(splitSeconds),
+            '-reset_timestamps',
+            '1',
+            join(directory, 'chunk-%06d.flac'),
+          ],
+          controller.signal,
+        )
+        const files = (await readdir(directory))
+          .filter((name) => /^chunk-\d+\.flac$/.test(name))
+          .sort()
+        if (!files.length || chunks.length > files.length)
+          throw Error('Audio split does not match transcription checkpoint.')
+        for (let i = chunks.length; i < files.length; i++) {
+          stage = 'transcribing'
+          progress = i / files.length
+          await beat()
+          controller.signal.throwIfAborted()
+          const result = await this.recognitionSlots.run(controller.signal, async () => {
+            await this.pace(controller.signal)
+            return this.recognize(join(directory!, files[i]), {
+              provider,
+              language: this.config.language,
+              timeoutMs: this.config.timeoutMs,
+              splitSeconds,
+            })
+          })
+          controller.signal.throwIfAborted()
+          chunks.push(result)
+          await saveCheckpoint(checkpoint, chunks, controller.signal)
+        }
+        const segments = chunks.flatMap((chunk, index) =>
+          Array.isArray(chunk.segments)
+            ? chunk.segments.map((segment: any) => ({
+                start_ms: index * splitSeconds * 1000 + segment.start_ms,
+                end_ms: index * splitSeconds * 1000 + segment.end_ms,
+                text: segment.text,
+                speaker: segment.speaker ?? null,
+              }))
+            : [],
+        )
+        content = {
+          text: chunks
+            .map((chunk) => chunk.text.trim())
+            .filter(Boolean)
+            .join('\n'),
+          segments,
+        }
       }
       stage = 'saving'
       progress = 1
       await beat()
       controller.signal.throwIfAborted()
-      const segments = chunks.flatMap((chunk, index) =>
-        Array.isArray(chunk.segments)
-          ? chunk.segments.map((segment: any) => ({
-              start_ms: index * splitSeconds * 1000 + segment.start_ms,
-              end_ms: index * splitSeconds * 1000 + segment.end_ms,
-              text: segment.text,
-              speaker: segment.speaker ?? null,
-            }))
-          : [],
-      )
-      const result = {
-        lease_token: job.lease_token,
-        text: chunks
-          .map((chunk) => chunk.text.trim())
-          .filter(Boolean)
-          .join('\n'),
-        model: provider,
-        segments,
-      }
+      const result = { lease_token: job.lease_token, model: provider, ...content }
       // A lost completion response is safe to resend with the same fencing token.
       for (let attempt = 0; ; attempt++) {
         try {

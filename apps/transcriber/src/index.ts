@@ -80,12 +80,20 @@ if (
   await rm(lockPath, { force: true })
   throw Error('TRANSCRIBER_CONCURRENCY must be 1–8; TRANSCRIBER_POLL_SECONDS must be at least 1.')
 }
+const provider = parseProvider(process.env.TRANSCRIBER_PROVIDER ?? 'chrome-recognition')
+const fluidCommand = process.env.TRANSCRIBER_FLUID_COMMAND ?? 'uomi-fluid-segments'
+if (provider !== 'codex' && !Bun.which(fluidCommand)) {
+  await rm(lockPath, { force: true })
+  throw Error(
+    'FluidAudio helper is unavailable. Set TRANSCRIBER_FLUID_COMMAND to uomi-fluid-segments; Chrome speech analysis cannot be skipped.',
+  )
+}
 const daemon = new ApiWorker({
   url: apiUrl,
   secret,
   accessToken: process.env.SITES_ACCESS_TOKEN,
   workerId: process.env.TRANSCRIBER_WORKER_ID ?? hostname(),
-  provider: parseProvider(process.env.TRANSCRIBER_PROVIDER ?? 'chrome-recognition'),
+  provider,
   language: process.env.LANGUAGE ?? 'ja',
   stateDir,
   concurrency,
@@ -94,6 +102,7 @@ const daemon = new ApiWorker({
   timeoutMs: 300000,
   splitSeconds,
   codexSplitSeconds,
+  fluidCommand,
 })
 let server: ReturnType<typeof Bun.serve>
 try {

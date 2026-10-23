@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
-import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, readdir, rm, writeFile, chmod } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { ApiWorker, saveCheckpoint, type WorkerConfig, type Job } from '../src/api-worker'
@@ -35,8 +35,18 @@ async function fixture(durationSeconds = 0.1) {
     frameIds: ['frame'],
     timing: [],
   }
+  const fluidCommand = join(dir, 'fake-fluid')
+  await writeFile(
+    fluidCommand,
+    `#!/usr/bin/env bun
+const output=process.argv[process.argv.indexOf('--output')+1];
+await Bun.write(output, JSON.stringify({schema:'uomi.speech-plan.v1',engine:'test-fluid-v1',duration_ms:${durationSeconds * 1000},segments:[{start_ms:0,end_ms:${durationSeconds * 1000},speaker:'speaker1'}]}));
+`,
+  )
+  await chmod(fluidCommand, 0o700)
   const config: WorkerConfig = {
     url: 'https://api.example',
+    fluidCommand,
     secret: 'secret',
     accessToken: 'gateway-token',
     workerId: 'test',
@@ -298,7 +308,7 @@ test('worker completes real web API queue through audio, manifest, heartbeat and
     const job = db.sqlite.prepare('SELECT * FROM transcription_jobs').get()
     expect(row.status).toBe('Completed')
     expect(row.text).toBe('real API transcript')
-    expect(JSON.parse(row.transcript_segments)[0].speaker).toBe('person')
+    expect(JSON.parse(row.transcript_segments)[0].speaker).toBe('speaker1')
     expect(job.stage).toBe('completed')
     expect(job.progress).toBe(1)
     expect(job.status).toBe('completed')

@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import { api } from './api'
+import { speakerLabel } from './speaker-label'
 import { mergeRecording, mergeRecordingPage } from './recording-state'
 import './style.css'
 
@@ -14,7 +15,7 @@ type Job = {
   updated_at: number
   available_at: number
 }
-type Segment = { start_ms: number; end_ms: number; text: string; speaker?: string }
+type Segment = { start_ms: number; end_ms: number; text: string; speaker?: string | null }
 type Recording = {
   revision?: number
   updated_at?: string
@@ -832,7 +833,9 @@ function App() {
                               {clock(s.start_ms / 1000)}
                             </button>
                             <p>
-                              {s.speaker && <strong>{s.speaker} </strong>}
+                              {s.speaker !== undefined && (
+                                <strong>{speakerLabel(s.speaker)} </strong>
+                              )}
                               {s.text}
                             </p>
                           </div>

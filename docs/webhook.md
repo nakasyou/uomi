@@ -14,13 +14,30 @@ Requests use `OAI-Sites-Authorization: Bearer <token>` and `X-Uomi-Secret`.
 Keep these credentials on the daemon host; never commit `.env` or embed provider
 credentials into web assets. ffmpeg and provider dependencies run on that host.
 
-Google uses `TRANSCRIBER_SPLIT_SECONDS=600` (10 minutes); Codex uses
-`TRANSCRIBER_CODEX_SPLIT_SECONDS=300` (5 minutes). Both settings accept 1–1800
-seconds. Detailed jobs always use Codex's duration, even when standard jobs use
-Google. These are fixed recording-time cuts, including silence; source recordings
-are never joined. `/health` reports both effective durations under `splitSeconds`.
-Checkpoints include the selected provider's duration so changing boundaries cannot
-reuse incompatible chunk results. Segment offsets use the same selected duration.
+Chrome standard transcription first runs the local FluidAudio streaming helper
+configured by `TRANSCRIBER_FLUID_COMMAND`. Silero VAD removes non-speech intervals;
+streaming LS-EEND supplies per-recording speaker labels. Source audio is preserved.
+The helper processes bounded PCM buffers and returns intervals in the original
+recording timeline; VAD-positive intervals without a confident speaker remain
+unattributed. Overlap is represented as a combined speaker set, not claimed as
+isolated audio for each voice. Original speech gaps are not lost by concatenation.
+
+Google speech/speaker intervals are capped at `TRANSCRIBER_SPLIT_SECONDS=600`
+(10 minutes); Codex uses fixed `TRANSCRIBER_CODEX_SPLIT_SECONDS=300` (5 minutes).
+Both settings accept 1–1800 seconds. Detailed jobs always use Codex's duration.
+Recordings are never joined. ASR calls are bounded to two across all active jobs;
+FluidAudio analysis is bounded to one. Chrome speech calls use this shared capacity
+without the legacy ten-second start delay; Codex retains `REQUEST_WAIT_SECONDS`.
+`/health` reports both effective durations and concurrency. A silent recording
+finishes with empty text/segments and sends zero ASR requests. Helper/model failures
+are visible failures, never an implicit fallback to transcribing the whole file.
+
+Model/SDK revisions and the normalized speech plan identify checkpoint state.
+Out-of-order successful speech results are saved by interval index, so retrying
+one failed interval does not repeat completed siblings. Final text and segments
+are ordered by source time. Provider-relative times are offset back onto that
+same source timeline, and FluidAudio's speaker labels are preserved. A helper
+version or segmentation change cannot reuse incompatible chunk results.
 
 ## Protocol
 
