@@ -189,3 +189,26 @@ per-row audio lookups, and native receipt updates modify only metadata in a
 transaction. A regression forbids audio BLOB INSERT/UPDATE/DELETE while verifying
 acknowledgements, monotonic frame counts and rollback. Existing indexed catalog
 cursor seeks were retained. Client checks now include 78 TS and 17 Rust tests.
+
+Production rollout: GitHub main `e9a824670884c011785345daa300b1c8aab501ed`.
+Owner-private Sites deployment `appgdep_6adb6ce53b1081918cf704a2ebb07623`
+succeeded from synchronized Sites source `81c6255569f91b09ecbefffad9c72a4d230f6c46`
+with environment revision 11. D1 now exposes jobs, receipt aliases and virtual
+sort_time; migration history includes 0005 and 0006. Scoped worker GET /api/jobs
+returns HTTP 200. The obsolete outbound webhook URL is removed from runtime
+configuration; the worker uses a dedicated scoped secret.
+
+Mac mini's Nix-generated service is running the new main revision (PID 83212).
+Its health reports concurrency 2, active jobs and successful polling with no
+transport error. Five real production jobs completed on their first attempt,
+with persisted progress=1/error=null, while two more were active. Exhaustive
+Notion import started with reset exactly once and continues in process PID 83423;
+its private migration-run.json and log record the resumable cursor/counters/errors.
+At the first verification, nine pages were safely skipped as existing primary
+records and import remained active. Final migration completion is not yet proven.
+
+The final combined release check passed 117 Node client/web tests plus 36 Bun
+shared/daemon tests, all TypeScript projects, production Site build, and format/lint
+with no warnings. Android's standalone local release APK is signed with the
+existing development certificate, has embedded Hermes bytecode and passes 16KB
+alignment/signature checks. It was not installed because no device is attached.
