@@ -12,6 +12,7 @@ export class CompletionOutbox {
     private directory: string,
     private config: SitesCallback | undefined,
     private secret: string,
+    private ready: (id: string, mode: TranscriptionMode) => Promise<boolean>,
     private fetcher: typeof fetch = fetch,
   ) {}
   async enqueue(id: string, mode: TranscriptionMode = 'standard') {
@@ -63,6 +64,12 @@ export class CompletionOutbox {
         if (state.nextAt > Date.now()) continue
         attempted++
         try {
+          // Recheck the matching canonical result after restart and before every delivery.
+          const mode = file.endsWith('.detailed.json') ? 'detailed' : 'standard'
+          if (!(await this.ready(file.slice(0, 32), mode))) {
+            attempted--
+            continue
+          }
           const response = await this.fetcher(this.config.url, {
             method: 'POST',
             redirect: 'manual',

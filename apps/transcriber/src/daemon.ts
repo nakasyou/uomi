@@ -56,6 +56,15 @@ export class Daemon {
       join(config.stateDir, 'completion-outbox'),
       config.sitesCallback,
       config.secret,
+      async (id, mode) => {
+        const page = await this.store.page(id)
+        return (
+          !page.archived &&
+          !page.in_trash &&
+          page.properties[transcriptionFields(mode).status]?.select?.name === 'Completed' &&
+          (await this.store.owns(page))
+        )
+      },
     )
   }
   async reserve(value: unknown): Promise<{ pageId: string }> {
