@@ -1,25 +1,12 @@
 # Uomi design
 
-Material 3, Operate mode. Preserve the forest-green/sage palette, system typeface,
-React Native Paper components, light and dark schemes, safe areas and 48dp actions.
-Expanded layout uses a navigation rail; compact Android uses bottom navigation.
+Material 3, Operate mode, English. The capture client is a narrow sync tool with
+Sync and Settings, durable-state progress, Omi pairing and a Web Recorder link.
+Use React Native Paper, system type, light/dark themes and 48dp touch targets.
 
-Library switches between On this device and In Notion below the heading. Notion
-search stays above remote recordings, independent of local inventory length.
-Local recordings offer playback; Notion recordings show audio metadata, processing
-status and text. Distinguish Local only, Saved in
-Notion, Awaiting transcription, Processing, Transcribed and Failed. Full text is
-read inline. Keep lists bounded/paged and reuse expensive audio grouping across
-progress paints. Search and status filters have useful empty states.
-
-Devices is the sole sync destination. Unpaired devices lead with pairing and its
-results before sync. Paired devices lead with a stable progress track and action
-row, followed by device diagnostics, live monitoring and gain. Settings explains
-Notion scope and credentials and offers an optional transcriber webhook behind a
-disclosure. Settings drafts remain in memory
-across tab navigation; explicit save and confirmed discard are available near the
-top. Notion setup includes a guide and a save-and-check action that prepares the
-database properties and refreshes recordings without uploading audio. Retention
-copy follows the configured keep/remove policy on every screen. No S3 or
-Cloudflare settings. All UI text is English. Never imply remote save means local
-deletion, transcription completion, or a live Bluetooth connection.
+Web visual authority is the supplied Google Recorder screenshot: charcoal canvas,
+blue transport controls, left recording list, a rounded split waveform/transcript
+panel and fixed playback controls. See apps/web/DESIGN.md for its tokens. Mobile
+stacks reading and waveform, with a recordings drawer. Never synthesize a fake
+waveform or word timestamps. Cached, saved in Notion, and transcribed are distinct
+states. No cached receipt may authorize removal of an unconfirmed local original.

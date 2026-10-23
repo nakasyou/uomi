@@ -11,15 +11,8 @@ import { Engine } from '../core/engine'
 import type { Port, Settings } from '../core/types'
 export interface Client {
   loadLocalChunk: Engine['loadLocalChunk']
-  loadRemoteAudio: Engine['loadRemoteAudio']
-  moreRemote: Engine['moreRemote']
-  previousRemote: Engine['previousRemote']
-  searchRemote: Engine['searchRemote']
+  syncCloud: Engine['syncCloud']
   importDevice: Engine['importDevice']
-  syncNotion: Engine['syncNotion']
-  refreshNotion: Engine['refreshNotion']
-  retryTranscription: Engine['retryTranscription']
-  loadTranscript: Engine['loadTranscript']
   micGain: Engine['micGain']
   startMonitor: Engine['startMonitor']
   stopMonitor: Engine['stopMonitor']
@@ -98,8 +91,8 @@ function nativePort(): Port {
     put: native.put,
     list: native.list,
     remove: native.remove,
-    secret: (v) => native.credential('notion', v ?? null),
-    transcriberSecret: (v) => native.credential('transcriber', v ?? null),
+    secret: (v) => native.credential('sites-api', v ?? null),
+    transcriberSecret: (v) => native.credential('sites-access', v ?? null),
     notion: api,
     notionFile: async (pageId, property, url) => {
       if (!url) {
@@ -192,10 +185,6 @@ function previewClient(): Client {
   }
   return {
     loadLocalChunk: unavailable,
-    loadRemoteAudio: unavailable,
-    moreRemote: unavailable,
-    previousRemote: unavailable,
-    searchRemote: unavailable,
     getSnapshot: () => snapshot,
     subscribe: () => () => {},
     init: async () => {},
@@ -204,12 +193,9 @@ function previewClient(): Client {
     pair: unavailable,
     unpair: unavailable,
     sync: unavailable,
+    syncCloud: unavailable,
     importDevice: unavailable,
-    syncNotion: unavailable,
     clearDelivered: unavailable,
-    refreshNotion: unavailable,
-    retryTranscription: unavailable,
-    loadTranscript: unavailable,
     micGain: unavailable,
     startMonitor: unavailable,
     stopMonitor: async () => {},

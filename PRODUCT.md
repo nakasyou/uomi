@@ -4,46 +4,25 @@
 
 ## Platform
 
-android
+Android capture client, Linux Tauri capture client, responsive web recorder.
+English UI, single owner with multiple personal devices.
 
-Also ships on Linux using React Native Web inside Tauri. English UI.
+## Product purpose
+
+Preserve Omi recordings in Notion, with fast search and playback from persistent
+D1 metadata/transcript and R2 original-audio caches. Cache storage is rebuildable
+from Notion. Staged uploads are not canonical saves. Keep local originals until
+Notion persistence is confirmed. Never re-encode source Opus packets.
+
+## Surfaces
+
+Capture client owns pairing, local import, durable queue, sync, progress and secure
+Sites credentials. No library. Web Recorder owns listing, search, playback,
+transcripts, source resync and key management. Bun daemon continues transcribing
+Notion pages. No per-word transcript times or diarization are claimed.
 
 ## Stack
 
-Vite+ / Bun monorepo. apps/client is React Native Android and Tauri Linux.
-apps/transcriber is a TypeScript/Bun webhook daemon using nTranscribe and ffmpeg.
-packages/notion owns shared direct Notion API/storage contracts. Notion is the
-remote database and audio store. No S3 or Cloudflare infrastructure is required.
-
-## Product Purpose
-
-Preserve Omi recordings locally, sync directly to the user's Notion database,
-and bring their transcripts back into the audio library.
-
-## Capabilities and Constraints
-
-Devices owns import/sync, progress, pairing, microphone gain and live debug audio.
-Library owns local playback, Notion save/processing status and searchable transcript
-previews with full text on demand. Settings owns scoped Notion credentials and the
-optional transcriber webhook. Manual mode is the default without continuous
-background activity. Periodic mode uses scheduled Wi-Fi jobs; real-time mode uses
-native background activity. Imported original Opus frames are never re-encoded.
-Local audio is automatically removed only after verified Notion upload when the retention setting is enabled; users can retain copies instead. No update feature. Stable frame
-IDs and manifests preserve timing and reconciliation across clients. Notion has
-no atomic uniqueness or job-claim constraint; do not claim exactly-once processing.
-
-## Product Principles
-
-Preserve originals. Show actual storage and processing state separately. Scope
-credentials to a dedicated database. Keep the user's services under their control.
-
-## Verified sync and scale
-
-The client uses compact packet indexes and loads audio only for a bounded number
-of chunks. Notion sync is incremental with cached manifests and paged history.
-A single daemon coordinates page reservations using a local SQLite index; audio
-still uploads directly to Notion. It automatically recovers unnotified and failed
-transcription jobs. Before automatic local removal, the client verifies the saved
-manifest and audio hash; cross-client copies also require matching original
-packets and timing. Same-device audio is combined with encoded Opus silence only
-when the entire next run fits within the configured maximum.
+Bun / Vite+ monorepo; Void / React on Sites; React Native Paper for Android and
+Tauri Linux. Native binary SQLite keeps source packet identities and capture
+cursors. Notion is canonical; D1 and R2 are caches and upload staging resources.

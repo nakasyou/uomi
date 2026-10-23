@@ -95,6 +95,7 @@ function fixture(recordCount = 1) {
     post: async () => {
       posts++
       if (failPost) throw Error('HTTP 503')
+      return true
     },
   }
   return {
@@ -304,10 +305,14 @@ test('progress counts committed imports and acknowledged uploads separately', as
   await e.sync()
   for (const stage of ['import', 'upload']) {
     assert.ok(
-      updates.some((p) => JSON.stringify(p) === JSON.stringify({ stage, completed: 0, total: 1 })),
+      updates.some(
+        (p) => (p as any).stage === stage && (p as any).completed === 0 && (p as any).total === 1,
+      ),
     )
     assert.ok(
-      updates.some((p) => JSON.stringify(p) === JSON.stringify({ stage, completed: 1, total: 1 })),
+      updates.some(
+        (p) => (p as any).stage === stage && (p as any).completed === 1 && (p as any).total === 1,
+      ),
     )
   }
   unsubscribe()
@@ -547,7 +552,7 @@ test('refresh reads bounded storage pages without per-record IPC or modifying st
   })
   await engine.init()
   assert.equal(engine.getSnapshot().recordings.length, 601)
-  assert.equal(pages, 5)
+  assert.equal(pages, 4)
   assert.ok(counts.includes(256) && counts.includes(512) && counts.includes(601))
   assert.equal(engine.getSnapshot().loadingRecords, undefined)
   assert.deepEqual(f.data, before)
@@ -638,5 +643,22 @@ test('native import rejects incomplete completion rather than claiming a success
   await e.importDevice()
   assert.match(e.getSnapshot().error!, /Incomplete native import/)
   assert.equal(e.getSnapshot().lastDeviceSync, null)
+  e.dispose()
+})
+
+test('Sites staging does not acknowledge or allow deletion before Notion confirms', async () => {
+  const f = fixture()
+  const e = new Engine(f.port)
+  await e.init()
+  f.port.post = async () => false
+  await e.sync()
+  assert.equal(e.getSnapshot().recordings[0].uploaded, 0)
+  await e.clearDelivered()
+  assert.equal(e.getSnapshot().recordings.length, 1)
+  f.port.post = async () => true
+  await e.syncCloud()
+  assert.equal(e.getSnapshot().recordings[0].uploaded, 1)
+  await e.clearDelivered()
+  assert.equal(e.getSnapshot().recordings.length, 0)
   e.dispose()
 })

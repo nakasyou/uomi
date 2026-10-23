@@ -58,8 +58,9 @@ const port: Port = {
   put: (key, value) => invoke('kv', { action: 'put', key, value }),
   list: (key) => invoke('kv', { action: 'list', key, value: null }),
   remove: (key) => invoke('kv', { action: 'remove', key, value: null }),
-  secret: (value) => invoke('credential', { name: 'notion', value: value ?? null }),
-  transcriberSecret: (value) => invoke('credential', { name: 'transcriber', value: value ?? null }),
+  secret: (value) => invoke('credential', { name: 'sites-api', value: value ?? null }),
+  transcriberSecret: (value) =>
+    invoke('credential', { name: 'sites-access', value: value ?? null }),
   notion: api,
   notionFile: async (pageId, property, url) => {
     if (!url) {
@@ -99,10 +100,6 @@ const engine = new Engine(port)
 let startup: Promise<void> | undefined
 export const tauriClient: Client = {
   loadLocalChunk: (plan) => engine.loadLocalChunk(plan),
-  loadRemoteAudio: (pageId) => engine.loadRemoteAudio(pageId),
-  moreRemote: () => engine.moreRemote(),
-  previousRemote: () => engine.previousRemote(),
-  searchRemote: (query) => engine.searchRemote(query),
   getSnapshot: engine.getSnapshot,
   micGain: (level) => engine.micGain(level),
   startMonitor: (onFrame) => engine.startMonitor(onFrame),
@@ -113,12 +110,9 @@ export const tauriClient: Client = {
   pair: (device) => engine.pair(device),
   unpair: () => engine.unpair(),
   sync: () => engine.sync('manual'),
+  syncCloud: () => engine.syncCloud(),
   importDevice: () => engine.importDevice(),
-  syncNotion: () => engine.syncNotion(),
   clearDelivered: () => engine.clearDelivered(),
-  refreshNotion: () => engine.refreshNotion(),
-  retryTranscription: (pageId) => engine.retryTranscription(pageId),
-  loadTranscript: (pageId) => engine.loadTranscript(pageId),
   init: () =>
     (startup ??= (async () => {
       const periodic = await invoke<boolean>('is_periodic')

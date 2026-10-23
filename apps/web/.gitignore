@@ -1,0 +1,7 @@
+dist/
+site.tar.gz
+.void/
+.wrangler/
+.void-wrangler.jsonc
+.env
+.dev.vars

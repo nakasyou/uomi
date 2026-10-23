@@ -176,6 +176,7 @@ export function silenceProperties(manifest: AudioManifest): Record<string, unkno
 }
 export const schema = {
   Name: { title: {} },
+  Starred: { checkbox: {} },
   'Recording ID': { rich_text: {} },
   Device: { rich_text: {} },
   'Recorded at': { date: {} },

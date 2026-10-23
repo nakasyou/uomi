@@ -7,20 +7,24 @@
   ],
   "type": "module",
   "scripts": {
-    "dev": "bun run --cwd apps/client dev",
+    "dev": "node apps/web/scripts/dev.mjs",
     "start": "bun run --cwd apps/client start",
     "android": "bun run --cwd apps/client android",
     "linux": "bun run --cwd apps/client linux",
     "linux:package": "bun run --cwd apps/client linux:package",
     "build:web": "bun run --cwd apps/client build:web",
     "build": "bun run build:web && bun run --cwd apps/transcriber build",
-    "test": "bun run --cwd apps/client test && bun test packages/audio/tests packages/notion/tests apps/transcriber/tests",
-    "typecheck": "tsc --noEmit -p apps/client && tsc --noEmit -p packages/notion && tsc --noEmit -p apps/transcriber && tsc --noEmit -p packages/audio",
+    "test": "node --import tsx --test apps/client/tests/*.test.ts apps/web/tests/*.test.js && bun test packages/audio/tests packages/notion/tests apps/transcriber/tests",
+    "typecheck": "tsc --noEmit -p apps/client && tsc --noEmit -p packages/notion && tsc --noEmit -p apps/transcriber && tsc --noEmit -p packages/audio && tsc --noEmit -p apps/web",
     "check": "vp check && bun run typecheck && bun run test && bun run build",
     "format": "vp fmt . --write",
     "transcriber": "bun run --cwd apps/transcriber start",
     "linux:check": "cargo check --manifest-path apps/client/src-tauri/Cargo.toml",
-    "android:release": "bun run --cwd apps/client android:release"
+    "android:release": "bun run --cwd apps/client android:release",
+    "dev:client": "bun run --cwd apps/client dev",
+    "build:viewer": "bun run --cwd apps/web build",
+    "test:web": "node --import tsx --test apps/web/tests/*.test.js",
+    "build:site": "node scripts/build-sites.mjs"
   },
   "devDependencies": {
     "@types/bun": "^1.4.2",

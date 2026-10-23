@@ -235,7 +235,7 @@ async fn lookup_credential(name: &str) -> Result<String> {
 async fn secret(state: State<'_,Arc<Backend>>,value: Option<String>) -> Result<String> { credential(state,"webhook".into(), value).await }
 #[tauri::command]
 async fn credential(state: State<'_,Arc<Backend>>,name: String, value: Option<String>) -> Result<String> {
-    if !["notion", "transcriber", "webhook"].contains(&name.as_str()) { return Err("Unknown credential".into()); }
+    if !["notion", "transcriber", "webhook", "sites-api", "sites-access"].contains(&name.as_str()) { return Err("Unknown credential".into()); }
     let Some(value)=value else {return stored_credential(&state,&name).await};
     if value.contains(['\n','\r']) {return Err("The secret cannot contain line breaks.".into());}
     state.credentials.write(&name,&value,||async {
@@ -617,12 +617,12 @@ async fn post(
     body: String,
     compression: String,
     id: String,
-) -> Result<()> {
+) -> Result<bool> {
     let url = reqwest::Url::parse(&endpoint).map_err(error)?;
     if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
         return Err("Use an HTTPS webhook URL without credentials.".into());
     }
-    let secret = stored_credential(&state,"webhook").await?;
+    let secret = stored_credential(&state,"sites-api").await?;
     if secret.is_empty() {
         return Err("Set your webhook secret in Settings.".into());
     }
@@ -648,6 +648,8 @@ async fn post(
         .header("Idempotency-Key", id)
         .header("X-Uomi-Schema", "1")
         .body(bytes);
+    let access = stored_credential(&state,"sites-access").await?;
+    if !access.is_empty() { request = request.header("OAI-Sites-Authorization", format!("Bearer {access}")); }
     if compression != "none" {
         request = request.header("Content-Encoding", compression);
     }
@@ -661,7 +663,8 @@ async fn post(
             response.status().as_u16()
         ));
     }
-    Ok(())
+    let receipt: Value = response.json().await.map_err(error)?;
+    Ok(receipt["notion_saved"].as_bool().unwrap_or(false))
 }
 #[tauri::command]
 fn smoke_ready(app: tauri::AppHandle) {
