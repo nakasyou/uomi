@@ -8,7 +8,7 @@ import { ApiWorker, errorDetail } from './api-worker'
 
 if (process.argv.includes('--help')) {
   console.log(
-    'Uomi API transcriber\nUOMI_API_URL and UOMI_CLIENT_SECRET are required.\nTRANSCRIBER_PROVIDER=chrome-recognition TRANSCRIBER_CONCURRENCY=2 TRANSCRIBER_SPLIT_SECONDS=600\nPolls durable API jobs, renews leases and reports progress/errors. Notion credentials and inbound webhooks are no longer used.\nRequires ffmpeg on PATH.',
+    'Uomi API transcriber\nUOMI_API_URL and UOMI_CLIENT_SECRET are required.\nTRANSCRIBER_PROVIDER=chrome-recognition TRANSCRIBER_CONCURRENCY=2 TRANSCRIBER_SPLIT_SECONDS=600 TRANSCRIBER_CODEX_SPLIT_SECONDS=300\nPolls durable API jobs, renews leases and reports progress/errors. Notion credentials and inbound webhooks are no longer used.\nRequires ffmpeg on PATH.',
   )
   process.exit(0)
 }
@@ -49,6 +49,7 @@ await acquireLock()
 const wait = Number(process.env.REQUEST_WAIT_SECONDS ?? 10)
 const port = Number(process.env.PORT ?? 8787)
 const splitSeconds = Number(process.env.TRANSCRIBER_SPLIT_SECONDS ?? 600)
+const codexSplitSeconds = Number(process.env.TRANSCRIBER_CODEX_SPLIT_SECONDS ?? 300)
 if (
   !Number.isFinite(wait) ||
   wait < 10 ||
@@ -57,11 +58,14 @@ if (
   port > 65535 ||
   !Number.isInteger(splitSeconds) ||
   splitSeconds < 1 ||
-  splitSeconds > 1800
+  splitSeconds > 1800 ||
+  !Number.isInteger(codexSplitSeconds) ||
+  codexSplitSeconds < 1 ||
+  codexSplitSeconds > 1800
 ) {
   await rm(lockPath)
   throw Error(
-    'Invalid PORT, REQUEST_WAIT_SECONDS (minimum 10), or TRANSCRIBER_SPLIT_SECONDS (1–1800).',
+    'Invalid PORT, REQUEST_WAIT_SECONDS (minimum 10), or provider split seconds (TRANSCRIBER_SPLIT_SECONDS / TRANSCRIBER_CODEX_SPLIT_SECONDS, 1–1800).',
   )
 }
 const concurrency = Number(process.env.TRANSCRIBER_CONCURRENCY ?? 2)
@@ -89,6 +93,7 @@ const daemon = new ApiWorker({
   requestWaitMs: wait * 1000,
   timeoutMs: 300000,
   splitSeconds,
+  codexSplitSeconds,
 })
 let server: ReturnType<typeof Bun.serve>
 try {

@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { ApiWorker, saveCheckpoint, type WorkerConfig, type Job } from '../src/api-worker'
 
-async function fixture() {
+async function fixture(durationSeconds = 0.1) {
   const dir = await mkdtemp(join(tmpdir(), 'uomi-api-test-'))
   const path = join(dir, 'source.ogg')
   const process = Bun.spawn(
@@ -16,7 +16,7 @@ async function fixture() {
       '-f',
       'lavfi',
       '-i',
-      'sine=frequency=440:duration=0.1',
+      `sine=frequency=440:duration=${durationSeconds}`,
       '-c:a',
       'libopus',
       path,
@@ -30,7 +30,7 @@ async function fixture() {
     id: 'recording',
     deviceId: 'test',
     capturedAt: null,
-    durationMs: 100,
+    durationMs: durationSeconds * 1000,
     sha256: createHash('sha256').update(audio).digest('hex'),
     frameIds: ['frame'],
     timing: [],
@@ -58,7 +58,7 @@ async function fixture() {
     attempt: 1,
     audio_url: '/audio',
     manifest_url: '/manifest',
-    duration_ms: 100,
+    duration_ms: durationSeconds * 1000,
   }
   return { dir, audio, manifest, config, job }
 }
@@ -361,3 +361,46 @@ test('concurrent lease checkpoints stay atomic, cleanup intermediates, and cance
     await rm(directory, { recursive: true, force: true })
   }
 })
+
+test('Google uses ten-minute chunks, Codex five-minute chunks, with matching original-timeline offsets', async () => {
+  const f = await fixture(301)
+  const completed: { text: string; segments: { start_ms: number; end_ms: number }[] }[] = []
+  const recognized: { provider: string; splitSeconds: number }[] = []
+  let claims = 0
+  const worker = new ApiWorker(
+    f.config,
+    async (_path, options) => {
+      recognized.push({ provider: options!.provider!, splitSeconds: options!.splitSeconds! })
+      return { text: 'test', segments: [{ start_ms: 0, end_ms: 500, text: 'test' }] }
+    },
+    (async (url: any, options: any) => {
+      const path = new URL(url).pathname
+      if (path === '/api/jobs/claim')
+        return Response.json({
+          jobs: claims++ ? [] : [f.job, { ...f.job, id: 'job2', mode: 'detailed' }],
+        })
+      if (path === '/audio') return new Response(f.audio)
+      if (path === '/manifest') return Response.json(f.manifest)
+      if (path.endsWith('/complete')) completed.push(JSON.parse(options.body))
+      return Response.json({ saved: true })
+    }) as typeof fetch,
+  )
+  try {
+    expect(worker.status.splitSeconds).toEqual({ google: 600, codex: 300 })
+    await worker.poll()
+    await worker.close()
+    expect(recognized.filter((r) => r.provider === 'chrome-recognizetion')).toEqual([
+      { provider: 'chrome-recognizetion', splitSeconds: 600 },
+    ])
+    expect(recognized.filter((r) => r.provider === 'codex')).toEqual([
+      { provider: 'codex', splitSeconds: 300 },
+      { provider: 'codex', splitSeconds: 300 },
+    ])
+    expect(
+      completed.map((r) => r.segments.map((s) => s.start_ms)).sort((a, b) => a.length - b.length),
+    ).toEqual([[0], [0, 300000]])
+  } finally {
+    await worker.close()
+    await rm(f.dir, { recursive: true, force: true })
+  }
+}, 30000)

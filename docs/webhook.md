@@ -5,14 +5,22 @@ Notion is not a queue, a source of transcription input, or a completion checkpoi
 
 ## Configuration
 
-Set `SITES_URL` to the existing private Site origin, `SITES_ACCESS_TOKEN` to that
+Set `UOMI_API_URL` to the existing private Site origin, `SITES_ACCESS_TOKEN` to that
 Site's service token, and `UOMI_CLIENT_SECRET` to a key created in web device
 settings, or a dedicated worker secret configured as `UOMI_WORKER_SECRET` in
 Sites. The legacy `UOMI_WEBHOOK_SECRET` is accepted only when no dedicated worker
 secret is configured. Worker credentials cannot upload, edit, or create client keys.
-Requests use `X-OpenAI-Site-Access-Token` and `X-Uomi-Secret`.
+Requests use `OAI-Sites-Authorization: Bearer <token>` and `X-Uomi-Secret`.
 Keep these credentials on the daemon host; never commit `.env` or embed provider
 credentials into web assets. ffmpeg and provider dependencies run on that host.
+
+Google uses `TRANSCRIBER_SPLIT_SECONDS=600` (10 minutes); Codex uses
+`TRANSCRIBER_CODEX_SPLIT_SECONDS=300` (5 minutes). Both settings accept 1–1800
+seconds. Detailed jobs always use Codex's duration, even when standard jobs use
+Google. These are fixed recording-time cuts, including silence; source recordings
+are never joined. `/health` reports both effective durations under `splitSeconds`.
+Checkpoints include the selected provider's duration so changing boundaries cannot
+reuse incompatible chunk results. Segment offsets use the same selected duration.
 
 ## Protocol
 

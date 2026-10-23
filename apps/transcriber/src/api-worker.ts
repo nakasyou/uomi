@@ -26,6 +26,7 @@ export interface WorkerConfig {
   language: string
   concurrency: number
   splitSeconds: number
+  codexSplitSeconds?: number
   requestWaitMs: number
   timeoutMs: number
   pollMs: number
@@ -79,6 +80,10 @@ export class ApiWorker {
     return {
       active: this.active.size,
       concurrency: this.config.concurrency,
+      splitSeconds: {
+        google: this.config.splitSeconds,
+        codex: this.config.codexSplitSeconds ?? 300,
+      },
       lastPollAt: this.lastPollAt,
       error: this.lastError,
     }
@@ -255,6 +260,8 @@ export class ApiWorker {
       if (createHash('sha256').update(audio).digest('hex') !== manifest.sha256)
         throw Error('Audio checksum mismatch.')
       const provider = job.mode === 'detailed' ? 'codex' : this.config.provider
+      const splitSeconds =
+        provider === 'codex' ? (this.config.codexSplitSeconds ?? 300) : this.config.splitSeconds
       const fingerprint = createHash('sha256')
         .update(
           JSON.stringify([
@@ -263,7 +270,7 @@ export class ApiWorker {
             manifest.sha256,
             provider,
             this.config.language,
-            this.config.splitSeconds,
+            splitSeconds,
           ]),
         )
         .digest('hex')
@@ -306,7 +313,7 @@ export class ApiWorker {
           '-f',
           'segment',
           '-segment_time',
-          String(this.config.splitSeconds),
+          String(splitSeconds),
           '-reset_timestamps',
           '1',
           join(directory, 'chunk-%06d.flac'),
@@ -342,7 +349,7 @@ export class ApiWorker {
           provider,
           language: this.config.language,
           timeoutMs: this.config.timeoutMs,
-          splitSeconds: this.config.splitSeconds,
+          splitSeconds,
         })
         controller.signal.throwIfAborted()
         chunks.push(result)
@@ -355,8 +362,8 @@ export class ApiWorker {
       const segments = chunks.flatMap((chunk, index) =>
         Array.isArray(chunk.segments)
           ? chunk.segments.map((segment: any) => ({
-              start_ms: index * this.config.splitSeconds * 1000 + segment.start_ms,
-              end_ms: index * this.config.splitSeconds * 1000 + segment.end_ms,
+              start_ms: index * splitSeconds * 1000 + segment.start_ms,
+              end_ms: index * splitSeconds * 1000 + segment.end_ms,
               text: segment.text,
               speaker: segment.speaker ?? null,
             }))
