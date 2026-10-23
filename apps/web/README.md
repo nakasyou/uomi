@@ -120,3 +120,14 @@ Notion's canonical transcript and commits normalized text/FTS before returning
 `saved:true`; it does not wait for another full audio resync. Duplicate callbacks
 are idempotent. The original audio cache and source range claims are preserved.
 Failed completion delivery does not mark successful transcription as Failed.
+
+## Detailed recording transcription
+
+Standard transcription defaults to Chrome. The recording's Start detailed transcription
+button queues a separate Codex result in Notion. GET/POST
+`/api/recordings/:id/detailed-transcription` are owner-only. Requests are durable
+when the daemon webhook is unavailable, and recover on its next scan. The viewer
+polls active jobs without reloading audio. Both transcript versions remain available;
+search continues to use the standard transcript. Detailed completion callbacks refresh
+the corresponding cache fields without replacing the standard result. Apply appended
+migration `0004_detailed_transcription.sql` with this release.

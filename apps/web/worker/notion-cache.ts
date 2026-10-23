@@ -28,6 +28,27 @@ export async function attachment(url: string, max: number) {
   }
   return Buffer.concat(parts)
 }
+export async function readDetailedTranscript(store: NotionStore, page: any) {
+  const p = page.properties
+  let transcript = text(p['Detailed preview']?.rich_text)
+  if (p['Detailed transcript']?.files?.[0]?.file?.url) {
+    const data = JSON.parse(
+      (await attachment(store.fileUrl(page, 'Detailed transcript'), 1024 * 1024)).toString(),
+    )
+    if (
+      data.schema !== 'uomi.transcript.v1' ||
+      typeof data.text !== 'string' ||
+      data.provider !== 'codex'
+    )
+      throw Error('Invalid detailed transcript attachment')
+    transcript = data.text
+  }
+  return {
+    detailed_status: p['Detailed status']?.select?.name ?? null,
+    detailed_text: transcript,
+    detailed_error: text(p['Detailed error']?.rich_text),
+  }
+}
 export async function cachePage(env: any, page: any) {
   const store = new NotionStore(httpTransport(env.NOTION_TOKEN), env.NOTION_DATA_SOURCE_ID),
     p = page.properties,
@@ -43,7 +64,9 @@ export async function cachePage(env: any, page: any) {
     return { id, skipped: 'pending-source-write' }
   if (page.archived || page.in_trash) {
     await env.DB.batch([
-      env.DB.prepare('DELETE FROM source_ranges WHERE recording_id=(SELECT rid FROM recordings WHERE id=?)').bind(id),
+      env.DB.prepare(
+        'DELETE FROM source_ranges WHERE recording_id=(SELECT rid FROM recordings WHERE id=?)',
+      ).bind(id),
       env.DB.prepare('DELETE FROM recordings WHERE id=?').bind(id),
     ])
     return { id, removed: true }
@@ -53,7 +76,7 @@ export async function cachePage(env: any, page: any) {
     old.notion_edited === page.last_edited_time &&
     old.audio_key &&
     (await env.BUCKET.head(old.audio_key)) &&
-    (old.manifest_gzip || (old.manifest_key && await env.BUCKET.head(old.manifest_key)))
+    (old.manifest_gzip || (old.manifest_key && (await env.BUCKET.head(old.manifest_key))))
   )
     return { id, unchanged: true }
   let audioKey: string | null = null,
@@ -87,6 +110,7 @@ export async function cachePage(env: any, page: any) {
       throw Error('Invalid transcript attachment')
     transcript = data.text
   }
+  const detailed = await readDetailedTranscript(store, page)
   const start = p.recorded_at_ms?.number ?? Date.parse(p['Recorded at']?.date?.start),
     duration = (p['Duration (s)']?.number ?? 0) * 1000,
     finish = p.record_finished_at_ms?.number ?? start + duration,
@@ -115,15 +139,16 @@ export async function cachePage(env: any, page: any) {
       page.last_edited_time,
       normalizeSearch(transcript),
     ),
-    env.DB.prepare('DELETE FROM source_ranges WHERE recording_id=(SELECT rid FROM recordings WHERE id=?)').bind(id),
+    env.DB.prepare(
+      'UPDATE recordings SET detailed_status=?,detailed_text=?,detailed_error=? WHERE id=?',
+    ).bind(detailed.detailed_status, detailed.detailed_text, detailed.detailed_error, id),
+    env.DB.prepare(
+      'DELETE FROM source_ranges WHERE recording_id=(SELECT rid FROM recordings WHERE id=?)',
+    ).bind(id),
     ...sourceSpans.map((range) =>
-      env.DB.prepare('INSERT INTO source_ranges VALUES(?,?,?,?,(SELECT rid FROM recordings WHERE id=?))').bind(
-        text(p.Device?.rich_text),
-        range.prefix,
-        range.start,
-        range.end,
-        id,
-      ),
+      env.DB.prepare(
+        'INSERT INTO source_ranges VALUES(?,?,?,?,(SELECT rid FROM recordings WHERE id=?))',
+      ).bind(text(p.Device?.rich_text), range.prefix, range.start, range.end, id),
     ),
   ])
   return { id, cached: true }

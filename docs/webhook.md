@@ -61,3 +61,26 @@ python3 receiver/server.py --database /path/to/audio.sqlite
 Place an HTTPS reverse proxy in front of `127.0.0.1:8787`, preserving `Content-Encoding`, `Idempotency-Key` and your secret header. Configure the app with `https://your-domain/audio`. Alternatively pass `--cert fullchain.pem --key privkey.pem` for direct TLS. Configure a matching `--secret-header` if changed in the app. Do not let an HTTP framework decompress the body twice.
 
 The receiver stores length-delimited individual Opus packets as BLOBs with metadata; these are not standalone `.opus` files. A downstream consumer can decode individual packets with libopus or mux them into an Ogg container. Unknown device-time recordings remain explicitly untimed until your application applies its own time-reconciliation policy.
+
+## Transcriber daemon webhook
+
+This is separate from the capture upload webhook above. `POST /webhook` accepts
+`Authorization: Bearer <UOMI_WEBHOOK_SECRET>` and JSON
+`{"pageId":"<Notion page UUID>","mode":"standard|detailed"}`. Omitting `mode`
+keeps standard behavior. Standard jobs use `TRANSCRIBER_PROVIDER`, defaulting to
+`chrome-recognition`. Detailed jobs always use Codex and operate on the complete
+recording (internally split into checkpointed requests).
+
+Detailed requests may target a recording whose standard Status is Completed.
+Audio and Manifest must already be attached in the configured Notion source.
+The daemon durably marks Detailed status Pending before acknowledging a new job.
+A 202 response with `accepted:true` means queued, not finished. Repeated in-flight
+notifications return `accepted:false`; completed jobs additionally return
+`completed:true` and are not rerun. Unknown modes or invalid pages return 400;
+missing/incorrect bearer credentials return 401. No audio is sent in this request.
+
+Detailed transcript/preview/status/error/attempts/retry-after properties are
+separate from the standard properties. Automatic recovery scans both kinds at
+startup and every 60 seconds. Failed jobs retain independent backoff and checkpoint
+files. The Web Recorder writes the same durable request to Notion and optionally
+sends this webhook as a wake-up. Closing the browser does not cancel the job.

@@ -8,6 +8,7 @@ import { NotionStore, httpTransport, type AudioManifest } from '@uomi/notion'
 import mcp from './index.js'
 import { ranges } from './source-ranges.ts'
 export { ranges } from './source-ranges.ts'
+import { detailedTranscription } from './detailed-transcription.ts'
 import { resync, cachePage } from './notion-cache.ts'
 
 export const json = (value: unknown, status = 200) =>
@@ -425,7 +426,7 @@ async function api(request: Request, env: any, ctx: any, role: string) {
     })
   }
   const match = path.match(
-    /^\/api\/recordings\/([a-zA-Z0-9-]+)(?:\/(audio|backup|transcript|resync|transcribe))?$/,
+    /^\/api\/recordings\/([a-zA-Z0-9-]+)(?:\/(audio|backup|transcript|resync|transcribe|detailed-transcription))?$/,
   )
   if (match) {
     const [, id, action] = match
@@ -435,6 +436,10 @@ async function api(request: Request, env: any, ctx: any, role: string) {
       if (!env.TRANSCRIBER_WEBHOOK_URL || !env.UOMI_WEBHOOK_SECRET) return json({error:'Configure TRANSCRIBER_WEBHOOK_URL and UOMI_WEBHOOK_SECRET in Sites'},503)
       ctx.waitUntil(notifyTranscriber(env,id,true))
       return json({accepted:true},202)
+    }
+    if (action === 'detailed-transcription' && ['GET', 'POST'].includes(method)) {
+      if (role !== 'owner') return json({ error: 'Owner access required' }, 403)
+      return json(await detailedTranscription(env, ctx, row, method === 'POST'), method === 'POST' ? 202 : 200)
     }
     if (action === 'resync' && method === 'POST') {
       const store = new NotionStore(httpTransport(env.NOTION_TOKEN), env.NOTION_DATA_SOURCE_ID)
@@ -520,6 +525,9 @@ async function api(request: Request, env: any, ctx: any, role: string) {
         duration_ms: row.duration_ms ?? row.finished_at - row.recorded_at,
         status: row.status,
         text: row.text,
+        detailed_status: row.detailed_status,
+        detailed_text: row.detailed_text,
+        detailed_error: row.detailed_error,
         starred: !!row.starred,
         has_audio: !!row.audio_key,
         backup_step: row.backup_step,
@@ -574,7 +582,8 @@ export default {
       if (path === '/api/transcriber/completed' && request.method === 'POST') {
         if (!(await webhookAuthorized(request,env.UOMI_WEBHOOK_SECRET))) return json({error:'Authentication required'},401)
         const data = await body(request,4096)
-        return json(await refreshTranscript(env,data.pageId))
+        if (data.mode !== undefined && !['standard', 'detailed'].includes(data.mode)) throw Error('Invalid transcription mode')
+        return json(await refreshTranscript(env,data.pageId,data.mode))
       }
       if (path === '/health') return json({ ok: true })
       if (path === '/mcp') {

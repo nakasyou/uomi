@@ -6,7 +6,13 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { transcribe, type Provider, type Transcription } from '@nakasyou/ntranscribe'
 import { ReservationCoordinator } from './coordinator'
-import { NotionStore, validateManifest, type AudioManifest } from '@uomi/notion'
+import {
+  NotionStore,
+  validateManifest,
+  type AudioManifest,
+  transcriptionFields,
+  type TranscriptionMode,
+} from '@uomi/notion'
 
 export interface Config {
   secret: string
@@ -32,7 +38,7 @@ export function pageId(value: unknown): string {
   return value.replace(/-/g, '').toLowerCase()
 }
 export class Daemon {
-  private jobs = new Set<string>()
+  private jobs = new Map<string, { id: string; mode: TranscriptionMode }>()
   private running = false
   private closing = false
   private drainPromise: Promise<void> = Promise.resolve()
@@ -45,34 +51,60 @@ export class Daemon {
     readonly store: NotionStore,
     readonly config: Config,
     private recognize: typeof transcribe = transcribe,
-  ) { this.callbacks = new CompletionOutbox(join(config.stateDir,'completion-outbox'),config.sitesCallback,config.secret) }
+  ) {
+    this.callbacks = new CompletionOutbox(
+      join(config.stateDir, 'completion-outbox'),
+      config.sitesCallback,
+      config.secret,
+    )
+  }
   async reserve(value: unknown): Promise<{ pageId: string }> {
     if (this.closing) throw Error('Daemon is shutting down.')
     this.coordinator ??= new ReservationCoordinator(this.store, this.config.stateDir)
     return this.coordinator.reserve(value)
   }
-  async accept(value: unknown): Promise<{ accepted: boolean; completed?: boolean }> {
+  async accept(
+    value: unknown,
+    mode: TranscriptionMode = 'standard',
+  ): Promise<{ accepted: boolean; completed?: boolean }> {
     if (this.closing) throw Error('Daemon is shutting down.')
+    if (!['standard', 'detailed'].includes(mode)) throw Error('Invalid transcription mode.')
+    const fields = transcriptionFields(mode)
     const id = pageId(value)
-    if (this.jobs.has(id)) return { accepted: false }
+    const key = `${id}:${mode}`
+    if (this.jobs.has(key)) return { accepted: false }
     if (this.jobs.size >= this.queueLimit)
       throw Error('Transcriber queue is full. Notion will be polled again.')
     const page = await this.store.page(id)
     if (!(await this.store.owns(page)))
       throw Error('Page does not belong to the configured Uomi database.')
-    const status = page.properties.Status?.select?.name
+    const status = page.properties[fields.status]?.select?.name
+    if (page.archived || page.in_trash) throw Error('Page was removed.')
     if (status === 'Completed') {
-      await this.callbacks.enqueue(id)
+      await this.callbacks.enqueue(id, mode)
       void this.callbacks.flush(1).catch(() => console.error('Completion callback recovery paused'))
       return { accepted: false, completed: true }
     }
-    if (!['Pending', 'Failed', 'Processing'].includes(status))
+    if (page.properties.Status?.select?.name === 'Uploading')
+      throw Error('Audio has not finished uploading.')
+    if (mode === 'standard' && !['Pending', 'Failed', 'Processing'].includes(status))
       throw Error('Audio has not finished uploading.')
     // Validate attachments before acknowledging. Notion remains the durable job record.
     this.store.fileUrl(page, 'Audio')
     this.store.fileUrl(page, 'Manifest')
-    if (this.jobs.has(id)) return { accepted: false }
-    this.jobs.add(id)
+    if (this.jobs.has(key)) return { accepted: false }
+    if (mode === 'detailed' && !['Pending', 'Processing'].includes(status))
+      await this.store.update(id, {
+        [fields.status]: { select: { name: 'Pending' } },
+        [fields.error]: { rich_text: [] },
+        [fields.attempts]: { number: 0 },
+        [fields.retry]: { date: null },
+      })
+    if (this.jobs.has(key)) return { accepted: false }
+    if (this.closing) throw Error('Daemon is shutting down.')
+    if (this.jobs.size >= this.queueLimit)
+      throw Error('Transcriber queue is full. Notion will be polled again.')
+    this.jobs.set(key, { id, mode })
     if (!this.running) {
       this.running = true
       this.drainPromise = this.drain()
@@ -85,37 +117,46 @@ export class Daemon {
     let accepted = 0
     try {
       await this.callbacks.flush()
-      const due = {
-        // queryPages adds an outer AND for pagination windows. Keep this OR
-        // flat to stay within Notion's two compound-filter nesting levels.
-        // Failed-job retry dates are checked below before admission.
-        or: ['Pending', 'Processing', 'Failed'].map((name) => ({
-          property: 'Status',
-          select: { equals: name },
-        })),
-      }
-      for await (const pages of this.store.queryPages(due))
-        for (const page of pages) {
-          if (this.jobs.size >= this.queueLimit) return accepted
-          const id = pageId(page.id)
-          if (
-            this.jobs.has(id) ||
-            !page.properties.Audio?.files?.length ||
-            !page.properties.Manifest?.files?.length
-          )
-            continue
-          const status = page.properties.Status?.select?.name
-          if (status === 'Failed') {
-            const retry = Date.parse(page.properties['Retry after']?.date?.start ?? '')
-            if (Number.isFinite(retry) && retry > Date.now()) continue
-          }
-          this.jobs.add(id)
-          accepted++
-          if (!this.running) {
-            this.running = true
-            this.drainPromise = this.drain()
-          }
+      // Explicit recording requests take priority over the automatic backlog.
+      for (const mode of ['detailed', 'standard'] as const) {
+        const fields = transcriptionFields(mode)
+        const due = {
+          // queryPages adds an outer AND for pagination windows. Keep this OR
+          // flat to stay within Notion's two compound-filter nesting levels.
+          // Failed-job retry dates are checked below before admission.
+          or: ['Pending', 'Processing', 'Failed'].map((name) => ({
+            property: fields.status,
+            select: { equals: name },
+          })),
         }
+        for await (const pages of this.store.queryPages(due))
+          for (const page of pages) {
+            if (this.jobs.size >= this.queueLimit) return accepted
+            const id = pageId(page.id)
+            const key = `${id}:${mode}`
+            if (
+              this.jobs.has(key) ||
+              page.archived ||
+              page.in_trash ||
+              page.properties.Status?.select?.name === 'Uploading' ||
+              !page.properties.Audio?.files?.length ||
+              !page.properties.Manifest?.files?.length
+            )
+              continue
+            const status = page.properties[fields.status]?.select?.name
+            if (!['Pending', 'Processing', 'Failed'].includes(status)) continue
+            if (status === 'Failed') {
+              const retry = Date.parse(page.properties[fields.retry]?.date?.start ?? '')
+              if (Number.isFinite(retry) && retry > Date.now()) continue
+            }
+            this.jobs.set(key, { id, mode })
+            accepted++
+            if (!this.running) {
+              this.running = true
+              this.drainPromise = this.drain()
+            }
+          }
+      }
       return accepted
     } finally {
       this.recovering = false
@@ -153,23 +194,26 @@ export class Daemon {
   }
   private async drain() {
     try {
-      for (const id of this.jobs) {
+      for (const [key, { id, mode }] of this.jobs) {
+        const fields = transcriptionFields(mode)
         try {
-          await this.process(id)
-          await this.callbacks.flush(1).catch(() => console.error('Completion outbox unavailable; retry on recovery'))
-          console.log(JSON.stringify({ pageId: id, status: 'Completed' }))
+          await this.process(id, mode)
+          await this.callbacks
+            .flush(1)
+            .catch(() => console.error('Completion outbox unavailable; retry on recovery'))
+          console.log(JSON.stringify({ pageId: id, mode, status: 'Completed' }))
         } catch {
           // Provider errors may include sensitive remote metadata. Keep public diagnostics bounded.
           try {
             const page = await this.store.page(id)
-            const attempts = (page.properties.Attempts?.number ?? 0) + 1
+            const attempts = (page.properties[fields.attempts]?.number ?? 0) + 1
             const retry =
               Date.now() + Math.min(6 * 3600000, 300000 * 2 ** Math.min(attempts - 1, 7))
             await this.store.update(id, {
-              Status: { select: { name: 'Failed' } },
-              Attempts: { number: attempts },
-              'Retry after': { date: { start: new Date(retry).toISOString() } },
-              Error: {
+              [fields.status]: { select: { name: 'Failed' } },
+              [fields.attempts]: { number: attempts },
+              [fields.retry]: { date: { start: new Date(retry).toISOString() } },
+              [fields.error]: {
                 rich_text: [
                   {
                     type: 'text',
@@ -185,27 +229,34 @@ export class Daemon {
             console.error(
               JSON.stringify({
                 pageId: id,
+                mode,
                 status: 'Failed',
                 error: 'Could not update Notion; retry notification after restoring connectivity.',
               }),
             )
           }
-          console.error(JSON.stringify({ pageId: id, status: 'Failed' }))
+          console.error(JSON.stringify({ pageId: id, mode, status: 'Failed' }))
         } finally {
-          this.jobs.delete(id)
+          this.jobs.delete(key)
         }
       }
     } finally {
       this.running = false
     }
   }
-  private async process(id: string) {
+  private async process(id: string, mode: TranscriptionMode = 'standard') {
+    const fields = transcriptionFields(mode)
+    const provider = mode === 'detailed' ? 'codex' : this.config.provider
     const page = await this.store.page(id)
-    if (page.properties.Status?.select?.name === 'Completed') return
+    if (page.properties[fields.status]?.select?.name === 'Completed') return
+    if (page.archived || page.in_trash) throw Error('Page was removed.')
     if (!(await this.store.owns(page))) throw Error('Wrong Notion database.')
-    // Persist before committing Completed, so a crash after Notion save cannot lose the callback.
-    await this.callbacks.enqueue(pageId(id))
-    await this.store.status(id, 'Processing')
+    // Persist before Completed, so a crash cannot lose either result notification.
+    await this.callbacks.enqueue(pageId(id), mode)
+    await this.store.update(id, {
+      [fields.status]: { select: { name: 'Processing' } },
+      [fields.error]: { rich_text: [] },
+    })
     const manifest: AudioManifest = JSON.parse(
       Buffer.from(await this.attachment(page, 'Manifest')).toString(),
     )
@@ -229,7 +280,12 @@ export class Daemon {
         (a, b) =>
           (a.created_time ?? '').localeCompare(b.created_time ?? '') || a.id.localeCompare(b.id),
       )[0]
-    if (canonical && pageId(canonical.id) !== pageId(page.id)) {
+    if (
+      mode === 'standard' &&
+      !page.properties['Detailed status']?.select?.name &&
+      canonical &&
+      pageId(canonical.id) !== pageId(page.id)
+    ) {
       const saved: AudioManifest = JSON.parse(
         Buffer.from(await this.attachment(canonical, 'Manifest')).toString(),
       )
@@ -244,13 +300,16 @@ export class Daemon {
         await this.process(canonical.id)
       if ((await this.store.page(canonical.id)).properties.Status?.select?.name !== 'Completed')
         throw Error('Canonical transcription is not complete.')
-      await this.store.archive(page.id)
       await this.callbacks.enqueue(pageId(canonical.id))
       await this.callbacks.discard(pageId(page.id))
+      await this.store.archive(page.id)
       return
     }
     await mkdir(this.config.stateDir, { recursive: true, mode: 0o700 })
-    const checkpoint = join(this.config.stateDir, `${id}.json`)
+    const checkpoint = join(
+      this.config.stateDir,
+      `${id}${mode === 'detailed' ? '.detailed' : ''}.json`,
+    )
     let previous: {
       splitSeconds?: number
       inputTransform?: string
@@ -262,7 +321,7 @@ export class Daemon {
       splitSeconds: this.config.splitSeconds ?? 600,
       inputTransform: manifest.gaps?.length ? 'synthetic-gaps-removed-v1' : 'original-v1',
       audioHash: manifest.sha256,
-      provider: this.config.provider,
+      provider,
       language: this.config.language,
       chunks: [],
     }
@@ -272,7 +331,7 @@ export class Daemon {
         (saved.inputTransform === previous.inputTransform ||
           (!saved.inputTransform && !manifest.gaps?.length)) &&
         saved.audioHash === manifest.sha256 &&
-        saved.provider === this.config.provider &&
+        saved.provider === provider &&
         saved.language === this.config.language &&
         (saved.splitSeconds ?? 600) === previous.splitSeconds
       )
@@ -326,7 +385,7 @@ export class Daemon {
         try {
           // Disable the provider's separate default boundary by using our checkpointed split.
           const result = await this.recognize(join(directory, files[i]), {
-            provider: this.config.provider,
+            provider,
             language: this.config.language,
             timeoutMs: this.config.timeoutMs,
             splitSeconds: this.config.splitSeconds ?? 600,
@@ -362,7 +421,8 @@ export class Daemon {
           .map((chunk) => chunk.text.trim())
           .filter(Boolean)
           .join('\n'),
-        this.config.provider,
+        provider,
+        mode,
       )
     } finally {
       await rm(directory, { recursive: true, force: true })

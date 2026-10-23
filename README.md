@@ -57,7 +57,12 @@ retry across restarts. Source resync remains available as a repair path. No mode
 Copy `apps/transcriber/.env.example` to an untracked `.env`. Configure
 `NOTION_TOKEN`, `NOTION_DATABASE_ID`, and `UOMI_WEBHOOK_SECRET` (24+ characters).
 The Notion connection needs Read/Insert/Update access to the dedicated database.
-Set `TRANSCRIBER_PROVIDER=codex` or `chrome-recognition` and install ffmpeg.
+Standard transcription defaults to `chrome-recognition`; install ffmpeg and provide
+the Chrome recognition environment. `TRANSCRIBER_PROVIDER` can override the standard
+provider. In the Web Recorder, select a recording and press **Start detailed
+transcription** to request a separate Codex transcript for that recording. Codex
+authentication stays on the daemon machine. Standard and detailed results are
+stored separately in Notion and can be switched in the viewer.
 Run `bun run transcriber`; Pending/Processing/Failed jobs recover at startup and
 periodically. The native client no longer needs the daemon webhook or Notion token.
 

@@ -9,7 +9,7 @@ import { authorized, Daemon } from './daemon'
 
 if (process.argv.includes('--help')) {
   console.log(
-    'Uomi transcriber\nNOTION_TOKEN, NOTION_DATABASE_ID, UOMI_WEBHOOK_SECRET are required.\nTRANSCRIBER_PROVIDER=codex | chrome-recognition\nHOST=127.0.0.1 PORT=8787 LANGUAGE=ja REQUEST_WAIT_SECONDS=10 TRANSCRIBER_SPLIT_SECONDS=600\nPending/Processing/Failed pages are recovered automatically at startup and every minute.\nOptional SITES_URL and SITES_ACCESS_TOKEN enable durable completion callbacks.\nRequires ffmpeg on PATH. Codex credentials stay on this machine.',
+    'Uomi transcriber\nNOTION_TOKEN, NOTION_DATABASE_ID, UOMI_WEBHOOK_SECRET are required.\nTRANSCRIBER_PROVIDER=chrome-recognition (default) | codex; detailed jobs always use codex\nHOST=127.0.0.1 PORT=8787 LANGUAGE=ja REQUEST_WAIT_SECONDS=10 TRANSCRIBER_SPLIT_SECONDS=600\nPending/Processing/Failed pages are recovered automatically at startup and every minute.\nOptional SITES_URL and SITES_ACCESS_TOKEN enable durable completion callbacks.\nRequires ffmpeg on PATH. Codex credentials stay on this machine.',
   )
   process.exit(0)
 }
@@ -71,8 +71,8 @@ if (
 const store = new NotionStore(httpTransport(token), database)
 const daemon = new Daemon(store, {
   secret,
-  sitesCallback: sitesCallback(process.env.SITES_URL,process.env.SITES_ACCESS_TOKEN),
-  provider: parseProvider(process.env.TRANSCRIBER_PROVIDER ?? 'codex'),
+  sitesCallback: sitesCallback(process.env.SITES_URL, process.env.SITES_ACCESS_TOKEN),
+  provider: parseProvider(process.env.TRANSCRIBER_PROVIDER ?? 'chrome-recognition'),
   language: process.env.LANGUAGE ?? 'ja',
   stateDir,
   requestWaitMs: wait * 1000,
@@ -97,8 +97,8 @@ try {
       try {
         if (url.pathname === '/reserve')
           return Response.json(await daemon.reserve(await request.json()))
-        const body = (await request.json()) as { pageId?: string }
-        const result = await daemon.accept(body.pageId)
+        const body = (await request.json()) as { pageId?: string; mode?: 'standard' | 'detailed' }
+        const result = await daemon.accept(body.pageId, body.mode)
         return Response.json(result, { status: 202 })
       } catch {
         return Response.json(

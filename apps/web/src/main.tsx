@@ -8,6 +8,9 @@ type Recording = {
   duration_ms: number | null
   finished_at?: number
   status: string
+  detailed_status?: string | null
+  detailed_text?: string
+  detailed_error?: string
   starred: boolean
   has_audio: boolean
   backup_step: string
@@ -90,7 +93,9 @@ function App() {
     [drawer, setDrawer] = useState(false),
     [devices, setDevices] = useState(false),
     [light, setLight] = useState(false),
-    [notice, setNotice] = useState('')
+    [notice, setNotice] = useState(''),
+    [transcriptView, setTranscriptView] = useState<'standard' | 'detailed'>('standard'),
+    [requestingDetail, setRequestingDetail] = useState<string | null>(null)
   const audio = useRef<HTMLAudioElement>(null),
     [playing, setPlaying] = useState(false),
     [position, setPosition] = useState(0),
@@ -152,6 +157,7 @@ function App() {
     selectedRef.current = r
     setSelected(r)
     setDrawer(false)
+    setTranscriptView('standard')
     setPosition(0)
     setDuration((r.duration_ms ?? (r.finished_at ?? 0) - (r.recorded_at ?? 0)) / 1000)
     setPlaying(false)
@@ -165,6 +171,53 @@ function App() {
       }
     } catch (e) {
       setError((e as Error).message)
+    }
+  }
+  // Refresh only transcription metadata/text; never reload audio or reset playback.
+  useEffect(() => {
+    if (!selected || !['done', 'legacy'].includes(selected.backup_step)) return
+    const id = selected.id
+    let cancelled = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+    async function refresh() {
+      try {
+        const result = await api(`/api/recordings/${id}/detailed-transcription`)
+        if (cancelled) return
+        setSelected((current) => (current?.id === id ? { ...current, ...result } : current))
+        if (selectedRef.current?.id === id) Object.assign(selectedRef.current, result)
+        if (['Pending', 'Processing', 'Failed'].includes(result.detailed_status))
+          timer = setTimeout(() => void refresh(), 10000)
+      } catch (e) {
+        if (!cancelled) {
+          setNotice(`Could not refresh detailed transcription: ${(e as Error).message}`)
+          timer = setTimeout(() => void refresh(), 30000)
+        }
+      }
+    }
+    void refresh()
+    return () => {
+      cancelled = true
+      clearTimeout(timer)
+    }
+  }, [selected?.id, selected?.backup_step, selected?.detailed_status])
+  async function startDetailed() {
+    if (!selected || requestingDetail) return
+    const id = selected.id
+    setRequestingDetail(id)
+    try {
+      const result = await api(`/api/recordings/${id}/detailed-transcription`, {
+        method: 'POST',
+        body: '{}',
+      })
+      if (selectedRef.current?.id === id) {
+        Object.assign(selectedRef.current, result)
+        setSelected((current) => (current?.id === id ? { ...current, ...result } : current))
+        setTranscriptView('detailed')
+      }
+    } catch (e) {
+      setNotice((e as Error).message)
+    } finally {
+      setRequestingDetail(null)
     }
   }
   async function patch(data: any) {
@@ -555,6 +608,66 @@ function App() {
                     </div>
                   </div>
                   <article className="transcript" aria-label="Transcript">
+                    <div className="transcription-controls">
+                      <div
+                        className="transcript-versions"
+                        role="group"
+                        aria-label="Transcript version"
+                      >
+                        <button
+                          aria-pressed={transcriptView === 'standard'}
+                          onClick={() => setTranscriptView('standard')}
+                        >
+                          Standard
+                        </button>
+                        <button
+                          aria-pressed={transcriptView === 'detailed'}
+                          onClick={() => setTranscriptView('detailed')}
+                        >
+                          Detailed · Codex
+                        </button>
+                      </div>
+                      <button
+                        className="tonal"
+                        disabled={
+                          !!requestingDetail ||
+                          !['done', 'legacy'].includes(selected.backup_step) ||
+                          ['Pending', 'Processing', 'Completed'].includes(
+                            selected.detailed_status ?? '',
+                          )
+                        }
+                        onClick={() => void startDetailed()}
+                      >
+                        {requestingDetail === selected.id
+                          ? 'Requesting…'
+                          : selected.detailed_status === 'Pending'
+                            ? 'Detailed transcription queued'
+                            : selected.detailed_status === 'Processing'
+                              ? 'Transcribing with Codex…'
+                              : selected.detailed_status === 'Completed'
+                                ? 'Detailed transcription ready'
+                                : selected.detailed_status === 'Failed'
+                                  ? 'Retry detailed transcription'
+                                  : 'Start detailed transcription'}
+                      </button>
+                      {!['done', 'legacy'].includes(selected.backup_step) && (
+                        <p>Available after saving to Notion.</p>
+                      )}
+                      {transcriptView === 'detailed' && (
+                        <p role="status">
+                          {selected.detailed_status === 'Pending'
+                            ? 'Queued for Codex. You can leave this recording and return later.'
+                            : selected.detailed_status === 'Processing'
+                              ? 'Codex is transcribing the full recording.'
+                              : selected.detailed_status === 'Failed'
+                                ? selected.detailed_error ||
+                                  'Detailed transcription failed. Retry now or wait for the automatic retry.'
+                                : selected.detailed_status === 'Completed'
+                                  ? 'Detailed transcription complete.'
+                                  : 'Transcribe this full recording with Codex. The standard transcript is kept.'}
+                        </p>
+                      )}
+                    </div>
                     <div className="transcript-time">
                       {selected.recorded_at
                         ? new Date(selected.recorded_at).toLocaleTimeString(undefined, {
@@ -564,28 +677,41 @@ function App() {
                         : 'Recording'}
                       <span>Full recording</span>
                     </div>
-                    {selected.text ? (
+                    {(transcriptView === 'detailed' ? selected.detailed_text : selected.text) ? (
                       <div className="transcript-text">
-                        {selected.text.split(/\n\n+/).map((p, i) => (
-                          <p key={i}>{p}</p>
-                        ))}
+                        {(transcriptView === 'detailed' ? selected.detailed_text! : selected.text!)
+                          .split(/\n\n+/)
+                          .map((p, i) => (
+                            <p key={i}>{p}</p>
+                          ))}
                       </div>
                     ) : (
                       <div className="transcript-empty">
                         <h2>
-                          {selected.status === 'Completed'
-                            ? 'No speech transcribed'
-                            : 'Waiting for transcription'}
+                          {transcriptView === 'detailed'
+                            ? selected.detailed_status === 'Completed'
+                              ? 'No speech transcribed'
+                              : 'Detailed transcript'
+                            : selected.status === 'Completed'
+                              ? 'No speech transcribed'
+                              : 'Waiting for transcription'}
                         </h2>
                         <p>
-                          {selected.status === 'Completed'
-                            ? 'The transcript for this recording is empty.'
-                            : 'Audio is saved. The transcription daemon will process it separately.'}
+                          {transcriptView === 'detailed'
+                            ? selected.detailed_status === 'Completed'
+                              ? 'The detailed transcript for this recording is empty.'
+                              : 'The Codex transcript will appear here when it is ready.'
+                            : selected.status === 'Completed'
+                              ? 'The transcript for this recording is empty.'
+                              : 'Audio is saved. The transcription daemon will process it separately.'}
                         </p>
                       </div>
                     )}
                     <p className="transcript-caption">
-                      Automatic transcription · Word timestamps unavailable
+                      {transcriptView === 'detailed'
+                        ? 'Detailed transcription · Codex'
+                        : 'Automatic transcription'}{' '}
+                      · Word timestamps unavailable
                     </p>
                   </article>
                 </div>

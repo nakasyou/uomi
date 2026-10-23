@@ -2,6 +2,26 @@ import { Buffer } from 'buffer'
 
 export const NOTION_VERSION = '2025-09-03'
 export type ProcessingStatus = 'Uploading' | 'Pending' | 'Processing' | 'Completed' | 'Failed'
+export type TranscriptionMode = 'standard' | 'detailed'
+export function transcriptionFields(mode: TranscriptionMode = 'standard') {
+  return mode === 'detailed'
+    ? {
+        status: 'Detailed status',
+        transcript: 'Detailed transcript',
+        preview: 'Detailed preview',
+        error: 'Detailed error',
+        attempts: 'Detailed attempts',
+        retry: 'Detailed retry after',
+      }
+    : {
+        status: 'Status',
+        transcript: 'Transcript',
+        preview: 'Transcript preview',
+        error: 'Error',
+        attempts: 'Attempts',
+        retry: 'Retry after',
+      }
+}
 export interface UploadBody {
   filename: string
   contentType: string
@@ -194,6 +214,14 @@ export const schema = {
   Audio: { files: {} },
   Manifest: { files: {} },
   Transcript: { files: {} },
+  'Detailed status': {
+    select: { options: ['Pending', 'Processing', 'Completed', 'Failed'].map((name) => ({ name })) },
+  },
+  'Detailed transcript': { files: {} },
+  'Detailed preview': { rich_text: {} },
+  'Detailed error': { rich_text: {} },
+  'Detailed attempts': { number: {} },
+  'Detailed retry after': { date: {} },
   'Transcript preview': { rich_text: {} },
   Error: { rich_text: {} },
   'Synthetic silence (s)': { number: {} },
@@ -573,15 +601,22 @@ export class NotionStore {
       target,
     }
   }
-  async saveTranscript(pageId: string, text: string, provider: string): Promise<void> {
+  async saveTranscript(
+    pageId: string,
+    text: string,
+    provider: string,
+    mode: TranscriptionMode = 'standard',
+  ): Promise<void> {
+    const fields = transcriptionFields(mode)
     const fileId = await this.upload(
-      `${pageId}-transcript.json`,
+      `${pageId}-${mode}-transcript.json`,
       'application/json',
       Buffer.from(
         JSON.stringify({
           schema: 'uomi.transcript.v1',
           text,
           provider,
+          mode,
           completedAt: new Date().toISOString(),
           wordTimestamps: false,
         }),
@@ -589,12 +624,14 @@ export class NotionStore {
     )
     // Full text lives in a file; the bounded preview avoids Notion rich-text size limits.
     await this.update(pageId, {
-      Transcript: {
+      [fields.transcript]: {
         files: [{ name: 'transcript.json', type: 'file_upload', file_upload: { id: fileId } }],
       },
-      'Transcript preview': { rich_text: rich(text.slice(0, 6000)) },
-      Status: { select: { name: 'Completed' } },
-      Error: { rich_text: [] },
+      [fields.preview]: { rich_text: rich(text.slice(0, 6000)) },
+      [fields.status]: { select: { name: 'Completed' } },
+      [fields.error]: { rich_text: [] },
+      [fields.attempts]: { number: 0 },
+      [fields.retry]: { date: null },
     })
   }
 }

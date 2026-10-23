@@ -805,3 +805,37 @@ main {
   color: var(--primary);
   min-height: 44px;
 }
+
+.transcription-controls {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 12px;
+  margin-bottom: 24px;
+}
+.transcript-versions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.transcript-versions button {
+  min-height: 48px;
+  padding: 0 16px;
+  border-radius: 24px;
+  color: var(--muted);
+}
+.transcript-versions button[aria-pressed='true'] {
+  background: var(--selected);
+  color: var(--primary);
+}
+.transcription-controls > .tonal {
+  min-height: 48px;
+  white-space: normal;
+  text-align: left;
+}
+.transcription-controls p {
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1.6;
+  margin: 0;
+}
