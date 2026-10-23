@@ -16,7 +16,8 @@ import {
   type PlanningProgress,
   planningLabel,
 } from './catalog'
-import { runPipeline, type PipelineProgress } from './pipeline'
+import { forEachBounded, runPipeline, type PipelineProgress } from './pipeline'
+import { reconciliationQueries } from './notion-sync'
 import type { AudioSegment } from './segments'
 import { LiveAssembler } from './live'
 import { Buffer } from 'buffer'
@@ -1108,6 +1109,15 @@ export class Engine {
         yield page
       }
   }
+  private async *matchingMirrorPages(queries: ReturnType<typeof reconciliationQueries>) {
+    const seen = new Set<string>()
+    for (const query of queries)
+      for await (const page of this.mirrorPages(query)) {
+        if (seen.has(page.id)) continue
+        seen.add(page.id)
+        yield page
+      }
+  }
   private manifestSignature(page: any) {
     return ['Audio', 'Manifest']
       .map((property) => {
@@ -1264,19 +1274,23 @@ export class Engine {
         ),
       )
     }
-    const remotes: RemoteRecording[] = []
-    for (const page of pages.slice(
-      this.port.mirrorEntries ? 0 : this.remoteOffset,
-      (this.port.mirrorEntries ? 0 : this.remoteOffset) + 50,
-    )) {
-      if (!page.properties.Audio?.files?.length || !page.properties.Manifest?.files?.length)
-        continue
-      const id = store.remotePage(page, this.notionTarget()).id
-      const saved = await this.port.get(`notion:remote:${this.notionTarget()}:${id}`)
-      remotes.push(
-        store.remotePage(page, this.notionTarget(), saved ? JSON.parse(saved) : undefined),
+    const visible = pages
+      .slice(
+        this.port.mirrorEntries ? 0 : this.remoteOffset,
+        (this.port.mirrorEntries ? 0 : this.remoteOffset) + 50,
       )
-    }
+      .filter(
+        (page) => page.properties.Audio?.files?.length && page.properties.Manifest?.files?.length,
+      )
+    const remoteKeys = visible.map(
+      (page) =>
+        `notion:remote:${this.notionTarget()}:${store.remotePage(page, this.notionTarget()).id}`,
+    )
+    const savedRemotes = await this.readMany(remoteKeys)
+    const remotes = visible.map((page, i) => {
+      const saved = savedRemotes.get(remoteKeys[i])
+      return store.remotePage(page, this.notionTarget(), saved ? JSON.parse(saved) : undefined)
+    })
     if (generation !== this.remoteGeneration) return
     this.update({
       remoteRecordings: remotes,
@@ -1394,23 +1408,16 @@ export class Engine {
         throw Error('Wi-Fi disconnected. Local audio is retained.')
       if (Date.now() > this.deadline) throw Error('Sync paused. Local audio is retained.')
     }
-    const times = indexes.flatMap((record) =>
-      record.capturedAt ? [Date.parse(record.capturedAt)] : [],
-    )
-    const range = times.length
-      ? {
-          from: times.reduce((a, b) => Math.min(a, b), Infinity),
-          until: times.reduce((a, b) => Math.max(a, b), -Infinity) + 900000,
-        }
-      : {}
-    // Only manifests that can intersect the local index are read. Unchanged
-    // manifests come from the durable cache, never a full historical download.
-    const matchQuery = { devices: [...new Set(indexes.map((r) => r.deviceId))], ...range }
+    // Query disjoint candidate page-start windows per device. Unknown clocks
+    // retain an unbounded device query so deduplication remains conservative.
+    const matchQueries = reconciliationQueries(indexes)
     let matchingTotal = 0
     if (indexes.length && this.port.mirrorCount) {
       try {
-        const count = await this.port.mirrorCount({ target, ...matchQuery })
-        if (typeof count === 'number' && Number.isFinite(count)) matchingTotal = count
+        for (const query of matchQueries) {
+          const count = await this.port.mirrorCount({ target, ...query })
+          if (typeof count === 'number' && Number.isFinite(count)) matchingTotal += count
+        }
       } catch {
         /* Older native backends still report completed counts. */
       }
@@ -1425,11 +1432,10 @@ export class Engine {
         detail: 'Checking matching audio manifests',
       },
     })
-    for await (const page of this.mirrorPages(matchQuery)) {
-      if (!indexes.length) break
+    await forEachBounded(this.matchingMirrorPages(matchQueries), async (page) => {
       try {
         if (!page.properties.Audio?.files?.length || !page.properties.Manifest?.files?.length)
-          continue
+          return
         await guard()
         this.update({
           phase: 'Checking audio saved in Notion',
@@ -1443,7 +1449,7 @@ export class Engine {
         })
         let manifest = await this.manifestFor(store, page)
         const localIds = manifest.frameIds.filter((id) => locate(id))
-        if (!localIds.length) continue
+        if (!localIds.length) return
         if (shouldDelete) {
           this.update({
             progress: {
@@ -1556,7 +1562,7 @@ export class Engine {
           },
         })
       }
-    }
+    })
     // Index-based acknowledgements and deletion use one transaction per batch.
     const acknowledged = (record: RecordIndex) => {
       let count = record.uploaded
@@ -1645,6 +1651,7 @@ export class Engine {
       checkpoint?: Checkpoint
       segment?: AudioSegment
       audio?: Uint8Array
+      audioHashVerified?: boolean
       page?: any
       key?: string
       records: RecordIndex[]
@@ -1921,6 +1928,7 @@ export class Engine {
                 ...(gaps.length ? { gaps } : {}),
               }
             }
+            if (!job.checkpoint) job.audioHashVerified = true
             job.key = `${jobPrefix}${job.manifest.id}`
             const reservationKey = `notion:reservation:${target}:${job.manifest.id}`
             const saved = job.checkpoint?.pageId ?? (await this.port.get(reservationKey))
@@ -1952,8 +1960,9 @@ export class Engine {
                 : oggOpus(job.segment!.frames)
               // A resumed checkpoint must reproduce the exact original Ogg, including gaps.
               if (
+                !job.audioHashVerified &&
                 (await this.port.hash(Buffer.from(job.audio).toString('base64'))) !==
-                job.manifest!.sha256
+                  job.manifest!.sha256
               )
                 throw Error('The resumed audio hash differs. Local audio is retained.')
               job.checkpoint!.audioId = await store.upload(
@@ -1981,12 +1990,15 @@ export class Engine {
           attach: async (job) => {
             await guard()
             publish('Attaching files to Notion')
-            let page = await store.attachAudio(
+            job.page = await store.attachAudio(
               job.manifest!,
               job.page,
               job.checkpoint!.audioId,
               job.checkpoint!.metadataId,
             )
+          },
+          verify: async (job) => {
+            let page = job.page
             if (shouldDelete) {
               publish('Verifying uploaded audio before local removal')
               page = (await this.verifiedManifest(store, page.id, job.manifest)).page
@@ -2011,7 +2023,10 @@ export class Engine {
             })
             commit = acknowledgement.catch(() => {})
             await acknowledgement
-            await this.sendNotification(remote)
+            job.page = page
+          },
+          notify: async (job) => {
+            await this.sendNotification(store.remote(job.page, job.manifest!, target))
             job.segment = undefined
             for (const record of job.records) {
               const count = (activeRecords.get(record.key) ?? 1) - 1

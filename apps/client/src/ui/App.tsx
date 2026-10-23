@@ -1039,35 +1039,41 @@ function DeviceSync({
       ) : null}
       {active && progress?.pipeline ? (
         <View style={{ gap: 12, marginTop: 8 }}>
-          {(['prepare', 'audio', 'metadata', 'attach'] as const).map((stage) => {
-            const queue = progress.pipeline![stage]
-            const labels = {
-              prepare: 'Preparing',
-              audio: 'Uploading audio',
-              metadata: 'Uploading audio metadata',
-              attach: 'Attaching files to Notion',
-            }
-            const reached = progress.chunksTotal ?? queue.completed + queue.active + queue.queued
-            return (
-              <View key={stage} style={{ gap: 5 }}>
-                <View style={[styles.rowBetween, { flexWrap: 'wrap', gap: 4 }]}>
-                  <Text variant="labelMedium">
-                    {labels[stage]}
-                    {stage === 'prepare' && progress.chunksTotal !== undefined
-                      ? ` · ${queue.completed} / ${progress.chunksTotal} chunks`
-                      : ''}
-                  </Text>
-                  <Text variant="labelSmall">
-                    {queue.active} / 2 active · {queue.queued} queued · {queue.completed} done
-                  </Text>
+          {(['prepare', 'audio', 'metadata', 'attach', 'verify', 'notify'] as const).map(
+            (stage) => {
+              const queue = progress.pipeline![stage]
+              const labels = {
+                prepare: 'Preparing',
+                audio: 'Uploading audio',
+                metadata: 'Uploading audio metadata',
+                attach: 'Attaching files to Notion',
+                verify: 'Verifying saved audio',
+                notify: 'Notifying transcriber',
+              }
+              const reached = progress.chunksTotal ?? queue.completed + queue.active + queue.queued
+              return (
+                <View key={stage} style={{ gap: 5 }}>
+                  <View style={[styles.rowBetween, { flexWrap: 'wrap', gap: 4 }]}>
+                    <Text variant="labelMedium">
+                      {labels[stage]}
+                      {stage === 'prepare' && progress.chunksTotal !== undefined
+                        ? ` · ${queue.completed} / ${progress.chunksTotal} chunks`
+                        : ''}
+                    </Text>
+                    <Text variant="labelSmall">
+                      {queue.active} / 2 active · {queue.queued} queued · {queue.completed} done
+                    </Text>
+                  </View>
+                  <ProgressBar
+                    progress={reached ? queue.completed / reached : 0}
+                    indeterminate={
+                      !progress.chunksTotal && queue.active > 0 && queue.completed === 0
+                    }
+                  />
                 </View>
-                <ProgressBar
-                  progress={reached ? queue.completed / reached : 0}
-                  indeterminate={!progress.chunksTotal && queue.active > 0 && queue.completed === 0}
-                />
-              </View>
-            )
-          })}
+              )
+            },
+          )}
         </View>
       ) : null}
       <View style={[styles.row, { flexWrap: 'wrap', marginTop: 16 }]}>

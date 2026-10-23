@@ -446,13 +446,40 @@ async fn connect(
     let mut stream = p.notifications().await.map_err(error)?;
     let bulk_state=state.inner().clone();
     *state.notifications.lock().await = Some(tauri::async_runtime::spawn(async move {
+        let trace = bulk_import::trace_enabled();
+        let mut trace_last = std::time::Instant::now();
+        let mut blocked_sends = 0u64;
+        let mut blocked_ms = 0.0f64;
+        let mut max_blocked_ms = 0.0f64;
         while let Some(n) = stream.next().await {
             // Custody firmware may require a live subscription to persist connected
             // audio; canonical import uses the ring and discards this duplicate stream.
             if n.uuid.to_string() == "19b10001-e8f2-537e-4f6c-d104768a1214" && bulk_state.bulk.lock().map(|v|v.is_some()).unwrap_or(false) {continue;}
             if n.uuid.to_string() == "30295781-4301-eabd-2904-2849adfeae43" && matches!(n.value.first(),Some(3|4|5)) {
                 let target=bulk_state.bulk.lock().ok().and_then(|guard|guard.clone());
-                if let Some(target)=target {let _=target.send(n.value).await; continue;}
+                if let Some(target)=target {
+                    let full = trace && target.capacity() == 0;
+                    let began = std::time::Instant::now();
+                    let is_done = n.value.first() == Some(&4);
+                    let sent = target.send(n.value).await.is_ok();
+                    if full {
+                        let ms = began.elapsed().as_secs_f64()*1000.0;
+                        blocked_sends += 1;
+                        blocked_ms += ms;
+                        max_blocked_ms = max_blocked_ms.max(ms);
+                        if trace_last.elapsed() >= Duration::from_secs(2) {
+                            eprintln!("UOMI_BLE_TRACE {}", json!({"event":"receiver_backpressure","blocked_sends":blocked_sends,"blocked_ms":blocked_ms,"max_blocked_ms":max_blocked_ms,"send_ok":sent}));
+                            trace_last = std::time::Instant::now();
+                            blocked_sends = 0; blocked_ms = 0.0; max_blocked_ms = 0.0;
+                        }
+                    }
+                    // Flush the last partial window at protocol DONE, too.
+                    if trace && blocked_sends > 0 && is_done {
+                        eprintln!("UOMI_BLE_TRACE {}", json!({"event":"receiver_backpressure","blocked_sends":blocked_sends,"blocked_ms":blocked_ms,"max_blocked_ms":max_blocked_ms}));
+                        blocked_sends = 0; blocked_ms = 0.0; max_blocked_ms = 0.0;
+                    }
+                    continue;
+                }
             }
             let _ = app.emit(
                 "uomi:ble",

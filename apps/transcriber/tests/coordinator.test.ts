@@ -30,6 +30,7 @@ test('concurrent clients reserve exactly one page and conflicting frame ranges c
     ])
     expect(one.pageId).toBe(two.pageId)
     expect(fake.pages.size).toBe(1)
+    expect(fake.requests.filter((r) => r.path.endsWith('/query'))).toHaveLength(1)
     await expect(coordinator.reserve(manifest(['frame-2', 'frame-3']))).rejects.toThrow(
       'overlapping',
     )

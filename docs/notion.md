@@ -80,8 +80,9 @@ outcomes are not retried blindly. Notion's service rate limits still apply.
 ## Bounded upload pipeline and restart recovery
 
 Chunks pass through Preparing → Uploading audio → Uploading audio metadata →
-Attaching files to Notion in that order. Different chunks overlap across stages;
-each stage has two slots and at most eight jobs are admitted at once. UI shows
+Attaching files to Notion → Verifying saved audio → Notifying transcriber in that order. Different chunks overlap across stages;
+attachment, verification and daemon notification have independent two-slot stages,
+and at most eight jobs are admitted at once. UI shows
 active/queued/completed counts and a progress bar for each stage, plus overall
 durably saved frame progress. Stage bars cover jobs admitted to that stage, not
 bytes sent. Notion request starts remain spaced by 400 ms; request completion
@@ -135,3 +136,12 @@ and `/webhook` on the same HTTPS base path. A valid old upload checkpoint resume
 its exact source boundaries even after the maximum chunk length changes.
 
 Artificial silence is recorded in `Manifest.gaps` with source-frame boundary, duration, and offset in the merged audio. Notion also receives `Synthetic silence (s)`, `Synthetic silence count`, and `Synthetic silence intervals`. The intervals preview contains relative millisecond offsets and absolute start/end timestamps when the recording clock is known. Large previews explicitly indicate truncation; the Manifest retains every interval. Legacy manifests without offsets do not invent timestamps. Transcription removes only these generated packets from temporary input, retaining original encoded source packets; the stored Notion audio remains unchanged.
+
+Reconciliation checks at most two pages concurrently and drains started checks
+before reporting a failure. Candidate pages are selected per device and per merged
+recording-time window, including the maximum 15-minute page overlap. Devices with
+unknown local recording clocks retain an unbounded query. Repeated candidate pages
+are checked once per sync. Local deletion still requires successful read-back
+verification. Library metadata is read in batches. Source schema metadata and
+concurrent upload-limit lookups are reused; daemon reservations perform one
+Recording ID reconciliation before their durably journaled page creation.

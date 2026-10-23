@@ -47,3 +47,43 @@ capability.
 
 Rebuild and restart the native client to load the new commands and schema. A
 frontend hot reload alone cannot upgrade native storage or BLE processing.
+
+### Linux BLE measurement logs
+
+Native debug builds (including `bun run linux`) emit `UOMI_BLE_TRACE` followed by
+JSON to stderr. Set `UOMI_BLE_TRACE=0` to disable, or `UOMI_BLE_TRACE=1` to enable
+in a release build. Restart the native process after changing the environment;
+frontend reloads alone do not apply native changes. Tauri dev normally rebuilds
+and restarts the native process when Rust sources change.
+
+Each bounded import emits `start`, cumulative `progress` about every two seconds,
+and `done` or `error`. Logs contain counts and timings, not audio, device IDs,
+timestamps from recordings, or credentials. `received_bytes` counts ring DATA
+payload (including record headers/padding), and `kib_per_s` is the cumulative
+application throughput, including command startup and storage waits. Each range
+resets these counters; this is not the radio's raw bitrate.
+
+- `queue_peak_sampled` (capacity 64) samples pending notifications before/after
+  receive and after commits. It is a lower bound on peak occupancy.
+- `receiver_backpressure` aggregates sends that found the queue full: their count,
+  total wait, and maximum wait. Windows flush at most every two seconds and at
+  DONE; disconnect/cancellation can leave a final partial window unreported.
+- `commit_wall_ms` and `commit_max_ms` include blocking-worker scheduling and all
+  local persistence work; `storage_ms` starts inside that worker and includes DB
+  lock wait, record preparation, SQL and transaction commit. They overlap;
+  do not add them together. Neither isolates fsync time.
+- `receive_wait_ms`/`receive_wait_max_ms` measure time awaiting the next queued
+  notification, not radio packet spacing. `parse_ms` measures ring assembly.
+  `first_data_ms` measures from import startup to first DATA consumption and
+  `command_ms` measures the control write round trip.
+
+A saturated queue plus receiver backpressure points to local processing stalls.
+Low storage/parse time and long receive waits points upstream of this consumer
+(BLE, BlueZ, firmware or SD), without distinguishing those causes. Error metrics
+are captured before cancellation cleanup salvages any remaining complete records.
+
+For actual PHY, connection interval and Data Length, start `sudo btmon` before
+connecting Omi, then import once. Inspect LE PHY Update Complete, LE Connection
+Update Complete and LE Data Length Change events alongside application logs.
+These values are not exposed by the current btleplug import interface. A btmon
+capture can contain audio payloads and device addresses; keep it local.

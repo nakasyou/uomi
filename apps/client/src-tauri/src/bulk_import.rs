@@ -4,6 +4,89 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 const CONTROL: &str = "30295781-4301-eabd-2904-2849adfeae43";
 const SERVICE: &str = "30295780-4301-eabd-2904-2849adfeae43";
 
+// Debug builds trace by default; production can opt in without rebuilding.
+// Read per import so no per-notification environment lookup is needed.
+pub(super) fn trace_enabled() -> bool {
+    match std::env::var("UOMI_BLE_TRACE").as_deref() {
+        Ok("1") => true,
+        Ok("0") => false,
+        _ => cfg!(debug_assertions),
+    }
+}
+
+struct TransferTrace {
+    enabled: bool,
+    began: Instant,
+    last: Instant,
+    notifications: u64,
+    queue_peak: usize,
+    receive_wait_ms: f64,
+    receive_wait_max_ms: f64,
+    first_data_ms: Option<f64>,
+    command_ms: f64,
+    parse_ms: f64,
+    commit_wall_ms: f64,
+    commit_max_ms: f64,
+    commits: u64,
+}
+impl TransferTrace {
+    fn new() -> Self {
+        Self {
+            enabled: trace_enabled(),
+            began: Instant::now(),
+            last: Instant::now(),
+            notifications: 0,
+            queue_peak: 0,
+            receive_wait_ms: 0.0,
+            receive_wait_max_ms: 0.0,
+            first_data_ms: None,
+            command_ms: 0.0,
+            parse_ms: 0.0,
+            commit_wall_ms: 0.0,
+            commit_max_ms: 0.0,
+            commits: 0,
+        }
+    }
+    fn committed(&mut self, began: Instant, queued: usize) {
+        if !self.enabled {
+            return;
+        }
+        let ms = began.elapsed().as_secs_f64() * 1000.0;
+        self.commit_wall_ms += ms;
+        self.commit_max_ms = self.commit_max_ms.max(ms);
+        self.commits += 1;
+        self.queue_peak = self.queue_peak.max(queued);
+    }
+    fn report(
+        &mut self,
+        event: &str,
+        bytes: usize,
+        records: u64,
+        storage_ms: f64,
+        mtu: Option<u64>,
+        largest: usize,
+    ) {
+        if !self.enabled || (event == "progress" && self.last.elapsed() < Duration::from_secs(2)) {
+            return;
+        }
+        let elapsed_ms = self.began.elapsed().as_secs_f64() * 1000.0;
+        eprintln!(
+            "UOMI_BLE_TRACE {}",
+            json!({
+                "event": event, "elapsed_ms": elapsed_ms, "received_bytes": bytes,
+                "kib_per_s": bytes as f64 / 1024.0 / (elapsed_ms / 1000.0).max(0.001),
+                "committed_records": records, "notifications": self.notifications,
+                "queue_peak_sampled": self.queue_peak, "queue_capacity": 64,
+                "receive_wait_ms": self.receive_wait_ms, "receive_wait_max_ms": self.receive_wait_max_ms,
+                "first_data_ms": self.first_data_ms, "command_ms": self.command_ms, "parse_ms": self.parse_ms,
+                "commit_wall_ms": self.commit_wall_ms, "commit_max_ms": self.commit_max_ms,
+                "storage_ms": storage_ms, "commits": self.commits,
+                "mtu": mtu, "max_notification_bytes": largest,
+            })
+        );
+        self.last = Instant::now();
+    }
+}
 struct RingStream {
     start: u64,
     end: u64,
@@ -336,6 +419,8 @@ pub async fn import_ring(
         *active = Some(tx);
     }
     let began = Instant::now();
+    let mut trace = TransferTrace::new();
+    if trace.enabled { eprintln!("UOMI_BLE_TRACE {}", json!({"event":"start", "requested_records":count,"mtu":mtu})); }
     let mut last = Instant::now();
     let mut storage_ms = 0.0;
     let mut bytes = 0usize;
@@ -345,31 +430,42 @@ pub async fn import_ring(
     let result:Result<()> = async {
         let (p,c)=characteristic(&state,SERVICE,CONTROL).await?;
         let mut command=vec![0x11];command.extend_from_slice(&start.to_be_bytes());command.extend_from_slice(&(count as u32).to_be_bytes());
+        let command_began = Instant::now();
         p.write(&c,&command,WriteType::WithResponse).await.map_err(error)?;
+        if trace.enabled { trace.command_ms = command_began.elapsed().as_secs_f64()*1000.0; }
         let mut stream=RingStream::new(start,count)?;
         loop {
             if state.bulk_cancelled.lock().map_err(error)?.contains(&id) {return Err("Import paused; committed audio is kept locally".into());}
+            let receive_began = Instant::now();
+            if trace.enabled { trace.queue_peak = trace.queue_peak.max(rx.len()); }
             let message=tokio::select! {
                 _=state.bulk_cancel.notified()=>continue,
                 value=tokio::time::timeout(Duration::from_secs(30),rx.recv())=>value.map_err(|_|"Bluetooth transfer idle timeout")?.ok_or("Bluetooth import disconnected")?,
             };
+            if trace.enabled { let wait_ms = receive_began.elapsed().as_secs_f64()*1000.0; trace.receive_wait_ms += wait_ms; trace.receive_wait_max_ms = trace.receive_wait_max_ms.max(wait_ms); trace.notifications += 1; trace.queue_peak = trace.queue_peak.max(rx.len()); }
             largest=largest.max(message.len());
-            if message.first()==Some(&3) {bytes+=message.len()-1;}
+            if message.first()==Some(&3) {bytes+=message.len()-1; if trace.enabled && trace.first_data_ms.is_none() { trace.first_data_ms = Some(trace.began.elapsed().as_secs_f64()*1000.0); }}
+            let parse_began = Instant::now();
             let (records,done)=stream.accept(&message)?;
+            if trace.enabled { trace.parse_ms += parse_began.elapsed().as_secs_f64()*1000.0; }
             pending.extend(records);
             while pending.len()>=32 {
                 let records=pending.drain(..32).collect();
+                let commit_began = Instant::now();
                 storage_ms+=commit(state.db.clone(),records,device.clone(),ring.clone(),cursor.clone()).await?;committed+=32;
+                trace.committed(commit_began, rx.len());
                 if last.elapsed().as_millis()>=150 {
                     let _=app.emit("uomi:import",json!({"requestId":id,"completed":committed,"elapsedMs":began.elapsed().as_secs_f64()*1000.0,"storageMs":storage_ms,"receivedBytes":bytes,"maxNotificationBytes":largest,"mtu":mtu.filter(|value|*value>=(largest+3) as u64)}));last=Instant::now();
                 }
             }
+            trace.report("progress", bytes, committed, storage_ms, mtu, largest);
             if done {
-                if !pending.is_empty() {let n=pending.len() as u64;storage_ms+=commit(state.db.clone(),std::mem::take(&mut pending),device.clone(),ring.clone(),cursor.clone()).await?;committed+=n;}
+                if !pending.is_empty() {let n=pending.len() as u64;let commit_began=Instant::now();storage_ms+=commit(state.db.clone(),std::mem::take(&mut pending),device.clone(),ring.clone(),cursor.clone()).await?;committed+=n;trace.committed(commit_began, rx.len());}
                 return Ok(());
             }
         }
     }.await;
+    trace.report(if result.is_ok() { "done" } else { "error" }, bytes, committed, storage_ms, mtu, largest);
     *state.bulk.lock().map_err(error)? = None;
     state
         .bulk_cancelled

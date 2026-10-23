@@ -259,3 +259,16 @@ test('legacy gaps do not invent absolute times; large interval previews are expl
   expect(details.intervals[0].started_at).toBeUndefined()
   expect(text.length).toBeLessThan(6000)
 })
+
+test('setup reuses source metadata and concurrent uploads share the limit lookup', async () => {
+  const fake = new FakeNotion()
+  const store = new NotionStore(fake.transport, SOURCE)
+  await store.setup()
+  await store.setup()
+  expect(fake.requests.filter((r) => r.path === `/data_sources/${SOURCE}`)).toHaveLength(1)
+  await Promise.all([
+    store.upload('one.ogg', 'audio/ogg', new Uint8Array([1])),
+    store.upload('two.json', 'application/json', new Uint8Array([2])),
+  ])
+  expect(fake.requests.filter((r) => r.path === '/users/me')).toHaveLength(1)
+})

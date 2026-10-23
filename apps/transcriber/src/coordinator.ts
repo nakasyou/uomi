@@ -91,7 +91,7 @@ export class ReservationCoordinator {
     // client can create this ID or reserve its frames during that uncertainty.
     let page: any
     try {
-      page = existing ?? (await this.store.reserve(request))
+      page = existing ?? (await this.store.createReservedPage(request))
     } catch (error) {
       if (/Notion HTTP (400|401|403|404|429)\b/.test(String(error)))
         db.transaction(() => {

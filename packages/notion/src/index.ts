@@ -202,6 +202,8 @@ export const schema = {
   'Retry after': { date: {} },
 }
 export class NotionStore {
+  private sourceMetadata?: any
+  private limitRequest?: Promise<number>
   private readyId?: string
   private setupComplete = false
   private uploadLimit?: number
@@ -214,7 +216,7 @@ export class NotionStore {
     const id = notionId(this.database)
     // Accept either a data source ID or a database URL. Only retry the alternate kind on 404.
     try {
-      await this.transport({ path: `/data_sources/${id}`, method: 'GET' })
+      this.sourceMetadata = await this.transport({ path: `/data_sources/${id}`, method: 'GET' })
       this.readyId = id
     } catch (e) {
       if (!String(e).includes('404')) throw e
@@ -228,7 +230,9 @@ export class NotionStore {
   async setup(): Promise<void> {
     if (this.setupComplete) return
     const id = await this.source()
-    const existing = await this.transport({ path: `/data_sources/${id}`, method: 'GET' })
+    const existing =
+      this.sourceMetadata ?? (await this.transport({ path: `/data_sources/${id}`, method: 'GET' }))
+    this.sourceMetadata = undefined
     const properties: Record<string, unknown> = {}
     for (const [key, value] of Object.entries(schema)) {
       const type = Object.keys(value)[0]
@@ -362,9 +366,16 @@ export class NotionStore {
   }
   async upload(filename: string, contentType: string, bytes: Uint8Array): Promise<string> {
     if (this.uploadLimit === undefined) {
-      const limits = await this.transport({ path: '/users/me', method: 'GET' })
-      this.uploadLimit =
-        limits.bot?.workspace_limits?.max_file_upload_size_in_bytes ?? 5 * 1024 * 1024
+      this.limitRequest ??= this.transport({ path: '/users/me', method: 'GET' })
+        .then(
+          (limits) =>
+            limits.bot?.workspace_limits?.max_file_upload_size_in_bytes ?? 5 * 1024 * 1024,
+        )
+        .catch((error) => {
+          this.limitRequest = undefined
+          throw error
+        })
+      this.uploadLimit = await this.limitRequest
     }
     const max = this.uploadLimit!
     if (bytes.length > max)
@@ -404,6 +415,10 @@ export class NotionStore {
   async reserve(manifest: AudioManifest): Promise<any> {
     const existing = await this.find(manifest.id)
     if (existing) return existing
+    return this.createReservedPage(manifest)
+  }
+  // Caller must have reconciled Recording ID and durably journaled its create intent.
+  async createReservedPage(manifest: AudioManifest): Promise<any> {
     return this.transport({
       path: '/pages',
       method: 'POST',
