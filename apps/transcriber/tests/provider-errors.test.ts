@@ -120,3 +120,51 @@ test('chunk errors preserve original HTTP status, retry metadata, and cause', as
   expect(failure.retryAfter).toBe('120')
   expect(failure.cause).toBeInstanceOf(Error)
 })
+
+test('Chrome sends chunked HTTP without Content-Length and keeps short uploads open for pairing', async () => {
+  const { createServer } = await import('node:http')
+  const received: { chunked?: string; length?: string; duration: number; bytes: number }[] = []
+  const pending = new Map<string, import('node:http').ServerResponse>()
+  const server = createServer(async (request, response) => {
+    const url = new URL(request.url!, 'http://local')
+    const pair = url.searchParams.get('pair')!
+    if (url.pathname.endsWith('/down')) {
+      pending.set(pair, response)
+      return
+    }
+    const started = Date.now()
+    let bytes = 0
+    for await (const chunk of request) bytes += chunk.length
+    received.push({
+      chunked: request.headers['transfer-encoding'],
+      length: request.headers['content-length'],
+      duration: Date.now() - started,
+      bytes,
+    })
+    response.end()
+    pending.get(pair)!.end()
+  })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const port = (server.address() as import('node:net').AddressInfo).port
+  const original = globalThis.fetch
+  globalThis.fetch = ((url: string | URL | Request, init: RequestInit) => {
+    const local = new URL(String(url))
+    local.protocol = 'http:'
+    local.host = `127.0.0.1:${port}`
+    return original(local, init)
+  }) as typeof fetch
+  try {
+    for await (const _ of recognizeFlac(flacHeader())) {
+      /* drain */
+    }
+    expect(received).toHaveLength(1)
+    expect(received[0].chunked).toBe('chunked')
+    expect(received[0].length).toBeUndefined()
+    expect(received[0].bytes).toBe(42)
+    expect(received[0].duration).toBeGreaterThan(500)
+  } finally {
+    globalThis.fetch = original
+    server.closeAllConnections()
+    await new Promise<void>((resolve) => server.close(() => resolve()))
+  }
+})

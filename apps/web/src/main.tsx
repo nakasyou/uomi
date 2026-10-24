@@ -97,6 +97,12 @@ const title = (r: Recording) =>
         minute: '2-digit',
       })
     : 'Untimed recording')
+const recordingStart = (value: number | null) => {
+  if (value === null) return 'Untimed recording'
+  const start = new Date(value)
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${start.getFullYear()}/${pad(start.getMonth() + 1)}/${pad(start.getDate())} ${pad(start.getHours())}:${pad(start.getMinutes())}`
+}
 const durationOf = (r: Recording) =>
   Math.max(0, (r.duration_ms ?? Math.max(0, (r.finished_at ?? 0) - (r.recorded_at ?? 0))) / 1000)
 const active = (j: Job | undefined | null) =>
@@ -120,7 +126,7 @@ function JobState({
     )
   return (
     <div className="job-state" role="status">
-      <strong>{job.stage || job.status}</strong>
+      <strong>{job.status === 'completed' ? 'Completed' : job.stage || job.status}</strong>
       {active(job) && job.progress > 0 && <progress max="1" value={job.progress} />}
       <span>
         Attempt {job.attempt}
@@ -576,7 +582,7 @@ function App() {
                   onClick={() => void choose(r)}
                 >
                   <span className="recording-title">
-                    {title(r)}
+                    {recordingStart(r.recorded_at)}
                     {r.starred && <Icon name="star" />}
                   </span>
                   <span className="recording-meta">
@@ -853,7 +859,11 @@ function App() {
                           {active(currentJob)
                             ? 'Transcription in progress'
                             : currentJob?.status === 'completed'
-                              ? 'No speech detected'
+                              ? currentJob.stage === 'completed_no_speech'
+                                ? 'No speech detected'
+                                : currentJob.stage === 'completed_empty'
+                                  ? 'Speech detected, but no transcript returned'
+                                  : 'No transcript returned'
                               : 'No transcript available'}
                         </h2>
                         {!selected.has_audio && (

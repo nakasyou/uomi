@@ -271,7 +271,11 @@ export class ApiWorker {
       const path = join(directory, 'audio.ogg')
       await writeFile(path, audio, { mode: 0o600 })
       let checkpoint: string
-      let content: { text: string; segments: unknown[] }
+      let content: {
+        text: string
+        segments: unknown[]
+        outcome?: 'no_speech' | 'empty' | 'transcribed'
+      }
       if (provider !== 'codex') {
         const speech = await transcribeSpeech({
           audioPath: path,
@@ -288,7 +292,9 @@ export class ApiWorker {
           signal: controller.signal,
           analyze: (work) => this.analysisSlots.run(controller.signal, work),
           recognize: (audioPath, options, signal) =>
-            this.recognitionSlots.run(signal, () => this.recognize(audioPath, options)),
+            this.recognitionSlots.run(signal, () =>
+              this.recognize(audioPath, { ...options, signal }),
+            ),
           stage: async (value, valueProgress) => {
             const changed = stage !== value
             stage = value
@@ -297,7 +303,7 @@ export class ApiWorker {
           },
         })
         checkpoint = speech.checkpoint
-        content = { text: speech.text, segments: speech.segments }
+        content = { text: speech.text, segments: speech.segments, outcome: speech.outcome }
       } else {
         const fingerprint = createHash('sha256')
           .update(

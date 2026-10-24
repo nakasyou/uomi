@@ -358,3 +358,37 @@ test('one recording never launches more than two slice recognizers', async () =>
     await f.cleanup()
   }
 }, 20_000)
+
+test('speech completion distinguishes VAD silence from empty recognition and retries transient slice errors', async () => {
+  const silence = await fixture([])
+  const speech = await fixture([segment(100, 1000, 'speaker0')])
+  try {
+    const noSpeech = await transcribeSpeech({
+      ...(await silence.options()),
+      recognize: async () => {
+        throw Error('must not call')
+      },
+    })
+    expect(noSpeech.outcome).toBe('no_speech')
+    let calls = 0
+    const empty = await transcribeSpeech({
+      ...(await speech.options()),
+      recognize: async () => {
+        calls++
+        if (calls === 1)
+          throw Object.assign(Error('Did not receive an upstream request with matching pair ID'), {
+            status: 400,
+          })
+        if (calls === 2) throw Object.assign(Error('temporary server failure'), { status: 500 })
+        return { text: '' }
+      },
+    })
+    expect(calls).toBe(3)
+    expect(empty.outcome).toBe('empty')
+    expect(empty.text).toBe('')
+    expect(empty.segments).toEqual([])
+  } finally {
+    await silence.cleanup()
+    await speech.cleanup()
+  }
+}, 15000)

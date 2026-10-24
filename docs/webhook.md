@@ -32,6 +32,16 @@ without the legacy ten-second start delay; Codex retains `REQUEST_WAIT_SECONDS`.
 finishes with empty text/segments and sends zero ASR requests. Helper/model failures
 are visible failures, never an implicit fallback to transcribing the whole file.
 
+The Chrome duplex upload uses HTTP chunked transfer with a one-second minimum
+pairing window for short slices, avoiding a fixed-length upload that can finish
+before the downstream request is paired. Transient pair errors, HTTP 429 and 5xx
+are retried at most three times per slice with fresh pair IDs and bounded backoff;
+the overall durable job remains limited to eight attempts.
+
+Completion distinguishes `no_speech` (zero VAD slices) from `empty` (recognition
+returned no text for detected speech). These are stored as completion stages;
+legacy empty results do not imply that VAD found silence.
+
 Model/SDK revisions and the normalized speech plan identify checkpoint state.
 Out-of-order successful speech results are saved by interval index, so retrying
 one failed interval does not repeat completed siblings. Final text and segments

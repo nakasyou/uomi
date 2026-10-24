@@ -347,3 +347,37 @@ test('migration reports an active lease separately from a saved resumable cursor
     f.sqlite.close()
   }
 })
+
+test('completion records the evidence for silence separately from empty recognition and legacy results', async () => {
+  const f = fixture()
+  try {
+    for (const [id, outcome, expected] of [
+      ['silence', 'no_speech', 'completed_no_speech'],
+      ['empty', 'empty', 'completed_empty'],
+      ['legacy', undefined, 'completed'],
+    ]) {
+      recording(f, id)
+      await enqueue(f.env, id)
+      const job = (await call(f, '/api/jobs/claim', { worker_id: 'outcome' })).jobs[0]
+      if (outcome) {
+        const invalid = await call(f, '/api/jobs/' + job.id + '/complete', {
+          lease_token: job.lease_token,
+          text: 'Has text',
+          outcome,
+        })
+        assert.equal(invalid.status, 400)
+      }
+      const done = await call(f, '/api/jobs/' + job.id + '/complete', {
+        lease_token: job.lease_token,
+        text: '',
+        outcome,
+      })
+      assert.equal(done.saved, true)
+      const detail = await call(f, '/api/recordings/' + id)
+      assert.equal(detail.transcription.stage, expected)
+      assert.equal(detail.transcription.status, 'completed')
+    }
+  } finally {
+    f.sqlite.close()
+  }
+})

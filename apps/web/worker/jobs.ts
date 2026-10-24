@@ -225,6 +225,16 @@ export async function jobsApi(request: Request, env: any, data: any) {
     throw new ApiError('text required (maximum 1 million characters)')
   if (data.model != null && (typeof data.model !== 'string' || data.model.length > 200))
     throw new ApiError('Invalid model')
+  if (data.outcome !== undefined && !['no_speech', 'empty', 'transcribed'].includes(data.outcome))
+    throw new ApiError('Invalid transcription outcome')
+  if (['no_speech', 'empty'].includes(data.outcome) && (data.text.trim() || data.segments?.length))
+    throw new ApiError('Empty transcription outcome cannot contain text or segments')
+  const completionStage =
+    data.outcome === 'no_speech'
+      ? 'completed_no_speech'
+      : data.outcome === 'empty'
+        ? 'completed_empty'
+        : 'completed'
   const recording = await env.DB.prepare('SELECT duration_ms FROM recordings WHERE id=?')
     .bind(job.recording_id)
     .first()
@@ -247,8 +257,8 @@ export async function jobsApi(request: Request, env: any, data: any) {
       now,
     ),
     env.DB.prepare(
-      `UPDATE transcription_jobs SET status='completed',stage='completed',progress=1,error=NULL,model=?,lease_until=0,updated_at=? WHERE id=? AND lease_token=? AND status='processing' AND lease_until>?`,
-    ).bind(data.model ?? null, now, id, data.lease_token, now),
+      `UPDATE transcription_jobs SET status='completed',stage=?,progress=1,error=NULL,model=?,lease_until=0,updated_at=? WHERE id=? AND lease_token=? AND status='processing' AND lease_until>?`,
+    ).bind(completionStage, data.model ?? null, now, id, data.lease_token, now),
   ])
   if (!result[1].meta.changes) throw new ApiError('Job lease replaced', 409, 'lease_conflict')
   return { saved: true }

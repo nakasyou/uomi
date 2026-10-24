@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import { setTimeout as delay } from 'node:timers/promises'
 import { readFile, stat, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { TranscribeOptions, Transcription } from '@nakasyou/ntranscribe'
@@ -120,7 +121,7 @@ export async function transcribeSpeech(options: {
         options.language,
         options.splitSeconds,
         speechPlanFingerprint(plan, plan.engine!),
-        'fluid-asr-v1',
+        'fluid-asr-v2-streaming',
       ]),
     )
     .digest('hex')
@@ -173,16 +174,33 @@ export async function transcribeSpeech(options: {
           ],
           workSignal,
         )
-        const recognized = await options.recognize(
-          path,
-          {
-            provider: 'chrome-recognizetion',
-            language: options.language,
-            timeoutMs: options.timeoutMs,
-            splitSeconds: options.splitSeconds,
-          },
-          workSignal,
-        )
+        let recognized: Transcription | undefined
+        for (let attempt = 0; attempt < 3; attempt++) {
+          try {
+            recognized = await options.recognize(
+              path,
+              {
+                provider: 'chrome-recognizetion',
+                language: options.language,
+                timeoutMs: options.timeoutMs,
+                splitSeconds: options.splitSeconds,
+              },
+              workSignal,
+            )
+            break
+          } catch (error) {
+            workSignal.throwIfAborted()
+            const status = (error as { status?: number }).status
+            const pairingFailure =
+              status === 400 && /(?:matching pair ID|pair ID is not unique)/i.test(String(error))
+            if (
+              attempt === 2 ||
+              !(pairingFailure || status === 429 || (status != null && status >= 500))
+            )
+              throw error
+            await delay(500 * 2 ** attempt, undefined, { signal: workSignal })
+          }
+        }
         signal.throwIfAborted()
         if (typeof recognized?.text !== 'string')
           throw Error('Chrome recognition returned an invalid transcript')
@@ -217,6 +235,10 @@ export async function transcribeSpeech(options: {
   if (segments.length > 20000) throw Error('Transcription exceeds the 20000-segment API limit')
   return {
     checkpoint,
+    outcome: (slices.length === 0 ? 'no_speech' : segments.length ? 'transcribed' : 'empty') as
+      | 'no_speech'
+      | 'transcribed'
+      | 'empty',
     text: results
       .map((result) => result?.text.trim())
       .filter(Boolean)
