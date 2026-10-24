@@ -12,6 +12,7 @@ export async function detailedTranscription(
   row: any,
   start: boolean,
   retry = false,
+  mode: 'detailed' | 'long' = 'detailed',
 ) {
   if (start && !row.audio_key)
     throw new ApiError(
@@ -20,22 +21,20 @@ export async function detailedTranscription(
       'audio_unavailable',
     )
   const job = start
-    ? await enqueue(env, row.id, 'detailed', retry || row.detailed_status === 'Failed')
-    : await env.DB.prepare(
-        "SELECT * FROM transcription_jobs WHERE recording_id=? AND mode='detailed'",
-      )
-        .bind(row.id)
+    ? await enqueue(env, row.id, mode, retry || row[`${mode}_status`] === 'Failed')
+    : await env.DB.prepare('SELECT * FROM transcription_jobs WHERE recording_id=? AND mode=?')
+        .bind(row.id, mode)
         .first()
   if (start && job.status === 'queued')
     await env.DB.prepare(
-      "UPDATE recordings SET detailed_status='Pending',detailed_error='' WHERE id=?",
+      `UPDATE recordings SET ${mode}_status='Pending',${mode}_error='' WHERE id=?`,
     )
       .bind(row.id)
       .run()
   return {
-    detailed_status: job ? (statusNames[job.status] ?? job.status) : row.detailed_status,
-    detailed_text: row.detailed_text,
-    detailed_error: job?.error ?? row.detailed_error,
-    detailed_transcription: jobView(job),
+    [`${mode}_status`]: job ? (statusNames[job.status] ?? job.status) : row[`${mode}_status`],
+    [`${mode}_text`]: row[`${mode}_text`],
+    [`${mode}_error`]: job?.error ?? row[`${mode}_error`],
+    [`${mode}_transcription`]: jobView(job),
   }
 }

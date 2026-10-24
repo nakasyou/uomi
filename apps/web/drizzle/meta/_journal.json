@@ -71,6 +71,13 @@
       "when": 1792819142541,
       "tag": "0009_job_progress",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "6",
+      "when": 1792822588022,
+      "tag": "0010_long_transcription",
+      "breakpoints": true
     }
   ]
 }

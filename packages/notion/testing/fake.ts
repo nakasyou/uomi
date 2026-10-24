@@ -97,7 +97,10 @@ export class FakeNotion {
     }
     throw Error(`Unexpected fake request: ${req.path}`)
   }
-  attachment = async (pageId: string, property: 'Manifest' | 'Transcript') => {
+  attachment = async (
+    pageId: string,
+    property: 'Manifest' | 'Transcript' | 'Detailed transcript' | 'Long transcript',
+  ) => {
     const page = this.pages.get(pageId)!
     const file = page.properties[property].files[0]
     return Buffer.from(this.files.get(file.file_upload.id)!).toString()

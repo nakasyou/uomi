@@ -13,3 +13,12 @@ Audio and manifests download concurrently from authenticated same-origin API end
 Provider segments, when available, use `{start_ms, end_ms, text, speaker}`. Chunk offsets are converted to the original audio playback timeline; original silence is retained. Providers returning only text produce no fabricated timestamps or speaker labels. Supporting providers can add timing and speaker output without changing the queue protocol.
 
 On Mac mini, the service is managed by `~/dotfiles/modules/darwin/uomi-transcriber.nix` and its pinned source package. Update that declaration, build `.#darwinConfigurations.mac-mini.system`, apply the documented rebuild or generated user-agent update, and verify `/health` plus an actual completed queue job. Preserve the private credentials file and checkpoint directory. Do not finish deployment using an unmanaged background process.
+
+`long` jobs always use Chrome recognition. They reuse the normalized FluidAudio
+plan but merge all speaker boundaries and gaps up to 5000 ms, retaining source
+silence inside each crop. Source spans split at the existing Google limit (600
+seconds); unlike standard results, long results contain only ordered text and no
+segments or speaker labels. Mode and merge policy isolate their checkpoints.
+
+New uploads and newly imported audio automatically enqueue standard and long jobs.
+Detailed remains an explicit request.

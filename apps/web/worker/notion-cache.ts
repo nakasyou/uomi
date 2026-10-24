@@ -1,4 +1,4 @@
-import { enqueue, validateSegments } from './jobs.ts'
+import { enqueue, enqueueLongDefault, validateSegments } from './jobs.ts'
 import { normalizeSearch } from './search.js'
 import { saveManifest } from './manifest.ts'
 import { Buffer } from 'buffer'
@@ -53,6 +53,28 @@ export async function readDetailedTranscript(store: NotionStore, page: any) {
     detailed_error: text(p['Detailed error']?.rich_text),
   }
 }
+export async function readLongTranscript(store: NotionStore, page: any) {
+  const p = page.properties
+  let transcript = text(p['Long preview']?.rich_text)
+  if (p['Long transcript']?.files?.[0]?.file?.url) {
+    const data = JSON.parse(
+      (await attachment(store.fileUrl(page, 'Long transcript'), 4 * 1024 * 1024)).toString(),
+    )
+    if (
+      data.schema !== 'uomi.transcript.v1' ||
+      data.mode !== 'long' ||
+      typeof data.text !== 'string' ||
+      data.text.length > 1000000
+    )
+      throw Error('Invalid long transcript attachment')
+    transcript = data.text
+  }
+  return {
+    status: p['Long status']?.select?.name ?? null,
+    text: transcript,
+    error: text(p['Long error']?.rich_text),
+  }
+}
 // Fill missing original files without allowing an import to replace primary edits.
 async function hydrateMissingAudio(env: any, store: NotionStore, page: any, old: any) {
   const id = old.id,
@@ -100,6 +122,7 @@ async function hydrateMissingAudio(env: any, store: NotionStore, page: any, old:
   ])
   const hydrated = !!result[2].meta.changes
   if (hydrated && old.status !== 'Completed') await enqueue(env, id)
+  if (hydrated) await enqueueLongDefault(env, id)
   return {
     id,
     cached: hydrated,
@@ -201,6 +224,7 @@ export async function cachePage(env: any, page: any) {
     segments = validateSegments(data.segments, null)
   }
   const detailed = await readDetailedTranscript(store, page)
+  const long = await readLongTranscript(store, page)
   const start = p.recorded_at_ms?.number ?? Date.parse(p['Recorded at']?.date?.start),
     duration = (p['Duration (s)']?.number ?? 0) * 1000,
     finish = p.record_finished_at_ms?.number ?? start + duration,
@@ -230,13 +254,16 @@ export async function cachePage(env: any, page: any) {
       normalizeSearch(transcript),
     ),
     env.DB.prepare(
-      'UPDATE recordings SET detailed_status=?,detailed_text=?,detailed_error=?,transcript_segments=?,detailed_segments=? WHERE id=? AND (primary_owned=0 OR (notion_edited IS NOT NULL AND revision=0 AND notion_import_version=0))',
+      'UPDATE recordings SET detailed_status=?,detailed_text=?,detailed_error=?,transcript_segments=?,detailed_segments=?,long_status=?,long_text=?,long_error=? WHERE id=? AND (primary_owned=0 OR (notion_edited IS NOT NULL AND revision=0 AND notion_import_version=0))',
     ).bind(
       detailed.detailed_status,
       detailed.detailed_text,
       detailed.detailed_error,
       JSON.stringify(segments),
       JSON.stringify(detailed.detailed_segments),
+      long.status,
+      long.text,
+      long.error,
       id,
     ),
     ...(sourceFilesPresent
@@ -258,6 +285,7 @@ export async function cachePage(env: any, page: any) {
     ).bind(id),
   ])
   if (audioKey && status !== 'Completed') await enqueue(env, id)
+  if (audioKey) await enqueueLongDefault(env, id)
   return {
     id,
     cached: true,

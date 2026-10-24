@@ -1,6 +1,7 @@
 import { expect, test } from 'bun:test'
 import {
   MAX_ASR_SEGMENT_MS,
+  longSpeechSlices,
   normalizeSpeechPlan,
   offsetSpeechSegments,
   speechPlanFingerprint,
@@ -194,4 +195,28 @@ test('speaker and normalized segment limits match the transcript API without tru
   // The cap applies after exact-adjacent same-speaker merging.
   const adjacent = Array.from({ length: 20_001 }, (_, index) => interval(index, index + 1))
   expect(normalizeSpeechPlan(plan(adjacent, 20_002)).segments).toEqual([interval(0, 20_001)])
+})
+
+test('long speech ignores speakers, retains five-second pauses and caps source spans at ten minutes', () => {
+  const input = normalizeSpeechPlan(
+    plan(
+      [
+        interval(1000, 1500, 'a'),
+        interval(1500, 2000, 'b'),
+        interval(7000, 8000),
+        interval(13001, 650000, 'c'),
+      ],
+      700000,
+    ),
+  )
+  const before = JSON.stringify(input)
+  expect(longSpeechSlices(input, 600000)).toEqual([
+    interval(1000, 8000),
+    interval(13001, 613001),
+    interval(613001, 650000),
+  ])
+  expect(JSON.stringify(input)).toBe(before)
+  expect(longSpeechSlices(normalizeSpeechPlan(plan([])), 600000)).toEqual([])
+  for (const maximum of [0, -1, NaN, 1.5, 600001])
+    expect(() => longSpeechSlices(input, maximum)).toThrow()
 })

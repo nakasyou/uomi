@@ -9,6 +9,8 @@ import {
   normalizeSpeechPlan,
   offsetSpeechSegments,
   speechPlanFingerprint,
+  longSpeechSlices,
+  LONG_SPEECH_GAP_MS,
   type SpeechPlan,
 } from './speech-plan'
 
@@ -109,17 +111,24 @@ export async function transcribeSpeech(options: {
       return normalized
     })
   }
-  // Bound additionally by the configured Google maximum, preserving silence gaps and speaker turns.
-  const slices = plan.segments.flatMap((segment) => {
-    const parts = []
-    for (let start = segment.start_ms; start < segment.end_ms; start += options.splitSeconds * 1000)
-      parts.push({
-        ...segment,
-        start_ms: start,
-        end_ms: Math.min(segment.end_ms, start + options.splitSeconds * 1000),
-      })
-    return parts
-  })
+  // Standard keeps speech/speaker boundaries; long mode retains short source pauses.
+  const slices =
+    options.mode === 'long'
+      ? longSpeechSlices(plan, options.splitSeconds * 1000)
+      : plan.segments.flatMap((segment) => {
+          const parts = []
+          for (
+            let start = segment.start_ms;
+            start < segment.end_ms;
+            start += options.splitSeconds * 1000
+          )
+            parts.push({
+              ...segment,
+              start_ms: start,
+              end_ms: Math.min(segment.end_ms, start + options.splitSeconds * 1000),
+            })
+          return parts
+        })
   const fingerprint = createHash('sha256')
     .update(
       JSON.stringify([
@@ -130,6 +139,7 @@ export async function transcribeSpeech(options: {
         options.splitSeconds,
         speechPlanFingerprint(plan, plan.engine!),
         'fluid-asr-v2-streaming',
+        ...(options.mode === 'long' ? ['long-v1', LONG_SPEECH_GAP_MS] : []),
       ]),
     )
     .digest('hex')
@@ -255,20 +265,24 @@ export async function transcribeSpeech(options: {
   const failed = workers.find((result) => result.status === 'rejected')
   if (failed?.status === 'rejected') throw failed.reason
   await writes
-  const segments = results.flatMap((result, index) => {
-    if (!result?.text.trim()) return []
-    const slice = slices[index]
-    return Array.isArray(result.segments) && result.segments.length
-      ? offsetSpeechSegments(result.segments, slice)
-      : [{ ...slice, text: result.text.trim() }]
-  })
+  const segments =
+    options.mode === 'long'
+      ? []
+      : results.flatMap((result, index) => {
+          if (!result?.text.trim()) return []
+          const slice = slices[index]
+          return Array.isArray(result.segments) && result.segments.length
+            ? offsetSpeechSegments(result.segments, slice)
+            : [{ ...slice, text: result.text.trim() }]
+        })
   if (segments.length > 20000) throw Error('Transcription exceeds the 20000-segment API limit')
   return {
     checkpoint,
-    outcome: (slices.length === 0 ? 'no_speech' : segments.length ? 'transcribed' : 'empty') as
-      | 'no_speech'
-      | 'transcribed'
-      | 'empty',
+    outcome: (slices.length === 0
+      ? 'no_speech'
+      : results.some((result) => result?.text.trim())
+        ? 'transcribed'
+        : 'empty') as 'no_speech' | 'transcribed' | 'empty',
     text: results
       .map((result) => result?.text.trim())
       .filter(Boolean)

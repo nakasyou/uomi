@@ -18,7 +18,7 @@ import type { ProgressDetail } from './progress'
 export interface Job {
   id: string
   recording_id: string
-  mode: 'standard' | 'detailed'
+  mode: 'standard' | 'long' | 'detailed'
   lease_token: string
   lease_until: number
   attempt: number
@@ -81,6 +81,7 @@ export class ApiWorker {
   get status() {
     return {
       active: this.active.size,
+      modes: ['standard', 'long', 'detailed'],
       concurrency: this.config.concurrency,
       splitSeconds: {
         google: this.config.splitSeconds,
@@ -282,7 +283,12 @@ export class ApiWorker {
       // The API serves both assets for the claimed row, and SHA-256 binds their bytes below.
       if (createHash('sha256').update(audio).digest('hex') !== manifest.sha256)
         throw Error('Audio checksum mismatch.')
-      const provider = job.mode === 'detailed' ? 'codex' : this.config.provider
+      const provider =
+        job.mode === 'detailed'
+          ? 'codex'
+          : job.mode === 'long'
+            ? 'chrome-recognizetion'
+            : this.config.provider
       const splitSeconds =
         provider === 'codex' ? (this.config.codexSplitSeconds ?? 300) : this.config.splitSeconds
       await mkdir(this.config.stateDir, { recursive: true, mode: 0o700 })

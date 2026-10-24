@@ -41,12 +41,23 @@ test('stage, retry, canonical acknowledgement, fast search and audio are separat
     headers = { 'Idempotency-Key': v.segmentId }
   let r = await app.fetch(request('/api/chunks', 'POST', v, headers), f.env, f.ctx)
   assert.equal(r.status, 201)
+  assert.deepEqual(
+    f.sqlite
+      .prepare('SELECT mode,status FROM transcription_jobs ORDER BY mode')
+      .all()
+      .map((row) => ({ ...row })),
+    [
+      { mode: 'long', status: 'queued' },
+      { mode: 'standard', status: 'queued' },
+    ],
+  )
   assert.equal((await r.json()).notion_saved, false)
   await Promise.all(f.tasks)
   assert.equal(f.files.size, 2)
   assert.equal(f.sqlite.prepare('SELECT backup_step FROM recordings').get().backup_step, 'page')
   r = await app.fetch(request('/api/chunks', 'POST', v, headers), f.env, f.ctx)
   assert.equal(r.status, 200)
+  assert.equal(f.sqlite.prepare('SELECT count(*) n FROM transcription_jobs').get().n, 2)
   f.sqlite
     .prepare(
       "UPDATE recordings SET backup_step='done',text='分散ファクトチェック',status='Completed'",

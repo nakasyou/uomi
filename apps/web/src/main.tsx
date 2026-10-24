@@ -12,6 +12,7 @@ import { speakerLabel } from './speaker-label'
 import { mergeRecording, mergeRecordingPage } from './recording-state'
 import './style.css'
 
+type TranscriptionMode = 'standard' | 'long' | 'detailed'
 type Job = {
   id: string
   status: string
@@ -44,6 +45,10 @@ type Recording = {
   preview?: string
   text?: string
   url?: string
+  long_status?: string
+  long_text?: string
+  long_error?: string
+  long_transcription?: Job | null
   detailed_status?: string
   detailed_text?: string
   detailed_error?: string
@@ -155,7 +160,7 @@ function App() {
     [light, setLight] = useState(false),
     [notice, updateNotice] = useState(''),
     [noticeTone, setNoticeTone] = useState<'error' | 'success'>('error'),
-    [view, setView] = useState<'standard' | 'detailed'>('standard'),
+    [view, setView] = useState<TranscriptionMode>('standard'),
     [busy, setBusy] = useState(''),
     [playing, setPlaying] = useState(false),
     [position, setPosition] = useState(0),
@@ -285,7 +290,11 @@ function App() {
         }
         timer = setTimeout(
           () => void refresh(),
-          active(state.transcription) || active(state.detailed_transcription) ? 3000 : 15000,
+          active(state.transcription) ||
+            active(state.long_transcription) ||
+            active(state.detailed_transcription)
+            ? 3000
+            : 15000,
         )
       } catch (e) {
         if (!cancelled) {
@@ -329,12 +338,12 @@ function App() {
       if (selectedRef.current?.id === r.id) setRename(null)
     })
   }
-  async function transcribe(mode: 'standard' | 'detailed') {
+  async function transcribe(mode: TranscriptionMode) {
     const r = selectedRef.current
     if (!r) return
     await action('transcribe', async () => {
       await api(
-        `/api/recordings/${r.id}/${mode === 'standard' ? 'transcription' : 'detailed-transcription'}`,
+        `/api/recordings/${r.id}/${mode === 'standard' ? 'transcription' : `${mode}-transcription`}`,
         { method: 'POST', body: '{"retry":true}' },
       )
       const full = await api('/api/recordings/' + r.id)
@@ -449,9 +458,19 @@ function App() {
     })
   }
   const currentJob =
-    view === 'standard' ? selected?.transcription : selected?.detailed_transcription
-  const transcript = view === 'standard' ? selected?.text : selected?.detailed_text
-  const segments = view === 'standard' ? selected?.segments : selected?.detailed_segments
+    view === 'standard'
+      ? selected?.transcription
+      : view === 'long'
+        ? selected?.long_transcription
+        : selected?.detailed_transcription
+  const transcript =
+    view === 'standard'
+      ? selected?.text
+      : view === 'long'
+        ? selected?.long_text
+        : selected?.detailed_text
+  const segments =
+    view === 'standard' ? selected?.segments : view === 'long' ? [] : selected?.detailed_segments
   return (
     <div className="app">
       <header className="topbar">
@@ -799,6 +818,9 @@ function App() {
                       >
                         Transcript
                       </button>
+                      <button aria-pressed={view === 'long'} onClick={() => setView('long')}>
+                        Long · Chrome
+                      </button>
                       <button
                         aria-pressed={view === 'detailed'}
                         onClick={() => setView('detailed')}
@@ -806,14 +828,17 @@ function App() {
                         Detailed · Codex
                       </button>
                     </div>
+                    {view === 'long' && (
+                      <p className="muted">Long passages with short pauses retained. Text only.</p>
+                    )}
                     <div className="transcription-controls">
                       <JobState
                         job={currentJob}
-                        error={view === 'detailed' ? selected.detailed_error : undefined}
+                        error={view === 'standard' ? undefined : selected[`${view}_error`]}
                         fallback={
                           view === 'standard'
                             ? selected.status
-                            : (selected.detailed_status ?? 'Not requested')
+                            : (selected[`${view}_status`] ?? 'Not requested')
                         }
                       />
                       {!active(currentJob) && (

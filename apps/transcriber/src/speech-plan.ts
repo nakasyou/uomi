@@ -13,6 +13,30 @@ export type SpeechPlan = {
 }
 
 export const MAX_ASR_SEGMENT_MS = 600_000
+export const LONG_SPEECH_GAP_MS = 5_000
+
+/** Keep short pauses in the source audio and ignore diarization boundaries. */
+export function longSpeechSlices(plan: SpeechPlan, maximumMs: number): SpeechInterval[] {
+  if (!Number.isSafeInteger(maximumMs) || maximumMs <= 0 || maximumMs > MAX_ASR_SEGMENT_MS)
+    throw Error('Invalid maximum long speech interval')
+  const groups: SpeechInterval[] = []
+  for (const segment of plan.segments) {
+    const previous = groups.at(-1)
+    if (previous && segment.start_ms - previous.end_ms <= LONG_SPEECH_GAP_MS)
+      previous.end_ms = Math.max(previous.end_ms, segment.end_ms)
+    else groups.push({ start_ms: segment.start_ms, end_ms: segment.end_ms, speaker: null })
+  }
+  return groups.flatMap((group) => {
+    const slices: SpeechInterval[] = []
+    for (let start = group.start_ms; start < group.end_ms; start += maximumMs)
+      slices.push({
+        start_ms: start,
+        end_ms: Math.min(group.end_ms, start + maximumMs),
+        speaker: null,
+      })
+    return slices
+  })
+}
 const MAX_DURATION_MS = 7 * 24 * 60 * 60 * 1000
 const MAX_INPUT_SEGMENTS = 100_000
 const MAX_OUTPUT_SEGMENTS = 20_000

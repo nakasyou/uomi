@@ -414,3 +414,36 @@ test('Google uses ten-minute chunks, Codex five-minute chunks, with matching ori
     await rm(f.dir, { recursive: true, force: true })
   }
 }, 30000)
+
+test('long jobs always use Chrome and complete without transcript positions', async () => {
+  const f = await fixture(0.1)
+  let claims = 0
+  let completion: any
+  const worker = new ApiWorker(
+    { ...f.config, provider: 'codex' },
+    async (_path, options) => {
+      expect(options?.provider).toBe('chrome-recognizetion')
+      expect(options?.splitSeconds).toBe(600)
+      return { text: 'long text', segments: [{ start_ms: 0, end_ms: 100, text: 'provider times' }] }
+    },
+    (async (url: any, options: any) => {
+      const path = new URL(url).pathname
+      if (path === '/api/jobs/claim')
+        return Response.json({ jobs: claims++ ? [] : [{ ...f.job, mode: 'long' }] })
+      if (path === '/audio') return new Response(f.audio)
+      if (path === '/manifest') return Response.json(f.manifest)
+      if (path.endsWith('/complete')) completion = JSON.parse(options.body)
+      return Response.json({ saved: true })
+    }) as typeof fetch,
+  )
+  try {
+    await worker.poll()
+    await worker.close()
+    expect(completion.text).toBe('long text')
+    expect(completion.segments).toEqual([])
+    expect(completion.outcome).toBe('transcribed')
+  } finally {
+    await worker.close()
+    await rm(f.dir, { recursive: true, force: true })
+  }
+}, 15000)

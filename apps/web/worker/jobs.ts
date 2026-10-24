@@ -28,7 +28,7 @@ export async function enqueue(env: any, recordingId: string, mode = 'standard', 
   const now = Date.now(),
     id = `${recordingId}:${mode}`
   await env.DB.prepare(`INSERT INTO transcription_jobs(id,recording_id,mode,created_at,updated_at)
-    SELECT ?,?,?,?,? FROM recordings WHERE id=? AND (?='detailed' OR status!='Completed' OR ?=1) ON CONFLICT(recording_id,mode) DO NOTHING`)
+    SELECT ?,?,?,?,? FROM recordings WHERE id=? AND (?!='standard' OR status!='Completed' OR ?=1) ON CONFLICT(recording_id,mode) DO NOTHING`)
     .bind(id, recordingId, mode, now, now, recordingId, mode, Number(retry))
     .run()
   if (retry)
@@ -37,6 +37,15 @@ export async function enqueue(env: any, recordingId: string, mode = 'standard', 
       .bind(now, id)
       .run()
   return env.DB.prepare('SELECT * FROM transcription_jobs WHERE id=?').bind(id).first()
+}
+/** New uploads/imports get the long version even when a standard result exists. */
+export async function enqueueLongDefault(env: any, recordingId: string) {
+  const now = Date.now()
+  await env.DB.prepare(`INSERT INTO transcription_jobs(id,recording_id,mode,created_at,updated_at)
+    SELECT id||':long',id,'long',?,? FROM recordings WHERE id=? AND audio_key IS NOT NULL
+    AND coalesce(long_status,'')!='Completed' ON CONFLICT(recording_id,mode) DO NOTHING`)
+    .bind(now, now, recordingId)
+    .run()
 }
 const leaseSeconds = (value: unknown) => {
   const n = value ?? 120
@@ -91,15 +100,17 @@ export async function jobsApi(request: Request, env: any, data: any) {
         .all()
     if (expired.results.length)
       await env.DB.batch(
-        ['standard', 'detailed'].map((mode) =>
-          env.DB.prepare(`UPDATE recordings SET ${mode === 'standard' ? "status='Failed'" : "detailed_status='Failed',detailed_error='Worker lease expired after maximum attempts'"}
+        ['standard', 'long', 'detailed']
+          .filter((mode) => expired.results.some((job: any) => job.mode === mode))
+          .map((mode) =>
+            env.DB.prepare(`UPDATE recordings SET ${mode === 'standard' ? "status='Failed'" : `${mode}_status='Failed',${mode}_error='Worker lease expired after maximum attempts'`}
       WHERE id IN(SELECT value FROM json_each(?)) AND EXISTS(SELECT 1 FROM transcription_jobs j WHERE j.recording_id=recordings.id AND j.mode=? AND j.status='failed')`).bind(
-            JSON.stringify(
-              expired.results.filter((j: any) => j.mode === mode).map((j: any) => j.recording_id),
+              JSON.stringify(
+                expired.results.filter((j: any) => j.mode === mode).map((j: any) => j.recording_id),
+              ),
+              mode,
             ),
-            mode,
           ),
-        ),
       )
     const token = crypto.randomUUID()
     // Each indexed lane contributes at most limit candidates. The final merge sorts
@@ -124,19 +135,21 @@ export async function jobsApi(request: Request, env: any, data: any) {
       .bind(JSON.stringify(claimed.results.map((j: any) => j.recording_id)))
       .all()
     const durations = new Map(metadata.results.map((r: any) => [r.id, r.duration_ms]))
-    // At most two writes, independent of the number of claimed recordings.
+    // At most three writes, independent of the number of claimed recordings.
     await env.DB.batch(
-      ['standard', 'detailed'].map((mode) =>
-        env.DB.prepare(`UPDATE recordings SET ${mode === 'standard' ? "status='Processing'" : "detailed_status='Processing'"}
+      ['standard', 'long', 'detailed']
+        .filter((mode) => claimed.results.some((job: any) => job.mode === mode))
+        .map((mode) =>
+          env.DB.prepare(`UPDATE recordings SET ${mode === 'standard' ? "status='Processing'" : `${mode}_status='Processing'`}
       WHERE id IN(SELECT value FROM json_each(?)) AND EXISTS(SELECT 1 FROM transcription_jobs WHERE recording_id=recordings.id AND mode=? AND lease_token=? AND status='processing' AND lease_until>?)`).bind(
-          JSON.stringify(
-            claimed.results.filter((j: any) => j.mode === mode).map((j: any) => j.recording_id),
+            JSON.stringify(
+              claimed.results.filter((j: any) => j.mode === mode).map((j: any) => j.recording_id),
+            ),
+            mode,
+            token,
+            Date.now(),
           ),
-          mode,
-          token,
-          Date.now(),
         ),
-      ),
     )
     const jobs = claimed.results.map((j: any) => ({
       ...jobView(j),
@@ -197,7 +210,7 @@ export async function jobsApi(request: Request, env: any, data: any) {
     const status = data.retryable !== false && job.attempt < job.max_attempts ? 'retry' : 'failed'
     await env.DB.batch([
       env.DB.prepare(
-        `UPDATE recordings SET ${job.mode === 'standard' ? "status='Failed'" : "detailed_status='Failed',detailed_error=?"} WHERE id=? AND EXISTS(SELECT 1 FROM transcription_jobs WHERE id=? AND lease_token=? AND status='processing' AND lease_until>?)`,
+        `UPDATE recordings SET ${job.mode === 'standard' ? "status='Failed'" : `${job.mode}_status='Failed',${job.mode}_error=?`} WHERE id=? AND EXISTS(SELECT 1 FROM transcription_jobs WHERE id=? AND lease_token=? AND status='processing' AND lease_until>?)`,
       ).bind(
         ...(job.mode === 'standard' ? [] : [data.error.slice(0, 4000)]),
         job.recording_id,
@@ -244,18 +257,22 @@ export async function jobsApi(request: Request, env: any, data: any) {
   const recording = await env.DB.prepare('SELECT duration_ms FROM recordings WHERE id=?')
     .bind(job.recording_id)
     .first()
+  if (job.mode === 'long' && data.segments?.length)
+    throw new ApiError('Long transcripts contain text only')
   const segments = JSON.stringify(validateSegments(data.segments, recording.duration_ms))
   const update =
     job.mode === 'standard'
       ? "status='Completed',text=?,search_text=?,search_version=1,transcript_segments=?"
-      : "detailed_status='Completed',detailed_text=?,detailed_error='',detailed_segments=?"
+      : job.mode === 'long'
+        ? "long_status='Completed',long_text=?,long_error=''"
+        : "detailed_status='Completed',detailed_text=?,detailed_error='',detailed_segments=?"
   const result = await env.DB.batch([
     env.DB.prepare(
       `UPDATE recordings SET ${update},primary_owned=1,revision=revision+1,edited_at=? WHERE id=? AND EXISTS(SELECT 1 FROM transcription_jobs WHERE id=? AND lease_token=? AND status='processing' AND lease_until>?)`,
     ).bind(
       data.text,
       ...(job.mode === 'standard' ? [normalizeSearch(data.text)] : []),
-      segments,
+      ...(job.mode === 'long' ? [] : [segments]),
       new Date(now).toISOString(),
       job.recording_id,
       id,

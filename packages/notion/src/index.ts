@@ -2,8 +2,17 @@ import { Buffer } from 'buffer'
 
 export const NOTION_VERSION = '2025-09-03'
 export type ProcessingStatus = 'Uploading' | 'Pending' | 'Processing' | 'Completed' | 'Failed'
-export type TranscriptionMode = 'standard' | 'detailed'
+export type TranscriptionMode = 'standard' | 'long' | 'detailed'
 export function transcriptionFields(mode: TranscriptionMode = 'standard') {
+  if (mode === 'long')
+    return {
+      status: 'Long status',
+      transcript: 'Long transcript',
+      preview: 'Long preview',
+      error: 'Long error',
+      attempts: 'Long attempts',
+      retry: 'Long retry after',
+    }
   return mode === 'detailed'
     ? {
         status: 'Detailed status',
@@ -212,6 +221,14 @@ export const schema = {
   Audio: { files: {} },
   Manifest: { files: {} },
   Transcript: { files: {} },
+  'Long status': {
+    select: { options: ['Pending', 'Processing', 'Completed', 'Failed'].map((name) => ({ name })) },
+  },
+  'Long transcript': { files: {} },
+  'Long preview': { rich_text: {} },
+  'Long error': { rich_text: {} },
+  'Long attempts': { number: {} },
+  'Long retry after': { date: {} },
   'Detailed status': {
     select: { options: ['Pending', 'Processing', 'Completed', 'Failed'].map((name) => ({ name })) },
   },

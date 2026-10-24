@@ -314,3 +314,18 @@ test('Notion diagnostics retain validation message and request ID while redactin
     expect(diagnostic).not.toContain('do-not-copy')
   }
 })
+
+test('long transcript backups use an independent text-only attachment', async () => {
+  const fake = new FakeNotion()
+  const store = new NotionStore(fake.transport, SOURCE)
+  await store.setup()
+  const page = await store.saveAudio(manifest, new Uint8Array([1]))
+  await store.saveTranscript(page.id, 'standard text', 'chrome-recognizetion')
+  await store.saveTranscript(page.id, 'long text', 'chrome-recognizetion', 'long')
+  const attachment = JSON.parse(await fake.attachment(page.id, 'Long transcript'))
+  expect(attachment.mode).toBe('long')
+  expect(attachment.text).toBe('long text')
+  expect(attachment.segments).toEqual([])
+  expect(JSON.parse(await fake.attachment(page.id, 'Transcript')).text).toBe('standard text')
+  expect((await store.page(page.id)).properties['Long status'].select.name).toBe('Completed')
+})

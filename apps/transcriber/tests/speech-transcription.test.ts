@@ -427,3 +427,37 @@ test('speech progress exposes concurrent interval positions and exact completed 
     await f.cleanup()
   }
 }, 15000)
+
+test('long mode retains pauses in a single source crop, returns text only, and isolates checkpoints', async () => {
+  const f = await fixture([segment(100, 1000, 'one'), segment(2000, 4000, 'two')])
+  try {
+    const recognize = async (path: string) => {
+      expect(await duration(path)).toBeCloseTo(3.9, 2)
+      return {
+        text: 'long passage',
+        segments: [{ start_ms: 0, end_ms: 200, text: 'provider time' }],
+      }
+    }
+    const long = await transcribeSpeech({ ...(await f.options()), mode: 'long', recognize })
+    expect(long.text).toBe('long passage')
+    expect(long.segments).toEqual([])
+    expect(long.outcome).toBe('transcribed')
+    const cached = await transcribeSpeech({
+      ...(await f.options()),
+      mode: 'long',
+      recognize: async () => {
+        throw Error('must reuse checkpoint')
+      },
+    })
+    expect(cached.text).toBe(long.text)
+    const standard = await transcribeSpeech({
+      ...(await f.options()),
+      recognize: async () => ({ text: 'standard' }),
+    })
+    expect(standard.checkpoint).not.toBe(long.checkpoint)
+    expect(standard.segments).toHaveLength(2)
+    await f.unchanged()
+  } finally {
+    await f.cleanup()
+  }
+}, 15000)

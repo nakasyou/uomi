@@ -2,7 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { fixture } from './helpers.js'
 import app from '../worker/app.ts'
-import { enqueue } from '../worker/jobs.ts'
+import { enqueue, enqueueLongDefault } from '../worker/jobs.ts'
 import { cachePage } from '../worker/notion-cache.ts'
 const request = (path, data, method = data ? 'POST' : 'GET') =>
   new Request('https://uomi.test' + path, {
@@ -411,6 +411,100 @@ test('detailed progress persists through heartbeat, status and list reads while 
       detail: { completed: 9, total: 8 },
     })
     assert.equal(invalid.status, 400)
+  } finally {
+    f.sqlite.close()
+  }
+})
+
+test('long jobs have independent status, durable text-only completion, failure and retry', async () => {
+  const f = fixture()
+  try {
+    recording(f)
+    f.sqlite
+      .prepare(
+        "UPDATE recordings SET status='Completed',text='original',detailed_status='Completed',detailed_text='detailed'",
+      )
+      .run()
+    const start = await call(f, '/api/recordings/recording/long-transcription', {})
+    assert.equal(start.status, 202)
+    assert.equal(start.long_status, 'Pending')
+    assert.equal(start.long_transcription.mode, 'long')
+    const claim = (await call(f, '/api/jobs/claim', { worker_id: 'long-worker' })).jobs[0]
+    const state = await call(f, '/api/recordings/recording/status')
+    assert.equal(state.long_status, 'Processing')
+    assert.equal(state.long_transcription.id, claim.id)
+    assert.equal(state.status, 'Completed')
+    const path = '/api/jobs/' + claim.id
+    assert.equal(
+      (
+        await call(f, path + '/fail', {
+          lease_token: claim.lease_token,
+          error: 'temporary',
+          retryable: false,
+        })
+      ).status,
+      'failed',
+    )
+    assert.equal((await call(f, '/api/recordings/recording')).long_error, 'temporary')
+    await call(f, '/api/recordings/recording/long-transcription', { retry: true })
+    const retry = (await call(f, '/api/jobs/claim', { worker_id: 'long-worker' })).jobs[0]
+    assert.equal(
+      (
+        await call(f, path + '/complete', {
+          lease_token: retry.lease_token,
+          text: 'long',
+          segments: [{ start_ms: 0, end_ms: 100, text: 'bad' }],
+        })
+      ).status,
+      400,
+    )
+    assert.equal(
+      (
+        await call(f, path + '/complete', {
+          lease_token: retry.lease_token,
+          text: 'long passage',
+          segments: [],
+          outcome: 'transcribed',
+        })
+      ).saved,
+      true,
+    )
+    assert.equal(
+      (await call(f, path + '/complete', { lease_token: retry.lease_token, text: 'long passage' }))
+        .duplicate,
+      true,
+    )
+    const full = await call(f, '/api/recordings/recording')
+    assert.equal(full.long_text, 'long passage')
+    assert.equal(full.long_status, 'Completed')
+    assert.equal(full.long_error, '')
+    assert.equal(full.text, 'original')
+    assert.equal(full.detailed_text, 'detailed')
+    const get = await call(f, '/api/recordings/recording/long-transcription')
+    assert.equal(get.long_transcription.status, 'completed')
+    assert.equal(get.long_text, 'long passage')
+  } finally {
+    f.sqlite.close()
+  }
+})
+
+test('automatic long enqueue is idempotent and preserves completed imported long text', async () => {
+  const f = fixture()
+  try {
+    recording(f)
+    await enqueueLongDefault(f.env, 'recording')
+    await enqueueLongDefault(f.env, 'recording')
+    assert.equal(f.sqlite.prepare('SELECT count(*) n FROM transcription_jobs').get().n, 1)
+    f.sqlite.prepare('DELETE FROM transcription_jobs').run()
+    f.sqlite
+      .prepare("UPDATE recordings SET long_status='Completed',long_text='imported long'")
+      .run()
+    await enqueueLongDefault(f.env, 'recording')
+    assert.equal(f.sqlite.prepare('SELECT count(*) n FROM transcription_jobs').get().n, 0)
+    assert.equal(
+      f.sqlite.prepare('SELECT long_text FROM recordings').get().long_text,
+      'imported long',
+    )
   } finally {
     f.sqlite.close()
   }

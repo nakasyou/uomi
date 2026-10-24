@@ -90,3 +90,12 @@ Native Bluetooth and background capture still require hardware verification.
 ## License
 
 [MIT](LICENSE). See [third-party notices](THIRD_PARTY_NOTICES.md).
+
+The Web Recorder also offers **Long · Chrome**, an automatic transcript between
+Transcript and Detailed · Codex. It ignores speaker boundaries and bridges silence
+of up to five seconds while retaining those pauses in the original audio. Longer
+pauses separate passages; each passage is capped at the same Google limit (600
+seconds, including pauses). It saves text only, independently of the other two
+versions, and shares the worker's two recognition slots and cached FluidAudio plan.
+New uploads and audio imports queue both standard and Long automatically. Existing
+recordings are not bulk retranscribed; use the Long tab to request them. Long results are included in optional Notion backups.

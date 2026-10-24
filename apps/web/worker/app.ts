@@ -16,7 +16,7 @@ import { NotionStore, httpTransport, validateManifest, type AudioManifest } from
 import mcp from './index.js'
 import { ranges, overlappingRecordingsSql } from './source-ranges.ts'
 export { ranges } from './source-ranges.ts'
-import { enqueue, jobsApi, jobView, ApiError } from './jobs.ts'
+import { enqueue, enqueueLongDefault, jobsApi, jobView, ApiError } from './jobs.ts'
 import { detailedTranscription } from './detailed-transcription.ts'
 import { resync, cachePage } from './notion-cache.ts'
 
@@ -194,6 +194,7 @@ async function ingest(request: Request, env: any, ctx: any) {
   if (old) {
     if (old.audio_sha !== sha) return json({ error: 'Chunk ID has different audio' }, 409)
     await enqueue(env, old.recording_id)
+    await enqueueLongDefault(env, old.recording_id)
     ctx.waitUntil(backup(env, old.recording_id))
     return json(
       {
@@ -298,7 +299,7 @@ async function ingest(request: Request, env: any, ctx: any) {
   try {
     await env.DB.batch([
       env.DB.prepare(
-        "INSERT INTO recordings(id,recorded_at,finished_at,edited_at,device,status,url,text,audio_key,audio_sha,duration_ms,manifest_key,backup_step,primary_owned) VALUES(?,?,?,?,?,'Pending','','',?,?,?,?,'page',1)",
+        "INSERT INTO recordings(id,recorded_at,finished_at,edited_at,device,status,url,text,audio_key,audio_sha,duration_ms,manifest_key,backup_step,primary_owned,long_status) VALUES(?,?,?,?,?,'Pending','','',?,?,?,?,'page',1,'Pending')",
       ).bind(
         id,
         start,
@@ -311,8 +312,9 @@ async function ingest(request: Request, env: any, ctx: any) {
         manifestKey,
       ),
       env.DB.prepare(
-        "INSERT OR IGNORE INTO transcription_jobs(id,recording_id,mode,created_at,updated_at) VALUES(?,?,'standard',?,?)",
-      ).bind(id + ':standard', id, Date.now(), Date.now()),
+        `INSERT OR IGNORE INTO transcription_jobs(id,recording_id,mode,created_at,updated_at)
+         SELECT ?||':'||value,?,value,?,? FROM json_each('["standard","long"]')`,
+      ).bind(id, id, Date.now(), Date.now()),
       // One statement keeps all claims atomic without a statement per source packet.
       env.DB.prepare(`INSERT INTO source_ranges
         SELECT ?,json_extract(value,'$.prefix'),json_extract(value,'$.start'),json_extract(value,'$.end'),
@@ -463,6 +465,16 @@ export async function backup(env: any, id: string) {
             'standard',
             JSON.parse(row.transcript_segments),
           )
+        if (row.long_status === 'Completed') {
+          await store.setup()
+          await store.saveTranscript(
+            row.backup_page,
+            row.long_text,
+            'chrome-recognizetion',
+            'long',
+            [],
+          )
+        }
         if (row.detailed_status === 'Completed')
           await store.saveTranscript(
             row.backup_page,
@@ -680,15 +692,16 @@ async function api(request: Request, env: any, ctx: any, role: string) {
     })
   }
   const match = path.match(
-    /^\/api\/recordings\/([a-zA-Z0-9-]+)(?:\/(audio|manifest|backup|transcript|transcription|resync|status|transcribe|detailed-transcription))?$/,
+    /^\/api\/recordings\/([a-zA-Z0-9-]+)(?:\/(audio|manifest|backup|transcript|transcription|resync|status|transcribe|detailed-transcription|long-transcription))?$/,
   )
   if (match) {
     const [, id, action] = match
     if (action === 'status' && method === 'GET') {
       const status =
-        await env.DB.prepare(`SELECT r.id,r.revision,r.status,r.detailed_status,r.backup_revision,r.backup_until,r.backup_step,r.backup_error,r.audio_key IS NOT NULL AS has_audio,r.edited_at AS updated_at,
+        await env.DB.prepare(`SELECT r.id,r.revision,r.status,r.detailed_status,r.long_status,r.backup_revision,r.backup_until,r.backup_step,r.backup_error,r.audio_key IS NOT NULL AS has_audio,r.edited_at AS updated_at,
         (SELECT json_object('id',j.id,'recording_id',j.recording_id,'mode',j.mode,'status',j.status,'stage',j.stage,'progress',j.progress,'detail',json(j.progress_detail),'attempt',j.attempt,'error',j.error,'lease_until',j.lease_until,'updated_at',j.updated_at,'available_at',j.available_at) FROM transcription_jobs j WHERE j.recording_id=r.id AND mode='standard') AS transcription_json,
-        (SELECT json_object('id',j.id,'recording_id',j.recording_id,'mode',j.mode,'status',j.status,'stage',j.stage,'progress',j.progress,'detail',json(j.progress_detail),'attempt',j.attempt,'error',j.error,'lease_until',j.lease_until,'updated_at',j.updated_at,'available_at',j.available_at) FROM transcription_jobs j WHERE j.recording_id=r.id AND mode='detailed') AS detailed_json
+        (SELECT json_object('id',j.id,'recording_id',j.recording_id,'mode',j.mode,'status',j.status,'stage',j.stage,'progress',j.progress,'detail',json(j.progress_detail),'attempt',j.attempt,'error',j.error,'lease_until',j.lease_until,'updated_at',j.updated_at,'available_at',j.available_at) FROM transcription_jobs j WHERE j.recording_id=r.id AND mode='detailed') AS detailed_json,
+        (SELECT json_object('id',j.id,'recording_id',j.recording_id,'mode',j.mode,'status',j.status,'stage',j.stage,'progress',j.progress,'detail',json(j.progress_detail),'attempt',j.attempt,'error',j.error,'lease_until',j.lease_until,'updated_at',j.updated_at,'available_at',j.available_at) FROM transcription_jobs j WHERE j.recording_id=r.id AND mode='long') AS long_json
         FROM recordings r WHERE r.id=?`)
           .bind(id)
           .first()
@@ -701,6 +714,8 @@ async function api(request: Request, env: any, ctx: any, role: string) {
         detailed_transcription: status.detailed_json ? JSON.parse(status.detailed_json) : null,
         transcription_json: undefined,
         detailed_json: undefined,
+        long_transcription: status.long_json ? JSON.parse(status.long_json) : null,
+        long_json: undefined,
       })
     }
     let row = await env.DB.prepare('SELECT * FROM recordings WHERE id=?').bind(id).first()
@@ -721,13 +736,23 @@ async function api(request: Request, env: any, ctx: any, role: string) {
         202,
       )
     }
-    if (action === 'detailed-transcription' && ['GET', 'POST'].includes(method)) {
+    if (
+      ['detailed-transcription', 'long-transcription'].includes(action) &&
+      ['GET', 'POST'].includes(method)
+    ) {
       if (role !== 'owner') return json({ error: 'Owner access required' }, 403)
       const data = method === 'POST' && request.body ? await body(request, 4096) : {}
       if (data.retry !== undefined && typeof data.retry !== 'boolean')
         throw new ApiError('retry must be a boolean')
       return json(
-        await detailedTranscription(env, ctx, row, method === 'POST', data.retry === true),
+        await detailedTranscription(
+          env,
+          ctx,
+          row,
+          method === 'POST',
+          data.retry === true,
+          action === 'long-transcription' ? 'long' : 'detailed',
+        ),
         method === 'POST' ? 202 : 200,
       )
     }
@@ -823,6 +848,7 @@ async function api(request: Request, env: any, ctx: any, role: string) {
       return json({
         transcription: jobView(jobs.results.find((j: any) => j.mode === 'standard')),
         detailed_transcription: jobView(jobs.results.find((j: any) => j.mode === 'detailed')),
+        long_transcription: jobView(jobs.results.find((j: any) => j.mode === 'long')),
         segments: JSON.parse(row.transcript_segments),
         detailed_segments: JSON.parse(row.detailed_segments),
         id: row.id,
@@ -835,6 +861,9 @@ async function api(request: Request, env: any, ctx: any, role: string) {
         detailed_status: row.detailed_status,
         detailed_text: row.detailed_text,
         detailed_error: row.detailed_error,
+        long_status: row.long_status,
+        long_text: row.long_text,
+        long_error: row.long_error,
         starred: !!row.starred,
         has_audio: !!row.audio_key,
         ...backupState(env, row),

@@ -266,7 +266,8 @@ test('missing-audio hydration preserves concurrent primary edits/results and rep
     assert.equal(row.backup_revision, -1)
     assert.ok(row.audio_key)
     assert.equal(f.sqlite.prepare('SELECT prefix FROM source_ranges').get().prefix, 'new:')
-    assert.equal(f.sqlite.prepare('SELECT count(*) n FROM transcription_jobs').get().n, 0)
+    assert.equal(f.sqlite.prepare('SELECT count(*) n FROM transcription_jobs').get().n, 1)
+    assert.equal(f.sqlite.prepare('SELECT mode FROM transcription_jobs').get().mode, 'long')
   } finally {
     globalThis.fetch = original
     f.sqlite.close()
