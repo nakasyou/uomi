@@ -131,7 +131,7 @@ function SyncApp() {
               {state.phase}
             </Text>
             <Text variant="bodyMedium">
-              {pending} recordings waiting · {records.length - pending} saved on server
+              {pending} local records waiting · {records.length - pending} local records synced
             </Text>
             {(!state.settings.endpoint || !state.hasSecret) && (
               <Button mode="contained" onPress={() => setTab('settings')}>
@@ -175,7 +175,11 @@ function SyncApp() {
                     <Text variant="bodyMedium" selectable>
                       {upload.id.slice(0, 12)} ·{' '}
                       {upload.transcription
-                        ? `${upload.transcription.status} · ${upload.transcription.stage} · ${Math.round(upload.transcription.progress * 100)}%`
+                        ? upload.transcription.stage === 'completed_no_speech'
+                          ? 'Completed · No speech detected'
+                          : upload.transcription.stage === 'completed_empty'
+                            ? 'Completed · No transcript returned'
+                            : `${upload.transcription.status} · ${upload.transcription.stage} · ${Math.round(upload.transcription.progress * 100)}%`
                         : 'Not queued'}
                     </Text>
                     {!!upload.transcription?.error && (

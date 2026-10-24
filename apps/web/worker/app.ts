@@ -356,7 +356,7 @@ async function ingest(request: Request, env: any, ctx: any) {
 }
 
 // Durable checkpoints are authoritative. waitUntil is only an opportunistic runner.
-export async function backup(env: any, id: string) {
+export async function backup(env: any, id: string, retryCreation = false) {
   const token = crypto.randomUUID(),
     now = Date.now()
   let row = await env.DB.prepare('SELECT * FROM recordings WHERE id=? AND audio_key IS NOT NULL')
@@ -388,30 +388,43 @@ export async function backup(env: any, id: string) {
       )
     Object.assign(row, extra, { backup_step: step })
   }
+  let createJournaled = false,
+    createMayHaveSucceeded = false
   try {
     if (!env.NOTION_TOKEN || !env.NOTION_DATA_SOURCE_ID)
       throw Error('Configure Notion backup credentials')
-    const transport = httpTransport(env.NOTION_TOKEN, ((url: any, init: any) =>
-      fetch(url, {
+    const transport = httpTransport(env.NOTION_TOKEN, (async (url: any, init: any) => {
+      const creating = init.method === 'POST' && new URL(url).pathname === '/v1/pages'
+      if (creating) createMayHaveSucceeded = true
+      const response = await fetch(url, {
         ...init,
         signal: AbortSignal.timeout(Math.max(1000, Math.min(7000, deadline - Date.now()))),
-      })) as typeof fetch)
+      })
+      // Explicit validation/auth/rate-limit rejections did not create a page.
+      // Timeouts and server failures remain ambiguous and must be reconciled.
+      if (creating && [400, 401, 403, 404, 422, 429].includes(response.status))
+        createMayHaveSucceeded = false
+      return response
+    }) as typeof fetch)
     const store = new NotionStore(transport, env.NOTION_DATA_SOURCE_ID)
     const manifest = await loadManifest(env, row)
     while (Date.now() < deadline - 2500) {
       if (row.backup_step === 'page' || row.backup_step === 'uncertain') {
         await store.setup()
-        const existing = await store.find(id)
+        const existing = await store.find(manifest.id)
         if (existing) {
           await checkpoint('audio', { backup_page: existing.id })
           continue
         }
-        if (row.backup_step === 'uncertain')
+        if (row.backup_step === 'uncertain' && !retryCreation)
           throw Error(
             'Notion page creation is unconfirmed; retry backup after checking the backup destination',
           )
+        // Leave enough time for the paced create request and durable checkpoint.
+        if (Date.now() > deadline - 10000) break
         await checkpoint('uncertain')
-        const page = await store.reserve(manifest)
+        createJournaled = true
+        const page = await store.createReservedPage(manifest)
         await checkpoint('audio', { backup_page: page.id })
       } else if (row.backup_step === 'audio') {
         const file = await env.BUCKET.get(row.audio_key)
@@ -489,6 +502,8 @@ export async function backup(env: any, id: string) {
       } else break
     }
   } catch (e) {
+    if (createJournaled && !createMayHaveSucceeded && row.backup_step === 'uncertain')
+      await checkpoint('page')
     console.error(
       JSON.stringify({
         event: 'notion_backup_failed',
@@ -795,24 +810,13 @@ async function api(request: Request, env: any, ctx: any, role: string) {
           'audio_unavailable',
         )
       await env.DB.prepare('UPDATE recordings SET backup_next_attempt=0 WHERE id=?').bind(id).run()
-      if (row.backup_step === 'uncertain') {
-        const store = new NotionStore(httpTransport(env.NOTION_TOKEN), env.NOTION_DATA_SOURCE_ID)
-        const page = await store.find(id)
-        if (!page)
-          return json(
-            {
-              error:
-                'Page creation outcome is uncertain. Check Notion before allowing another creation.',
-            },
-            409,
-          )
-        await env.DB.prepare(
-          "UPDATE recordings SET backup_page=?,backup_step='audio' WHERE id=? AND backup_step='uncertain'",
-        )
-          .bind(page.id, id)
-          .run()
-      }
-      ctx.waitUntil(backup(env, id))
+      const options = request.headers.get('content-type')?.includes('application/json')
+        ? await body(request, 4096)
+        : {}
+      if (options.retry_creation !== undefined && typeof options.retry_creation !== 'boolean')
+        throw new ApiError('retry_creation must be a boolean')
+      // Reconcile and optionally recreate under the same lease as automatic backups.
+      ctx.waitUntil(backup(env, id, options.retry_creation === true))
       return json({ accepted: true }, 202)
     }
     if (!action && method === 'PATCH') {

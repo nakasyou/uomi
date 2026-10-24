@@ -790,14 +790,20 @@ function App() {
                           void action('backup', async () => {
                             await api(`/api/recordings/${selected.id}/backup`, {
                               method: 'POST',
-                              body: '{}',
+                              body: JSON.stringify({
+                                retry_creation: selected.backup_status === 'uncertain',
+                              }),
                             })
                             merge(selected.id, await api('/api/recordings/' + selected.id))
                             setNotice('Backup requested.', 'success')
                           })
                         }
                       >
-                        {busy === 'backup' ? 'Requesting…' : 'Retry backup'}
+                        {busy === 'backup'
+                          ? 'Requesting…'
+                          : selected.backup_status === 'uncertain'
+                            ? 'Reconcile & retry backup'
+                            : 'Retry backup'}
                       </button>
                       {selected.url && (
                         <a href={selected.url} target="_blank" rel="noreferrer">

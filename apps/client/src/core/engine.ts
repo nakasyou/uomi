@@ -154,8 +154,9 @@ export class Engine {
         (!this.snapshot.uploadJobs?.length ||
           this.snapshot.uploadJobs.some(
             (job) =>
-              job.transcription &&
-              !['done', 'completed', 'failed'].includes(job.transcription.status),
+              (job.transcription &&
+                !['done', 'completed', 'failed'].includes(job.transcription.status)) ||
+              ['pending', 'processing', 'retry', 'uncertain'].includes(job.backup_status ?? ''),
           ))
       )
         this.jobTimer = setTimeout(() => void this.refreshUploadJobs(), 15000)

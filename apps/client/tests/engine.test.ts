@@ -1001,3 +1001,44 @@ test('native saved-status acknowledgements update metadata without rereading aud
   assert.equal(f.data.get('record:parallel'), original)
   e.dispose()
 })
+
+test('completed transcription continues refreshing until Notion backup is saved', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const f = localAudioFixture(1)
+  let saved = false,
+    calls = 0
+  f.port.post = async () => {
+    saved = true
+    return true
+  }
+  f.port.uploadStatus = async (_endpoint, _header, ids) => {
+    calls++
+    return ids.map((id) => ({
+      id,
+      status: saved ? 'saved' : 'missing',
+      transcription: { id, status: 'completed', stage: 'completed', progress: 1, attempt: 1 },
+      backup_status: calls > 4 ? 'saved' : 'retry',
+      backup_error: calls > 4 ? null : 'Temporary Notion failure',
+    }))
+  }
+  const e = new Engine(f.port)
+  try {
+    await e.init()
+    await e.syncCloud()
+    await e.setActive(true)
+    await new Promise((resolve) => setImmediate(resolve))
+    const initialCalls = calls
+    t.mock.timers.tick(15000)
+    await new Promise((resolve) => setImmediate(resolve))
+    assert.ok(calls > initialCalls, 'backup retries continue after completed ASR')
+    t.mock.timers.tick(15000)
+    await new Promise((resolve) => setImmediate(resolve))
+    assert.equal(e.getSnapshot().uploadJobs?.[0].backup_error, null)
+    const completedCalls = calls
+    t.mock.timers.tick(15000)
+    await new Promise((resolve) => setImmediate(resolve))
+    assert.equal(calls, completedCalls, 'polling stops once both transcription and backup finish')
+  } finally {
+    e.dispose()
+  }
+})
