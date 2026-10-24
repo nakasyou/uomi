@@ -583,7 +583,7 @@ function App() {
                 >
                   <span className="recording-title">
                     {recordingStart(r.recorded_at)}
-                    {r.starred && <Icon name="star" />}
+                    {!!r.starred && <Icon name="star" />}
                   </span>
                   <span className="recording-meta">
                     <span>{clock(durationOf(r))}</span>
