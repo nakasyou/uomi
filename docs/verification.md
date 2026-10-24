@@ -520,3 +520,54 @@ successfully as Sites deployment `appgdep_6adb850e43608191aebc81f562c32f2c`, sou
 `c8479cac6534ac3dc25f42816cb4018a184e8edc`, environment revision 11, at the existing
 private Uomi URL. Existing completed/failed recordings were not automatically
 requeued; a manual rerun uses the new pipeline.
+
+## Chrome duplex transport and empty-result correction (2026-10-24 JST)
+
+The production rerun audit distinguished 40 completed results: 27 had zero
+FluidAudio speech intervals, ten had detected speech but empty Google text, and
+three had nonempty text. An empty completed transcript alone did not establish
+that the audio was silent. The previous UI incorrectly labeled all three empty
+cases as `No speech detected`.
+
+Revision `d0cb8e92c02be5709d893a860ac2c1dac6fda7fe` changes Chrome uploads from a
+fixed-length Buffer to a streaming request with a one-second minimum pairing
+window. A local real-HTTP regression asserts `Transfer-Encoding: chunked`, no
+`Content-Length`, intact bytes, and retention of the short upload. An immediate
+stream close still reproduced missing-pair HTTP 400/500 on Mac mini; retaining
+the pairing window completed all 14 synthetic speech intervals in one attempt,
+with six nonempty text segments, 258 characters, both speaker labels, original
+offsets, two-request maximum concurrency, and unchanged source bytes. A second
+run encountered one `Stream pair ID is not unique` upstream 400 and completed
+on retry. A final run completed all 14 calls in the first job attempt without
+errors. Slice-level retries now recognize both pairing errors, HTTP 429 and 5xx,
+with fresh pairs and a maximum of three calls per slice; the eight-job-attempt
+limit remains. Cancellation propagates to the provider upload and pairing timer.
+The transport checkpoint version changed so prior empty/partial ASR results do
+not silently pass through the repaired transport.
+
+Completion now accepts a validated outcome and stores `completed_no_speech` for
+zero VAD slices or `completed_empty` for speech with no recognized text. Existing
+empty completions retain unknown provenance. The UI labels these cases
+separately, and tests reject empty outcomes paired with text or segments. No
+schema migration or source-audio mutation was needed.
+
+Full tests, typechecks, daemon/site builds and repository lint/format passed;
+59 Bun tests include transport, cancellation/checkpoint and outcome regressions.
+The web source `6a71d773097df70ef03a5e44073b83d62cff08c6` was published privately
+as deployment `appgdep_6adc33d32c9c819183d825b04a97a5fe`, environment revision 11.
+The Mac mini source hash is
+`1wl679rv20jih93i93yxbcg6zv2y860fs92sx8d64r5w2y4xvgcl`; the complete Nix build
+produced `/nix/store/wc32r6h1cmsfvdcx1frqc8pcr9bjxx56-darwin-system-26.05.c3e90c8`.
+The generated user LaunchAgent replaced the old daemon after termination,
+retaining credentials, checkpoints, prior logs and GC roots. PID 11030 uses
+`/nix/store/0h28y3qy8ha8cbjbd2514qll0qd0hyw0-uomi-transcriber-launch` and
+`/nix/store/8g3n0sr86wnkyy8irgviqxrfc9pid3hi-uomi-transcriber-2026-10-24-d0cb8e9`.
+Health reported `ok`, `error:null`, two active jobs and limits 600/300 seconds.
+
+After activation, production recording `401f60d4-5c99-817c-a839-d68315894030`
+completed with a ten-character transcript and one original-time segment; its
+speaker was honestly unattributed. The daemon remained healthy with no stored
+error and two active jobs. An authenticated audit selected 51 legacy empty
+completions from the authorized 211-recording rerun and successfully requeued
+all 51 with zero API errors. Completed nonempty text and active jobs were
+preserved; queued/retry jobs naturally continue through the repaired worker.
