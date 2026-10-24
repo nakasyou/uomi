@@ -1,6 +1,13 @@
 import React, { useEffect, useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import { api } from './api'
+import {
+  recordingStart,
+  recordingTitle as title,
+  recordingDate as date,
+  japanTime,
+} from './recording-time'
+import { stageLabel, progressLines, type ProgressDetail } from './job-progress'
 import { speakerLabel } from './speaker-label'
 import { mergeRecording, mergeRecordingPage } from './recording-state'
 import './style.css'
@@ -10,6 +17,7 @@ type Job = {
   status: string
   stage: string
   progress: number
+  detail?: ProgressDetail
   attempt: number
   error?: string
   updated_at: number
@@ -83,26 +91,6 @@ const clock = (s: number) =>
   Number.isFinite(s)
     ? `${Math.floor(Math.max(0, s) / 60)}:${String(Math.floor(Math.max(0, s) % 60)).padStart(2, '0')}`
     : '0:00'
-const date = (v: number | null) =>
-  v
-    ? new Date(v).toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' })
-    : 'Unknown date'
-const title = (r: Recording) =>
-  r.title ||
-  (r.recorded_at
-    ? new Date(r.recorded_at).toLocaleString(undefined, {
-        month: 'short',
-        day: 'numeric',
-        hour: '2-digit',
-        minute: '2-digit',
-      })
-    : 'Untimed recording')
-const recordingStart = (value: number | null) => {
-  if (value === null) return 'Untimed recording'
-  const start = new Date(value)
-  const pad = (n: number) => String(n).padStart(2, '0')
-  return `${start.getFullYear()}/${pad(start.getMonth() + 1)}/${pad(start.getDate())} ${pad(start.getHours())}:${pad(start.getMinutes())}`
-}
 const durationOf = (r: Recording) =>
   Math.max(0, (r.duration_ms ?? Math.max(0, (r.finished_at ?? 0) - (r.recorded_at ?? 0))) / 1000)
 const active = (j: Job | undefined | null) =>
@@ -126,14 +114,23 @@ function JobState({
     )
   return (
     <div className="job-state" role="status">
-      <strong>{job.status === 'completed' ? 'Completed' : job.stage || job.status}</strong>
-      {active(job) && job.progress > 0 && <progress max="1" value={job.progress} />}
+      <strong>{stageLabel(job.stage, job.status)}</strong>
+      {active(job) && (
+        <progress
+          max="1"
+          {...(job.progress > 0 ? { value: job.progress } : {})}
+          aria-label="Recording processing progress"
+        />
+      )}
+      {progressLines(job.detail).map((line) => (
+        <span key={line}>{line}</span>
+      ))}
       <span>
         Attempt {job.attempt}
-        {job.updated_at ? ` · ${new Date(job.updated_at).toLocaleTimeString()}` : ''}
+        {job.updated_at ? ` · Updated ${japanTime(job.updated_at)} JST` : ''}
       </span>
       {job.status === 'retry' && job.available_at > Date.now() && (
-        <span>Retry at {new Date(job.available_at).toLocaleTimeString()}</span>
+        <span>Retry at {japanTime(job.available_at)}</span>
       )}
       {job.error && <p className="error">{job.error}</p>}
     </div>
@@ -216,10 +213,10 @@ function App() {
       }
       const p = new URLSearchParams()
       if (search) p.set('q', search)
-      if (from) p.set('from', new Date(from + 'T00:00:00').toISOString())
+      if (from) p.set('from', new Date(from + 'T00:00:00+09:00').toISOString())
       if (to) {
-        const end = new Date(to + 'T00:00:00')
-        end.setDate(end.getDate() + 1)
+        const end = new Date(to + 'T00:00:00+09:00')
+        end.setTime(end.getTime() + 86400000)
         p.set('to', end.toISOString())
       }
       if (from && to && from > to) throw Error('The start date must be before the end date.')
@@ -587,7 +584,11 @@ function App() {
                   </span>
                   <span className="recording-meta">
                     <span>{clock(durationOf(r))}</span>
-                    <span>{r.status}</span>
+                    <span>
+                      {r.transcription
+                        ? stageLabel(r.transcription.stage, r.transcription.status)
+                        : r.status}
+                    </span>
                   </span>
                   {r.preview && <span className="recording-preview">{r.preview}</span>}
                 </button>

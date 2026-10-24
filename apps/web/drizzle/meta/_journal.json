@@ -64,6 +64,13 @@
       "when": 1792816604132,
       "tag": "0008_reset_transcripts",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "6",
+      "when": 1792819142541,
+      "tag": "0009_job_progress",
+      "breakpoints": true
     }
   ]
 }

@@ -40,9 +40,8 @@ test('requested transcript reset clears both modes and search, fences old leases
       before,
     )
     assert.equal(
-      f.sqlite
-        .prepare("SELECT count(*) AS n FROM transcripts WHERE transcripts MATCH 'sec'")
-        .get().n,
+      f.sqlite.prepare("SELECT count(*) AS n FROM transcripts WHERE transcripts MATCH 'sec'").get()
+        .n,
       0,
     )
     const jobs = f.sqlite.prepare('SELECT * FROM transcription_jobs').all()

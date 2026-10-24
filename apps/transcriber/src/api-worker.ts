@@ -13,6 +13,7 @@ import { saveCheckpoint } from './checkpoint'
 export { saveCheckpoint } from './checkpoint'
 import { audioProcess, WorkSlots } from './process'
 import { transcribeSpeech } from './speech-transcription'
+import type { ProgressDetail } from './progress'
 
 export interface Job {
   id: string
@@ -146,7 +147,12 @@ export class ApiWorker {
     this.stopped = true
     await Promise.allSettled(this.active)
   }
-  private async download(path: string, signal: AbortSignal, maxBytes: number): Promise<Uint8Array> {
+  private async download(
+    path: string,
+    signal: AbortSignal,
+    maxBytes: number,
+    onProgress?: (received: number, total: number) => Promise<void>,
+  ): Promise<Uint8Array> {
     const url = new URL(path, this.config.url)
     if (url.origin !== new URL(this.config.url).origin)
       throw Error('Job attachment URL must use the API origin.')
@@ -182,6 +188,7 @@ export class ApiWorker {
         throw Error('Attachment exceeds size limit.')
       }
       chunks.push(part.value)
+      await onProgress?.(size, Number(response.headers.get('content-length')) || 0)
     }
     return Buffer.concat(chunks)
   }
@@ -218,6 +225,7 @@ export class ApiWorker {
     const controller = new AbortController()
     let stage = 'downloading'
     let progress = 0
+    let detail: ProgressDetail = {}
     let heartbeatBusy = false
     let heartbeatFailures = 0
     let lastHeartbeat = 0
@@ -228,7 +236,7 @@ export class ApiWorker {
       try {
         await this.request(
           `/api/jobs/${encodeURIComponent(job.id)}/heartbeat`,
-          { lease_token: job.lease_token, stage, progress, lease_seconds: 180 },
+          { lease_token: job.lease_token, stage, progress, detail, lease_seconds: 180 },
           controller.signal,
         )
         heartbeatFailures = 0
@@ -255,8 +263,19 @@ export class ApiWorker {
       controller.signal.throwIfAborted()
       const [manifestBytes, audio] = await Promise.all([
         this.download(job.manifest_url, controller.signal, 8 * 1024 * 1024),
-        this.download(job.audio_url, controller.signal, 128 * 1024 * 1024),
+        this.download(
+          job.audio_url,
+          controller.signal,
+          128 * 1024 * 1024,
+          async (bytes_received, bytes_total) => {
+            detail = { bytes_received, bytes_total }
+            if (Date.now() - lastHeartbeat >= 3000) await beat()
+          },
+        ),
       ])
+      stage = 'verifying'
+      detail = {}
+      await beat()
       const manifest = JSON.parse(Buffer.from(manifestBytes).toString())
       validateManifest(manifest)
       // Migrated rows use their Notion page ID; manifest.id retains the original capture ID.
@@ -291,15 +310,24 @@ export class ApiWorker {
           timeoutMs: this.config.timeoutMs,
           signal: controller.signal,
           analyze: (work) => this.analysisSlots.run(controller.signal, work),
-          recognize: (audioPath, options, signal) =>
-            this.recognitionSlots.run(signal, () =>
-              this.recognize(audioPath, { ...options, signal }),
-            ),
-          stage: async (value, valueProgress) => {
+          recognize: (audioPath, options, signal, onStart) =>
+            this.recognitionSlots.run(signal, async () => {
+              await onStart?.()
+              return this.recognize(audioPath, { ...options, signal })
+            }),
+          stage: async (value, valueProgress, valueDetail) => {
             const changed = stage !== value
             stage = value
             progress = valueProgress
-            if (changed || Date.now() - lastHeartbeat >= 3000) await beat()
+            const previousDetail = detail
+            detail = valueDetail ?? {}
+            if (
+              changed ||
+              previousDetail.completed !== detail.completed ||
+              JSON.stringify(previousDetail.active) !== JSON.stringify(detail.active) ||
+              Date.now() - lastHeartbeat >= 3000
+            )
+              await beat()
           },
         })
         checkpoint = speech.checkpoint
@@ -330,6 +358,7 @@ export class ApiWorker {
             throw Error(`Cannot read transcription checkpoint ${checkpoint}: ${errorDetail(error)}`)
         }
         stage = 'decoding'
+        detail = {}
         await beat()
         controller.signal.throwIfAborted()
         await audioProcess(
@@ -365,12 +394,30 @@ export class ApiWorker {
         if (!files.length || chunks.length > files.length)
           throw Error('Audio split does not match transcription checkpoint.')
         for (let i = chunks.length; i < files.length; i++) {
-          stage = 'transcribing'
+          stage = 'waiting_recognition'
           progress = i / files.length
+          detail = {
+            completed: i,
+            total: files.length,
+            active: [
+              {
+                index: i + 1,
+                start_ms: i * splitSeconds * 1000,
+                end_ms: Math.round(Math.min((i + 1) * splitSeconds * 1000, manifest.durationMs)),
+                attempt: 1,
+                state: 'waiting',
+              },
+            ],
+          }
           await beat()
           controller.signal.throwIfAborted()
           const result = await this.recognitionSlots.run(controller.signal, async () => {
+            stage = 'waiting_rate_limit'
+            await beat()
             await this.pace(controller.signal)
+            stage = 'transcribing'
+            detail.active![0].state = 'transcribing'
+            await beat()
             return this.recognize(join(directory!, files[i]), {
               provider,
               language: this.config.language,
@@ -401,6 +448,7 @@ export class ApiWorker {
         }
       }
       stage = 'saving'
+      detail = { ...detail, completed: detail.total, active: [] }
       progress = 1
       await beat()
       controller.signal.throwIfAborted()

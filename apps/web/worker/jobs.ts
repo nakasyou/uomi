@@ -17,6 +17,7 @@ export const jobView = (row: any) =>
     status: row.status,
     stage: row.stage,
     progress: row.progress,
+    detail: JSON.parse(row.progress_detail ?? '{}'),
     attempt: row.attempt,
     error: row.error,
     lease_until: row.lease_until,
@@ -32,7 +33,7 @@ export async function enqueue(env: any, recordingId: string, mode = 'standard', 
     .run()
   if (retry)
     await env.DB.prepare(`UPDATE transcription_jobs SET status='queued',stage='queued',error=NULL,
-    progress=0,attempt=0,available_at=0,updated_at=? WHERE id=? AND status IN ('failed','completed')`)
+    progress=0,progress_detail='{}',attempt=0,available_at=0,updated_at=? WHERE id=? AND status IN ('failed','completed')`)
       .bind(now, id)
       .run()
   return env.DB.prepare('SELECT * FROM transcription_jobs WHERE id=?').bind(id).first()
@@ -112,7 +113,7 @@ export async function jobsApi(request: Request, env: any, data: any) {
         JOIN recordings r ON r.id=j.recording_id WHERE j.status='processing' AND j.attempt<j.max_attempts
         AND j.lease_until<=? AND r.audio_key IS NOT NULL ORDER BY j.lease_until,j.created_at,j.id LIMIT ?)
     ) UPDATE transcription_jobs SET status='processing',worker_id=?,lease_token=?,lease_until=?,attempt=attempt+1,
-      stage='downloading',progress=0,error=NULL,updated_at=? WHERE id IN(
+      stage='downloading',progress=0,progress_detail='{}',error=NULL,updated_at=? WHERE id IN(
       SELECT id FROM candidates ORDER BY ready_at,created_at,id LIMIT ?) RETURNING *`)
       .bind(now, limit, now, limit, data.worker_id, token, now + seconds * 1000, now, limit)
       .all()
@@ -167,13 +168,18 @@ export async function jobsApi(request: Request, env: any, data: any) {
       throw new ApiError('progress must be between 0 and 1')
     if (data.stage !== undefined && (typeof data.stage !== 'string' || data.stage.length > 100))
       throw new ApiError('Invalid stage')
+    const detail =
+      data.detail === undefined
+        ? job.progress_detail
+        : JSON.stringify(validateProgress(data.detail))
     const r = await env.DB.prepare(
-      `UPDATE transcription_jobs SET lease_until=?,stage=?,progress=?,updated_at=? WHERE id=? AND lease_token=? AND status='processing' AND lease_until>?`,
+      `UPDATE transcription_jobs SET lease_until=?,stage=?,progress=?,progress_detail=?,updated_at=? WHERE id=? AND lease_token=? AND status='processing' AND lease_until>?`,
     )
       .bind(
         now + seconds * 1000,
         data.stage ?? job.stage,
         data.progress ?? job.progress,
+        detail,
         now,
         id,
         data.lease_token,
@@ -262,4 +268,58 @@ export async function jobsApi(request: Request, env: any, data: any) {
   ])
   if (!result[1].meta.changes) throw new ApiError('Job lease replaced', 409, 'lease_conflict')
   return { saved: true }
+}
+
+export function validateProgress(value: any) {
+  if (!value || typeof value !== 'object' || Array.isArray(value))
+    throw new ApiError('Invalid progress detail')
+  const detail: any = {}
+  for (const key of [
+    'completed',
+    'total',
+    'analyzed_ms',
+    'duration_ms',
+    'bytes_received',
+    'bytes_total',
+  ]) {
+    if (value[key] !== undefined) {
+      if (!Number.isSafeInteger(value[key]) || value[key] < 0)
+        throw new ApiError('Invalid progress count')
+      detail[key] = value[key]
+    }
+  }
+  if (
+    detail.completed !== undefined &&
+    (detail.total === undefined || detail.completed > detail.total)
+  )
+    throw new ApiError('Invalid completed count')
+  if (value.active !== undefined) {
+    if (!Array.isArray(value.active) || value.active.length > 2)
+      throw new ApiError('Invalid active intervals')
+    detail.active = value.active.map((a: any) => {
+      if (
+        !a ||
+        !Number.isSafeInteger(a.index) ||
+        a.index < 1 ||
+        a.index > (detail.total ?? 0) ||
+        !Number.isSafeInteger(a.start_ms) ||
+        a.start_ms < 0 ||
+        !Number.isSafeInteger(a.end_ms) ||
+        a.end_ms < a.start_ms ||
+        !Number.isSafeInteger(a.attempt) ||
+        a.attempt < 1 ||
+        a.attempt > 3 ||
+        !['waiting', 'transcribing', 'retrying'].includes(a.state)
+      )
+        throw new ApiError('Invalid active interval')
+      return {
+        index: a.index,
+        start_ms: a.start_ms,
+        end_ms: a.end_ms,
+        attempt: a.attempt,
+        state: a.state,
+      }
+    })
+  }
+  return detail
 }

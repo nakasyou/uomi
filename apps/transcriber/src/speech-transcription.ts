@@ -12,7 +12,8 @@ import {
   type SpeechPlan,
 } from './speech-plan'
 
-type Stage = (stage: string, progress: number) => Promise<void>
+import type { ProgressDetail } from './progress'
+type Stage = (stage: string, progress: number, detail?: ProgressDetail) => Promise<void>
 export async function transcribeSpeech(options: {
   audioPath: string
   directory: string
@@ -31,6 +32,7 @@ export async function transcribeSpeech(options: {
     path: string,
     options: TranscribeOptions,
     signal: AbortSignal,
+    onStart?: () => Promise<void>,
   ) => Promise<Transcription>
   stage: Stage
 }) {
@@ -71,6 +73,7 @@ export async function transcribeSpeech(options: {
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT')
       throw Error(`Cannot read speech plan: ${String(error)}`)
+    await options.stage('waiting_analysis', 0)
     plan = await options.analyze(async () => {
       await options.stage('diarizing', 0)
       const output = join(directory, 'speech.json')
@@ -82,7 +85,12 @@ export async function transcribeSpeech(options: {
         analysisSignal,
         Math.max(180000, Math.min(1800000, options.durationMs * 2)),
         (progress) => {
-          updates = updates.then(() => options.stage('diarizing', progress * 0.2))
+          updates = updates.then(() =>
+            options.stage('diarizing', progress * 0.2, {
+              analyzed_ms: Math.round(progress * options.durationMs),
+              duration_ms: Math.round(options.durationMs),
+            }),
+          )
           // The original rejection is awaited below; cancellation also stops inference promptly.
           void updates.catch((error) => analysisCancellation.abort(error))
         },
@@ -143,9 +151,16 @@ export async function transcribeSpeech(options: {
   let next = 0,
     completed = results.filter(Boolean).length
   let writes = Promise.resolve()
+  const active = new Map<number, NonNullable<ProgressDetail['active']>[number]>()
+  const report = () =>
+    options.stage('transcribing', 0.2 + 0.75 * (slices.length ? completed / slices.length : 1), {
+      completed,
+      total: slices.length,
+      active: [...active.values()].sort((a, b) => a.index - b.index),
+    })
   const cancellation = new AbortController()
   const workSignal = AbortSignal.any([signal, cancellation.signal])
-  await options.stage('transcribing', 0.2 + 0.75 * (slices.length ? completed / slices.length : 1))
+  await report()
   const work = async () => {
     for (;;) {
       workSignal.throwIfAborted()
@@ -177,6 +192,14 @@ export async function transcribeSpeech(options: {
         let recognized: Transcription | undefined
         for (let attempt = 0; attempt < 3; attempt++) {
           try {
+            active.set(index, {
+              index: index + 1,
+              start_ms: slice.start_ms,
+              end_ms: slice.end_ms,
+              attempt: attempt + 1,
+              state: 'waiting',
+            })
+            await report()
             recognized = await options.recognize(
               path,
               {
@@ -186,6 +209,10 @@ export async function transcribeSpeech(options: {
                 splitSeconds: options.splitSeconds,
               },
               workSignal,
+              async () => {
+                active.get(index)!.state = 'transcribing'
+                await report()
+              },
             )
             break
           } catch (error) {
@@ -198,6 +225,8 @@ export async function transcribeSpeech(options: {
               !(pairingFailure || status === 429 || (status != null && status >= 500))
             )
               throw error
+            active.get(index)!.state = 'retrying'
+            await report()
             await delay(500 * 2 ** attempt, undefined, { signal: workSignal })
           }
         }
@@ -212,7 +241,8 @@ export async function transcribeSpeech(options: {
         writes = writes.then(() => saveCheckpoint(checkpoint, snapshot, signal))
         await writes
         completed++
-        await options.stage('transcribing', 0.2 + (0.75 * completed) / slices.length)
+        active.delete(index)
+        await report()
       } catch (error) {
         cancellation.abort(error)
         throw error

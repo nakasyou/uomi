@@ -58,7 +58,10 @@ version or segmentation change cannot reuse incompatible chunk results.
    `lease_until`, `duration_ms`, `audio_url` and `manifest_url`. Fetch URLs with the
    same authentication, validate the manifest and original-audio SHA-256.
 3. `POST /api/jobs/:id/heartbeat` with `{lease_token,stage,progress,lease_seconds}`
-   renews ownership. Progress is 0–1. The web app reads the persisted stage/progress
+   renews ownership. Optional `detail` persists completed/total interval counts,
+   up to two active intervals (1-based index, original start/end milliseconds,
+   local attempt 1–3, waiting/transcribing/retrying), analyzed audio milliseconds,
+   and downloaded bytes. Counts reflect completed work, not an ETA. Progress is 0–1. The web app reads the persisted stage/progress
    rather than inferring completion from request delivery.
 4. `POST /api/jobs/:id/complete` with `{lease_token,text,segments?,model?}` commits
    the transcript and completed job transactionally. A repeated receipt for the

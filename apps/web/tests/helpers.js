@@ -12,6 +12,8 @@ export function fixture() {
     '0005_jobs.sql',
     '0006_query_performance.sql',
     '0007_notion_cutover.sql',
+    '0008_reset_transcripts.sql',
+    '0009_job_progress.sql',
   ])
     sqlite.exec(readFileSync(new URL('../drizzle/' + name, import.meta.url), 'utf8'))
   const DB = {

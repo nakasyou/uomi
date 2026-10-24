@@ -661,7 +661,7 @@ async function api(request: Request, env: any, ctx: any, role: string) {
       args.push(c.time, c.id)
     }
     const { results } = await env.DB.prepare(
-      `SELECT r.id,r.title,r.recorded_at,r.finished_at,r.duration_ms,r.status,r.starred,r.revision,r.backup_revision,r.backup_until,r.backup_step,r.backup_error,r.audio_key IS NOT NULL AS has_audio,(SELECT json_object('id',j.id,'status',j.status,'stage',j.stage,'progress',j.progress,'attempt',j.attempt,'error',j.error,'updated_at',j.updated_at) FROM transcription_jobs j WHERE j.recording_id=r.id AND j.mode='standard') AS transcription_json,substr(r.text,1,240) AS preview FROM recordings r${join}${clauses.length ? ' WHERE ' + clauses.join(' AND ') : ''} ORDER BY r.sort_time DESC,r.id DESC LIMIT ?`,
+      `SELECT r.id,r.title,r.recorded_at,r.finished_at,r.duration_ms,r.status,r.starred,r.revision,r.backup_revision,r.backup_until,r.backup_step,r.backup_error,r.audio_key IS NOT NULL AS has_audio,(SELECT json_object('id',j.id,'status',j.status,'stage',j.stage,'progress',j.progress,'detail',json(j.progress_detail),'attempt',j.attempt,'error',j.error,'updated_at',j.updated_at) FROM transcription_jobs j WHERE j.recording_id=r.id AND j.mode='standard') AS transcription_json,substr(r.text,1,240) AS preview FROM recordings r${join}${clauses.length ? ' WHERE ' + clauses.join(' AND ') : ''} ORDER BY r.sort_time DESC,r.id DESC LIMIT ?`,
     )
       .bind(...args, limit + 1)
       .all()
@@ -687,8 +687,8 @@ async function api(request: Request, env: any, ctx: any, role: string) {
     if (action === 'status' && method === 'GET') {
       const status =
         await env.DB.prepare(`SELECT r.id,r.revision,r.status,r.detailed_status,r.backup_revision,r.backup_until,r.backup_step,r.backup_error,r.audio_key IS NOT NULL AS has_audio,r.edited_at AS updated_at,
-        (SELECT json_object('id',j.id,'recording_id',j.recording_id,'mode',j.mode,'status',j.status,'stage',j.stage,'progress',j.progress,'attempt',j.attempt,'error',j.error,'lease_until',j.lease_until,'updated_at',j.updated_at,'available_at',j.available_at) FROM transcription_jobs j WHERE j.recording_id=r.id AND mode='standard') AS transcription_json,
-        (SELECT json_object('id',j.id,'recording_id',j.recording_id,'mode',j.mode,'status',j.status,'stage',j.stage,'progress',j.progress,'attempt',j.attempt,'error',j.error,'lease_until',j.lease_until,'updated_at',j.updated_at,'available_at',j.available_at) FROM transcription_jobs j WHERE j.recording_id=r.id AND mode='detailed') AS detailed_json
+        (SELECT json_object('id',j.id,'recording_id',j.recording_id,'mode',j.mode,'status',j.status,'stage',j.stage,'progress',j.progress,'detail',json(j.progress_detail),'attempt',j.attempt,'error',j.error,'lease_until',j.lease_until,'updated_at',j.updated_at,'available_at',j.available_at) FROM transcription_jobs j WHERE j.recording_id=r.id AND mode='standard') AS transcription_json,
+        (SELECT json_object('id',j.id,'recording_id',j.recording_id,'mode',j.mode,'status',j.status,'stage',j.stage,'progress',j.progress,'detail',json(j.progress_detail),'attempt',j.attempt,'error',j.error,'lease_until',j.lease_until,'updated_at',j.updated_at,'available_at',j.available_at) FROM transcription_jobs j WHERE j.recording_id=r.id AND mode='detailed') AS detailed_json
         FROM recordings r WHERE r.id=?`)
           .bind(id)
           .first()

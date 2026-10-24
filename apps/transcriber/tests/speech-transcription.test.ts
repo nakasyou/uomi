@@ -392,3 +392,38 @@ test('speech completion distinguishes VAD silence from empty recognition and ret
     await speech.cleanup()
   }
 }, 15000)
+
+test('speech progress exposes concurrent interval positions and exact completed counts', async () => {
+  const f = await fixture([segment(100, 1000, 'one'), segment(3100, 3900, 'two')])
+  const updates: any[] = []
+  try {
+    const result = await transcribeSpeech({
+      ...(await f.options()),
+      stage: async (stage, progress, detail) => {
+        updates.push(JSON.parse(JSON.stringify({ stage, progress, detail })))
+      },
+      recognize: async (path, _options, _signal, onStart) => {
+        await onStart?.()
+        if (path.endsWith('speech-0.flac')) await new Promise((r) => setTimeout(r, 30))
+        return { text: 'ok' }
+      },
+    })
+    {
+      const stages = updates.filter((x) => x.stage === 'transcribing')
+      expect(
+        stages.some(
+          (x) =>
+            x.detail.active.length === 2 &&
+            x.detail.active.every((a: any) => a.state === 'transcribing'),
+        ),
+      ).toBe(true)
+      expect(stages.at(-1).detail).toEqual({ completed: 2, total: 2, active: [] })
+      expect(
+        stages.some((x) => x.detail.active.some((a: any) => a.index === 2 && a.start_ms === 3100)),
+      ).toBe(true)
+    }
+    expect(result.outcome).toBe('transcribed')
+  } finally {
+    await f.cleanup()
+  }
+}, 15000)

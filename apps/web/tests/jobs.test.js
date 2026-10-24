@@ -381,3 +381,37 @@ test('completion records the evidence for silence separately from empty recognit
     f.sqlite.close()
   }
 })
+
+test('detailed progress persists through heartbeat, status and list reads while rejecting invalid counts', async () => {
+  const f = fixture()
+  try {
+    recording(f)
+    await enqueue(f.env, 'recording')
+    const job = (await call(f, '/api/jobs/claim', { worker_id: 'progress' })).jobs[0]
+    const detail = {
+      completed: 3,
+      total: 8,
+      active: [{ index: 4, start_ms: 2000, end_ms: 4000, attempt: 2, state: 'retrying' }],
+    }
+    const beat = await call(f, '/api/jobs/' + job.id + '/heartbeat', {
+      lease_token: job.lease_token,
+      stage: 'transcribing',
+      progress: 0.5,
+      detail,
+    })
+    assert.equal(beat.status, 200)
+    assert.deepEqual(
+      (await call(f, '/api/recordings/recording/status')).transcription.detail,
+      detail,
+    )
+    assert.deepEqual((await call(f, '/api/recordings')).results[0].transcription.detail, detail)
+    assert.deepEqual((await call(f, '/api/recordings/recording')).transcription.detail, detail)
+    const invalid = await call(f, '/api/jobs/' + job.id + '/heartbeat', {
+      lease_token: job.lease_token,
+      detail: { completed: 9, total: 8 },
+    })
+    assert.equal(invalid.status, 400)
+  } finally {
+    f.sqlite.close()
+  }
+})
