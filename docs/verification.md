@@ -571,3 +571,27 @@ error and two active jobs. An authenticated audit selected 51 legacy empty
 completions from the authorized 211-recording rerun and successfully requeued
 all 51 with zero API errors. Completed nonempty text and active jobs were
 preserved; queued/retry jobs naturally continue through the repaired worker.
+
+## Owner-requested complete transcript reset (2026-10-24 JST)
+
+The owner explicitly requested deletion of all transcript results and resetting
+all recordings to Pending. The worker was booted out and PID 11030 exited before
+the one-time reset was published. Migration `0008_reset_transcripts` clears
+standard/detailed text, both segment arrays and normalized search text, sets both
+recording statuses to Pending, invalidates worker tokens and resets job errors,
+progress and attempts. Original audio, manifests, titles, stars and identities
+are preserved. External Notion backups are not deleted. The daemon remains
+stopped so the requested Pending state is stable.
+
+A regression with seeded results verifies source preservation, removal from FTS,
+creation of missing standard jobs and rejection of stale completion tokens.
+The complete test suite passed. The private Sites deployment
+`appgdep_6adc3668990c8191947fd657ef19d151` succeeded from source
+`f37bb9518364d1a0102777a283aa01ea3b27a84a`, environment revision 11.
+Direct, fully paginated database verification confirmed **213 recordings**, all
+with empty standard/detailed/search text and empty segment arrays, both statuses
+Pending. **212** retain source audio; the remaining recording has no source audio
+and cannot receive an executable standard job. All **216 jobs** (212 standard,
+four detailed) are queued with zero attempt/progress, no error and no active
+lease. Local cleanup removed 249 current/legacy transcript checkpoint JSON files;
+114 speech-only plans were retained. The LaunchAgent is not loaded.
