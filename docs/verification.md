@@ -637,3 +637,44 @@ audio and valid checkpoints were retained.
 
 The final viewer source is `b77ec17f9d9c81f1acb0f44ed1f877b4ba09b3ff`, private
 Sites deployment `appgdep_6adc42bf4c448191aef119a396270ffd`, environment revision 11.
+
+
+## Long Chrome transcripts (2026-10-24)
+
+Implementation commit `a3c66ffa8eb88f4279b830d548e6f1fdaffae56d` adds a third,
+independent `long` queue/result. New audio uploads atomically enqueue standard and
+long jobs; retries are idempotent. Newly imported audio also queues long unless
+an imported completed long result exists. Detailed remains on demand. Existing
+recordings are not bulk reset or retranscribed.
+
+Long uses Chrome with the same 600-second maximum, ignores speaker boundaries,
+and retains source pauses up to 5000 ms inside each crop. Longer gaps separate
+crops. It stores only ordered text, with independent status/error and checkpoints.
+Optional Notion backup/import includes the long version. No source audio changes.
+Migration 0010 expands the job mode constraint while preserving leases, attempts,
+progress, claim indexes, and previous results; migration preservation has its own
+test. Claim state writes skip modes absent from the claim to retain bounded cost.
+
+Validation: 148 Node tests and 64 Bun tests passed, plus typechecks and full build.
+Tests cover actual ffmpeg crop duration including pauses, ten-minute bounds,
+checkpoint separation/reuse, forced Chrome routing, text-only completion, status,
+fail/retry, independent versions, upload/import automatic enqueue, and Notion
+backup. Brave verified the third tab and plain-text display using synthetic data,
+then the live page successfully queued the 2026/10/23 09:24 recording's long job.
+That production long job remains in the normal queue; its other transcripts are
+unchanged. A separate real-provider verification on the same recording reused the
+cached speech plan, processed six long crops and returned 333 characters with
+zero timestamp segments. Temporary original and crop audio were deleted.
+
+Mac mini was built declaratively from the updated dotfiles pin/hash:
+`17mx8xpv2sgc8d3rk1rwv2l4bf7fgg9yjbgpx4x0zaps2pdllaqm`, closure
+`/nix/store/78rpzc69j7p32h45qy6q3hvp79ph41sy-darwin-system-26.05.c3e90c8`.
+Only its generated Uomi user LaunchAgent was activated, preserving unrelated dirty
+dotfiles and services. Old work drained before bootstrap. Health reports all three
+modes, unchanged 600/300-second limits, and no errors; standard jobs completed on
+the new worker after restart.
+
+Sites source `37334f7b88b068073a70afdf9670cdef00d1cda6`, owner-private deployment
+`appgdep_6adc4e8edd8c8191ab08c041e0b2f1fb`, environment revision 11, succeeded.
+Live API exposes long state/text, the original standard text remains 322 chars,
+and the actual production UI shows Long queued separately.
