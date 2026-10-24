@@ -122,7 +122,10 @@ function JobState({
           aria-label="Recording processing progress"
         />
       )}
-      {progressLines(job.detail).map((line) => (
+      {progressLines({
+        ...job.detail,
+        active: job.status === 'processing' ? job.detail?.active : [],
+      }).map((line) => (
         <span key={line}>{line}</span>
       ))}
       <span>
