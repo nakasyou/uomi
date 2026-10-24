@@ -67,16 +67,24 @@ export async function transcribeSpeech(options: {
     .update(JSON.stringify([options.audioSha, options.helper, 'fluid-v1']))
     .digest('hex')
   const cache = join(options.stateDir, `plan-${cacheId}.json`)
-  let plan: SpeechPlan
-  try {
-    if ((await stat(cache)).size > 8 * 1024 * 1024)
-      throw Error('Speech plan cache exceeds size limit')
-    plan = normalizeSpeechPlan(JSON.parse(await readFile(cache, 'utf8')), options.durationMs)
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT')
-      throw Error(`Cannot read speech plan: ${String(error)}`)
+  const cachedPlan = async (): Promise<SpeechPlan | undefined> => {
+    try {
+      if ((await stat(cache)).size > 8 * 1024 * 1024)
+        throw Error('Speech plan cache exceeds size limit')
+      return normalizeSpeechPlan(JSON.parse(await readFile(cache, 'utf8')), options.durationMs)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT')
+        throw Error(`Cannot read speech plan: ${String(error)}`)
+      return undefined
+    }
+  }
+  let plan = await cachedPlan()
+  if (!plan) {
     await options.stage('waiting_analysis', 0)
     plan = await options.analyze(async () => {
+      // Another version of this recording may have filled the cache while we waited.
+      const ready = await cachedPlan()
+      if (ready) return ready
       await options.stage('diarizing', 0)
       const output = join(directory, 'speech.json')
       const analysisCancellation = new AbortController()

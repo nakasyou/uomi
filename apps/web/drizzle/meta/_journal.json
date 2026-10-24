@@ -78,6 +78,13 @@
       "when": 1792822588022,
       "tag": "0010_long_transcription",
       "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "6",
+      "when": 1792824023659,
+      "tag": "0011_provider_queues",
+      "breakpoints": true
     }
   ]
 }

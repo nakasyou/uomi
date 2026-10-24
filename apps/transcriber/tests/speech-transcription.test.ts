@@ -396,6 +396,8 @@ test('speech completion distinguishes VAD silence from empty recognition and ret
 test('speech progress exposes concurrent interval positions and exact completed counts', async () => {
   const f = await fixture([segment(100, 1000, 'one'), segment(3100, 3900, 'two')])
   const updates: any[] = []
+  let started = 0
+  const bothReady = deferred()
   try {
     const result = await transcribeSpeech({
       ...(await f.options()),
@@ -404,7 +406,8 @@ test('speech progress exposes concurrent interval positions and exact completed 
       },
       recognize: async (path, _options, _signal, onStart) => {
         await onStart?.()
-        if (path.endsWith('speech-0.flac')) await new Promise((r) => setTimeout(r, 30))
+        if (++started === 2) bothReady.resolve()
+        await bothReady.promise
         return { text: 'ok' }
       },
     })
@@ -461,3 +464,38 @@ test('long mode retains pauses in a single source crop, returns text only, and i
     await f.cleanup()
   }
 }, 15000)
+
+test('standard and long jobs waiting for the same analysis run FluidAudio only once', async () => {
+  const f = await fixture([segment(100, 1000, 'speaker')])
+  const slots = new WorkSlots(1)
+  const counter = join(f.root, 'analysis-count')
+  const helper = join(f.root, 'helper')
+  const script = await readFile(helper, 'utf8')
+  await writeFile(
+    helper,
+    script.replace(
+      'const args=',
+      `await import('node:fs/promises').then(fs=>fs.appendFile(${JSON.stringify(counter)},'run\\n'));await Bun.sleep(100);const args=`,
+    ),
+    { mode: 0o700 },
+  )
+  try {
+    const options = await Promise.all([f.options(), f.options()])
+    const results = await Promise.all(
+      options.map((value, index) =>
+        transcribeSpeech({
+          ...value,
+          mode: index ? 'long' : 'standard',
+          analyze: (work) => slots.run(value.signal, work),
+          recognize: async () => ({ text: 'ok' }),
+        }),
+      ),
+    )
+    expect(await readFile(counter, 'utf8')).toBe('run\n')
+    expect(results.map((result) => result.text)).toEqual(['ok', 'ok'])
+    expect(results[0].segments).toHaveLength(1)
+    expect(results[1].segments).toEqual([])
+  } finally {
+    await f.cleanup()
+  }
+}, 10000)

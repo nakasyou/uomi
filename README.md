@@ -96,6 +96,12 @@ Transcript and Detailed · Codex. It ignores speaker boundaries and bridges sile
 of up to five seconds while retaining those pauses in the original audio. Longer
 pauses separate passages; each passage is capped at the same Google limit (600
 seconds, including pauses). It saves text only, independently of the other two
-versions, and shares the worker's two recognition slots and cached FluidAudio plan.
+versions, and shares the worker's two Chrome recognition slots and cached FluidAudio plan.
 New uploads and audio imports queue both standard and Long automatically. Existing
 recordings are not bulk retranscribed; use the Long tab to request them. Long results are included in optional Notion backups.
+
+
+Transcription now uses independent FluidAudio (1), Chrome (2), and Codex (2)
+execution queues. Chrome and Codex also claim separate durable API lanes; Chrome
+admits one extra recording for analysis prefetch, while identical standard/Long
+analysis is shared through the cache. `/health` exposes each queue's load.

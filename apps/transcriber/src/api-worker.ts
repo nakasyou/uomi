@@ -55,8 +55,9 @@ export function errorDetail(error: unknown): string {
 }
 /** Durable ownership lives in the web database; local checkpoints only avoid repeated provider work. */
 export class ApiWorker {
-  private active = new Set<Promise<void>>()
-  private recognitionSlots = new WorkSlots(2)
+  private active = new Map<Promise<void>, 'chrome' | 'codex'>()
+  private chromeSlots = new WorkSlots(2)
+  private codexSlots = new WorkSlots(2)
   private analysisSlots = new WorkSlots(1)
   private stopped = false
   private polling = false
@@ -78,11 +79,26 @@ export class ApiWorker {
     if (!Number.isInteger(config.concurrency) || config.concurrency < 1 || config.concurrency > 8)
       throw Error('TRANSCRIBER_CONCURRENCY must be 1–8.')
   }
+  private get chromeCapacity() {
+    return Math.min(8, this.config.concurrency + 1)
+  }
+  private activeIn(queue: 'chrome' | 'codex') {
+    return [...this.active.values()].filter((value) => value === queue).length
+  }
   get status() {
     return {
       active: this.active.size,
       modes: ['standard', 'long', 'detailed'],
-      concurrency: this.config.concurrency,
+      concurrency: this.chromeCapacity + 2,
+      queues: {
+        fluidaudio: this.analysisSlots.status,
+        chrome: this.chromeSlots.status,
+        codex: this.codexSlots.status,
+      },
+      jobs: {
+        chrome: { active: this.activeIn('chrome'), maximum: this.chromeCapacity },
+        codex: { active: this.activeIn('codex'), maximum: 2 },
+      },
       splitSeconds: {
         google: this.config.splitSeconds,
         codex: this.config.codexSplitSeconds ?? 300,
@@ -121,22 +137,37 @@ export class ApiWorker {
     }
   }
   async poll(): Promise<number> {
-    if (this.stopped || this.polling || this.active.size >= this.config.concurrency) return 0
+    if (this.stopped || this.polling) return 0
     this.polling = true
+    let count = 0
     try {
-      const { jobs } = await this.request('/api/jobs/claim', {
-        worker_id: this.config.workerId,
-        limit: this.config.concurrency - this.active.size,
-        lease_seconds: 180,
-      })
-      if (!Array.isArray(jobs)) throw Error('Claim response is missing jobs array.')
+      const responses = await Promise.allSettled(
+        (['chrome', 'codex'] as const).map(async (queue) => {
+          const maximum = queue === 'chrome' ? this.chromeCapacity : 2
+          const free = maximum - this.activeIn(queue)
+          if (free <= 0) return
+          const { jobs } = await this.request('/api/jobs/claim', {
+            worker_id: this.config.workerId,
+            queue,
+            limit: free,
+            lease_seconds: 180,
+          })
+          if (!Array.isArray(jobs) || jobs.length > free)
+            throw Error('Invalid claim response jobs array.')
+          for (const job of jobs as Job[]) {
+            if ((queue === 'codex') !== (job.mode === 'detailed'))
+              throw Error('Claim returned a job from the wrong queue.')
+            const task = this.run(job).finally(() => this.active.delete(task))
+            this.active.set(task, queue)
+            count++
+          }
+        }),
+      )
       this.lastPollAt = new Date().toISOString()
+      const failed = responses.find((value) => value.status === 'rejected')
+      if (failed?.status === 'rejected') throw failed.reason
       this.lastError = null
-      for (const job of jobs as Job[]) {
-        const task = this.run(job).finally(() => this.active.delete(task))
-        this.active.add(task)
-      }
-      return jobs.length
+      return count
     } catch (error) {
       this.lastError = errorDetail(error)
       throw error
@@ -146,7 +177,7 @@ export class ApiWorker {
   }
   async close() {
     this.stopped = true
-    await Promise.allSettled(this.active)
+    await Promise.allSettled(this.active.keys())
   }
   private async download(
     path: string,
@@ -317,7 +348,7 @@ export class ApiWorker {
           signal: controller.signal,
           analyze: (work) => this.analysisSlots.run(controller.signal, work),
           recognize: (audioPath, options, signal, onStart) =>
-            this.recognitionSlots.run(signal, async () => {
+            this.chromeSlots.run(signal, async () => {
               await onStart?.()
               return this.recognize(audioPath, { ...options, signal })
             }),
@@ -417,7 +448,7 @@ export class ApiWorker {
           }
           await beat()
           controller.signal.throwIfAborted()
-          const result = await this.recognitionSlots.run(controller.signal, async () => {
+          const result = await this.codexSlots.run(controller.signal, async () => {
             stage = 'waiting_rate_limit'
             await beat()
             await this.pace(controller.signal)

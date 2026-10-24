@@ -206,3 +206,28 @@ test('recording status uses one indexed metadata query and never returns full tr
   assert.equal(detail.text, large)
   f.sqlite.close()
 })
+
+test('provider-specific claims seek per-mode ready and expired indexes with bounded candidate sets', async () => {
+  const f = fixture()
+  try {
+    seed(f)
+    f.sqlite.exec(
+      "INSERT INTO transcription_jobs(id,recording_id,mode,created_at,updated_at) VALUES('long','r000000','long',1,1),('codex','r000000','detailed',2,2)",
+    )
+    const statements = capture(f)
+    for (const queue of ['chrome', 'codex']) {
+      statements.length = 0
+      await call(f, '/api/jobs/claim', { worker_id: queue, queue, limit: 2 })
+      const query = statements.find((value) =>
+        value.sql.includes('WITH candidates AS MATERIALIZED'),
+      )
+      const explanation = plan(f, query.sql, query.values)
+      assert.match(explanation, /SEARCH j USING INDEX jobs_due_mode \(mode=\?/)
+      assert.match(explanation, /SEARCH j USING INDEX jobs_expired_mode \(mode=\?/)
+      assert.doesNotMatch(explanation, /SCAN j\b/)
+      assert.equal((query.sql.match(/LIMIT \?/g) || []).length, queue === 'chrome' ? 5 : 3)
+    }
+  } finally {
+    f.sqlite.close()
+  }
+})

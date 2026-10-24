@@ -73,6 +73,13 @@ await Bun.write(output, JSON.stringify({schema:'uomi.speech-plan.v1',engine:'tes
   return { dir, audio, manifest, config, job }
 }
 
+function claimJobs(options: any, jobs: Job[]) {
+  const { queue } = JSON.parse(options.body)
+  return jobs.filter((job) =>
+    queue === 'codex' ? job.mode === 'detailed' : job.mode !== 'detailed',
+  )
+}
+
 test('API worker bounds concurrent claims, reports progress and preserves real segment times', async () => {
   const f = await fixture()
   const calls: { path: string; body: any }[] = []
@@ -86,8 +93,13 @@ test('API worker bounds concurrent claims, reports progress and preserves real s
     calls.push({ path, body })
     if (path === '/api/jobs/claim') {
       claims++
-      expect(body.limit).toBe(2)
-      return Response.json({ jobs: [f.job, { ...f.job, id: 'job2', mode: 'detailed' }] })
+      expect(body.limit).toBeLessThanOrEqual(body.queue === 'chrome' ? 3 : 2)
+      return Response.json({
+        jobs:
+          claims <= 2
+            ? claimJobs(options, [f.job, { ...f.job, id: 'job2', mode: 'detailed' }])
+            : [],
+      })
     }
     if (path === '/audio') return new Response(f.audio)
     if (path === '/manifest') return Response.json(f.manifest)
@@ -109,7 +121,7 @@ test('API worker bounds concurrent claims, reports progress and preserves real s
     expect(await worker.poll()).toBe(2)
     expect(await worker.poll()).toBe(0)
     await worker.close()
-    expect(claims).toBe(1)
+    expect(claims).toBe(4)
     expect(recognizes).toBe(2)
     const completed = calls.filter((call) => call.path.endsWith('/complete'))
     expect(completed).toHaveLength(2)
@@ -137,7 +149,7 @@ test('checksum errors are visible and submitted to durable failure state without
     },
     (async (url: any, options: any) => {
       const path = new URL(url).pathname
-      if (path === '/api/jobs/claim') return Response.json({ jobs: [f.job] })
+      if (path === '/api/jobs/claim') return Response.json({ jobs: claimJobs(options, [f.job]) })
       if (path === '/audio') return new Response('corrupt')
       if (path === '/manifest') return Response.json(f.manifest)
       if (path.endsWith('/fail')) reported = JSON.parse(options.body)
@@ -163,17 +175,18 @@ test('lease fencing aborts processing and does not fail a job owned by another w
     async () => {
       throw Error('must not recognize')
     },
-    (async (url: any) => {
+    (async (url: any, options: any) => {
       const path = new URL(url).pathname
       paths.push(path)
-      if (path === '/api/jobs/claim') return Response.json({ jobs: [f.job] })
+      if (path === '/api/jobs/claim') return Response.json({ jobs: claimJobs(options, [f.job]) })
       return Response.json({ error: 'lease expired' }, { status: 409 })
     }) as unknown as typeof fetch,
   )
   try {
     await worker.poll()
     await worker.close()
-    expect(paths).toEqual(['/api/jobs/claim', '/api/jobs/job1/heartbeat'])
+    expect(paths.filter((path) => path === '/api/jobs/claim')).toHaveLength(2)
+    expect(paths.filter((path) => path !== '/api/jobs/claim')).toEqual(['/api/jobs/job1/heartbeat'])
     expect(worker.lastError).toContain('409')
   } finally {
     await rm(f.dir, { recursive: true, force: true })
@@ -209,7 +222,7 @@ test('a lost completion response retries the same lease without repeating recogn
     },
     (async (url: any, options: any) => {
       const path = new URL(url).pathname
-      if (path === '/api/jobs/claim') return Response.json({ jobs: [f.job] })
+      if (path === '/api/jobs/claim') return Response.json({ jobs: claimJobs(options, [f.job]) })
       if (path === '/audio') return new Response(f.audio)
       if (path === '/manifest') return Response.json(f.manifest)
       if (path.endsWith('/complete')) {
@@ -240,7 +253,7 @@ test('restart reuses checkpointed recognition after a save failure', async () =>
   let failed: string | undefined
   const http = (async (url: any, options: any) => {
     const path = new URL(url).pathname
-    if (path === '/api/jobs/claim') return Response.json({ jobs: [f.job] })
+    if (path === '/api/jobs/claim') return Response.json({ jobs: claimJobs(options, [f.job]) })
     if (path === '/audio') return new Response(f.audio)
     if (path === '/manifest') return Response.json(f.manifest)
     if (path.endsWith('/complete') && rejectSave)
@@ -325,9 +338,10 @@ test('one transient heartbeat outage does not discard a valid lease or repeat wo
   let completed = false
   const worker = new ApiWorker(f.config, async () => ({ text: 'recovered heartbeat' }), (async (
     url: any,
+    options: any,
   ) => {
     const path = new URL(url).pathname
-    if (path === '/api/jobs/claim') return Response.json({ jobs: [f.job] })
+    if (path === '/api/jobs/claim') return Response.json({ jobs: claimJobs(options, [f.job]) })
     if (path === '/audio') return new Response(f.audio)
     if (path === '/manifest') return Response.json(f.manifest)
     if (path.endsWith('/heartbeat') && ++heartbeat === 1)
@@ -387,7 +401,10 @@ test('Google uses ten-minute chunks, Codex five-minute chunks, with matching ori
       const path = new URL(url).pathname
       if (path === '/api/jobs/claim')
         return Response.json({
-          jobs: claims++ ? [] : [f.job, { ...f.job, id: 'job2', mode: 'detailed' }],
+          jobs:
+            claims++ < 2
+              ? claimJobs(options, [f.job, { ...f.job, id: 'job2', mode: 'detailed' }])
+              : [],
         })
       if (path === '/audio') return new Response(f.audio)
       if (path === '/manifest') return Response.json(f.manifest)
@@ -429,7 +446,9 @@ test('long jobs always use Chrome and complete without transcript positions', as
     (async (url: any, options: any) => {
       const path = new URL(url).pathname
       if (path === '/api/jobs/claim')
-        return Response.json({ jobs: claims++ ? [] : [{ ...f.job, mode: 'long' }] })
+        return Response.json({
+          jobs: claims++ ? [] : claimJobs(options, [{ ...f.job, mode: 'long' }]),
+        })
       if (path === '/audio') return new Response(f.audio)
       if (path === '/manifest') return Response.json(f.manifest)
       if (path.endsWith('/complete')) completion = JSON.parse(options.body)
@@ -447,3 +466,96 @@ test('long jobs always use Chrome and complete without transcript positions', as
     await rm(f.dir, { recursive: true, force: true })
   }
 }, 15000)
+
+test('Chrome saturation does not block Codex, and the analysis prefetch lane stays bounded', async () => {
+  const f = await fixture()
+  const extra = await fixture()
+  expect(extra.manifest.sha256).not.toBe(f.manifest.sha256)
+  const counter = join(f.dir, 'analysis-count')
+  const helper = await readFile(f.config.fluidCommand!, 'utf8')
+  await writeFile(
+    f.config.fluidCommand!,
+    helper.replace(
+      'const output=',
+      `await import('node:fs/promises').then(fs=>fs.appendFile(${JSON.stringify(counter)},'run\\n'));const output=`,
+    ),
+    { mode: 0o700 },
+  )
+  let release!: () => void
+  const blocked = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  let chromeStarted = 0,
+    codexFinished = false
+  let bothStarted!: () => void
+  const ready = new Promise<void>((resolve) => {
+    bothStarted = resolve
+  })
+  const claimed = new Set<string>()
+  const worker = new ApiWorker(
+    f.config,
+    async (_path, options) => {
+      if (options?.provider === 'codex') {
+        codexFinished = true
+        return { text: 'codex done' }
+      }
+      if (++chromeStarted === 2) bothStarted()
+      await blocked
+      return { text: 'chrome done' }
+    },
+    (async (url: any, options: any) => {
+      const path = new URL(url).pathname
+      if (path === '/api/jobs/claim') {
+        const { queue, limit } = JSON.parse(options.body)
+        expect(limit).toBeLessThanOrEqual(queue === 'chrome' ? 3 : 2)
+        if (claimed.has(queue)) return Response.json({ jobs: [] })
+        claimed.add(queue)
+        return Response.json({
+          jobs:
+            queue === 'chrome'
+              ? [0, 1, 2].map((i) => ({
+                  ...f.job,
+                  id: 'chrome-' + i,
+                  recording_id: 'chrome-' + i,
+                  ...(i === 2
+                    ? { audio_url: '/extra-audio', manifest_url: '/extra-manifest' }
+                    : {}),
+                }))
+              : [{ ...f.job, id: 'codex', mode: 'detailed' }],
+        })
+      }
+      if (path === '/extra-audio') return new Response(extra.audio)
+      if (path === '/extra-manifest') return Response.json(extra.manifest)
+      if (path === '/audio') return new Response(f.audio)
+      if (path === '/manifest') return Response.json(f.manifest)
+      return Response.json({ saved: true })
+    }) as typeof fetch,
+  )
+  try {
+    expect(await worker.poll()).toBe(4)
+    await Promise.race([
+      ready,
+      new Promise((_, reject) =>
+        setTimeout(() => reject(Error('Chrome work never started')), 3000),
+      ),
+    ])
+    for (
+      let attempt = 0;
+      attempt < 100 && (await readFile(counter, 'utf8')).split('run').length < 3;
+      attempt++
+    )
+      await Bun.sleep(10)
+    expect((await readFile(counter, 'utf8')).match(/run/g)).toHaveLength(2)
+    expect(codexFinished).toBe(true)
+    expect(worker.status.queues.chrome.active).toBe(2)
+    expect(worker.status.queues.codex.active).toBe(0)
+    expect(worker.status.jobs.chrome.active).toBe(3)
+    expect(worker.status.queues.fluidaudio.maximum).toBe(1)
+    expect(await worker.poll()).toBe(0)
+  } finally {
+    release()
+    await worker.close()
+    await rm(f.dir, { recursive: true, force: true })
+    await rm(extra.dir, { recursive: true, force: true })
+  }
+}, 10000)

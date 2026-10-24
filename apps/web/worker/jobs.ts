@@ -88,6 +88,8 @@ export async function jobsApi(request: Request, env: any, data: any) {
   if (url.pathname === '/api/jobs/claim' && request.method === 'POST') {
     if (typeof data.worker_id !== 'string' || !data.worker_id.trim() || data.worker_id.length > 200)
       throw new ApiError('worker_id required (1–200 characters)')
+    if (data.queue !== undefined && !['chrome', 'codex'].includes(data.queue))
+      throw new ApiError('queue must be chrome or codex')
     const limit = data.limit ?? 1,
       seconds = leaseSeconds(data.lease_seconds)
     if (!Number.isInteger(limit) || limit < 1 || limit > 8)
@@ -113,21 +115,39 @@ export async function jobsApi(request: Request, env: any, data: any) {
           ),
       )
     const token = crypto.randomUUID()
-    // Each indexed lane contributes at most limit candidates. The final merge sorts
-    // at most 16 rows, even when the historical job table contains millions.
-    const claimed = await env.DB.prepare(`WITH candidates AS MATERIALIZED (
-      SELECT * FROM (SELECT j.id,j.recording_id,j.available_at AS ready_at,j.created_at FROM transcription_jobs j
-        JOIN recordings r ON r.id=j.recording_id WHERE j.status IN ('queued','retry') AND j.attempt<j.max_attempts
-        AND j.available_at<=? AND r.audio_key IS NOT NULL ORDER BY j.available_at,j.created_at,j.id LIMIT ?)
-      UNION ALL
-      SELECT * FROM (SELECT j.id,j.recording_id,j.lease_until AS ready_at,j.created_at FROM transcription_jobs j
-        JOIN recordings r ON r.id=j.recording_id WHERE j.status='processing' AND j.attempt<j.max_attempts
-        AND j.lease_until<=? AND r.audio_key IS NOT NULL ORDER BY j.lease_until,j.created_at,j.id LIMIT ?)
-    ) UPDATE transcription_jobs SET status='processing',worker_id=?,lease_token=?,lease_until=?,attempt=attempt+1,
+    const modes =
+      data.queue === 'chrome'
+        ? ['standard', 'long']
+        : data.queue === 'codex'
+          ? ['detailed']
+          : [null]
+    // Each indexed mode contributes at most limit ready and expired candidates.
+    // Literal mode filters come only from the fixed list above, never request text.
+    const candidates = modes.flatMap((mode) => {
+      const filter = mode === null ? '' : `AND j.mode='${mode}'`
+      return [
+        `SELECT * FROM (SELECT j.id,j.recording_id,j.available_at AS ready_at,j.created_at FROM transcription_jobs j
+          JOIN recordings r ON r.id=j.recording_id WHERE j.status IN ('queued','retry') AND j.attempt<j.max_attempts
+          ${filter} AND j.available_at<=? AND r.audio_key IS NOT NULL ORDER BY j.available_at,j.created_at,j.id LIMIT ?)`,
+        `SELECT * FROM (SELECT j.id,j.recording_id,j.lease_until AS ready_at,j.created_at FROM transcription_jobs j
+          JOIN recordings r ON r.id=j.recording_id WHERE j.status='processing' AND j.attempt<j.max_attempts
+          ${filter} AND j.lease_until<=? AND r.audio_key IS NOT NULL ORDER BY j.lease_until,j.created_at,j.id LIMIT ?)`,
+      ]
+    })
+    const claimed =
+      await env.DB.prepare(`WITH candidates AS MATERIALIZED (${candidates.join(' UNION ALL ')})
+      UPDATE transcription_jobs SET status='processing',worker_id=?,lease_token=?,lease_until=?,attempt=attempt+1,
       stage='downloading',progress=0,progress_detail='{}',error=NULL,updated_at=? WHERE id IN(
       SELECT id FROM candidates ORDER BY ready_at,created_at,id LIMIT ?) RETURNING *`)
-      .bind(now, limit, now, limit, data.worker_id, token, now + seconds * 1000, now, limit)
-      .all()
+        .bind(
+          ...modes.flatMap(() => [now, limit, now, limit]),
+          data.worker_id,
+          token,
+          now + seconds * 1000,
+          now,
+          limit,
+        )
+        .all()
     if (!claimed.results.length) return { jobs: [] }
     const metadata = await env.DB.prepare(
       'SELECT id,duration_ms FROM recordings WHERE id IN(SELECT value FROM json_each(?))',

@@ -509,3 +509,52 @@ test('automatic long enqueue is idempotent and preserves completed imported long
     f.sqlite.close()
   }
 })
+
+test('provider queues claim independently, retain FIFO within each lane and reclaim only their own leases', async () => {
+  const f = fixture()
+  try {
+    for (const id of ['a', 'b', 'c']) recording(f, id)
+    await enqueue(f.env, 'a', 'standard')
+    await enqueue(f.env, 'b', 'long')
+    await enqueue(f.env, 'c', 'detailed')
+    f.sqlite
+      .prepare(
+        "UPDATE transcription_jobs SET created_at=CASE mode WHEN 'standard' THEN 1 WHEN 'long' THEN 2 ELSE 3 END",
+      )
+      .run()
+    const codex = await call(f, '/api/jobs/claim', { worker_id: 'codex', queue: 'codex', limit: 2 })
+    assert.deepEqual(
+      codex.jobs.map((job) => job.mode),
+      ['detailed'],
+    )
+    const chrome = await call(f, '/api/jobs/claim', {
+      worker_id: 'chrome',
+      queue: 'chrome',
+      limit: 1,
+    })
+    assert.deepEqual(
+      chrome.jobs.map((job) => job.mode),
+      ['standard'],
+    )
+    f.sqlite.prepare("UPDATE transcription_jobs SET lease_until=1 WHERE mode='detailed'").run()
+    const next = await call(f, '/api/jobs/claim', {
+      worker_id: 'chrome',
+      queue: 'chrome',
+      limit: 2,
+    })
+    assert.deepEqual(
+      next.jobs.map((job) => job.mode),
+      ['long'],
+    )
+    assert.equal(
+      (await call(f, '/api/jobs/claim', { worker_id: 'codex', queue: 'codex' })).jobs[0].attempt,
+      2,
+    )
+    assert.equal(
+      (await call(f, '/api/jobs/claim', { worker_id: 'bad', queue: 'fluidaudio' })).status,
+      400,
+    )
+  } finally {
+    f.sqlite.close()
+  }
+})

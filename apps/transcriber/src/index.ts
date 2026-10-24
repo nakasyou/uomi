@@ -8,7 +8,7 @@ import { ApiWorker, errorDetail } from './api-worker'
 
 if (process.argv.includes('--help')) {
   console.log(
-    'Uomi API transcriber\nUOMI_API_URL and UOMI_CLIENT_SECRET are required.\nTRANSCRIBER_PROVIDER=chrome-recognition TRANSCRIBER_CONCURRENCY=2 TRANSCRIBER_SPLIT_SECONDS=600 TRANSCRIBER_CODEX_SPLIT_SECONDS=300\nPolls durable API jobs, renews leases and reports progress/errors. Notion credentials and inbound webhooks are no longer used.\nRequires ffmpeg on PATH.',
+    'Uomi API transcriber\nUOMI_API_URL and UOMI_CLIENT_SECRET are required.\nTRANSCRIBER_PROVIDER=chrome-recognition TRANSCRIBER_CONCURRENCY=2 TRANSCRIBER_SPLIT_SECONDS=600 TRANSCRIBER_CODEX_SPLIT_SECONDS=300\nClaims independent Chrome/Codex lanes; FluidAudio=1, Chrome=2, Codex=2 execution queues. Renews leases and reports progress/errors. Notion credentials and inbound webhooks are no longer used.\nRequires ffmpeg on PATH.',
   )
   process.exit(0)
 }
@@ -131,7 +131,8 @@ console.log(
   JSON.stringify({
     status: 'started',
     api: new URL(apiUrl).origin,
-    concurrency,
+    concurrency: daemon.status.concurrency,
+    queues: daemon.status.queues,
     workerId: daemon.config.workerId,
   }),
 )

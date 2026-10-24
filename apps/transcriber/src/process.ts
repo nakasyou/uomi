@@ -75,6 +75,9 @@ export class WorkSlots {
   private active = 0
   private waiters: (() => void)[] = []
   constructor(private readonly maximum: number) {}
+  get status() {
+    return { active: this.active, waiting: this.waiters.length, maximum: this.maximum }
+  }
   async run<T>(signal: AbortSignal, work: () => Promise<T>): Promise<T> {
     signal.throwIfAborted()
     if (this.active < this.maximum) this.active++

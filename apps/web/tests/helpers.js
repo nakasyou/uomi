@@ -15,6 +15,7 @@ export function fixture() {
     '0008_reset_transcripts.sql',
     '0009_job_progress.sql',
     '0010_long_transcription.sql',
+    '0011_provider_queues.sql',
   ])
     sqlite.exec(readFileSync(new URL('../drizzle/' + name, import.meta.url), 'utf8'))
   const DB = {
