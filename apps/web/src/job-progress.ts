@@ -36,14 +36,21 @@ export function stageLabel(stage: string, status: string) {
     status
   )
 }
-const clock = (ms: number) =>
-  `${Math.floor(ms / 60000)}:${String(Math.floor(ms / 1000) % 60).padStart(2, '0')}`
+const clock = (ms: number) => {
+  const whole = `${Math.floor(ms / 60000)}:${String(Math.floor(ms / 1000) % 60).padStart(2, '0')}`
+  const fraction = String(Math.round(ms % 1000))
+    .padStart(3, '0')
+    .replace(/0+$/, '')
+  return fraction ? `${whole}.${fraction}` : whole
+}
 export function progressLines(detail: ProgressDetail = {}) {
   const lines: string[] = []
   if (detail.total !== undefined)
     lines.push(`${detail.completed ?? 0} / ${detail.total} segments complete`)
   if (detail.analyzed_ms !== undefined && detail.duration_ms !== undefined)
-    lines.push(`Audio analyzed: ${clock(detail.analyzed_ms)} / ${clock(detail.duration_ms)}`)
+    lines.push(
+      `Audio analyzed: ${clock(Math.floor(detail.analyzed_ms / 1000) * 1000)} / ${clock(Math.floor(detail.duration_ms / 1000) * 1000)}`,
+    )
   if (detail.bytes_received !== undefined)
     lines.push(
       `Downloaded ${(detail.bytes_received / 1048576).toFixed(1)}${detail.bytes_total ? ` / ${(detail.bytes_total / 1048576).toFixed(1)}` : ''} MB`,

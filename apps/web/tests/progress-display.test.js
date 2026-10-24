@@ -42,3 +42,13 @@ test('progress explains completed intervals, original audio ranges, capacity wai
   assert.equal(stageLabel('waiting_analysis', 'processing'), 'Waiting for speech analysis')
   assert.equal(stageLabel('completed_no_speech', 'completed'), 'Completed')
 })
+
+test('subsecond speech intervals retain their distinct endpoints', () => {
+  assert.deepEqual(
+    progressLines({
+      total: 1,
+      active: [{ index: 1, start_ms: 546300, end_ms: 546524, attempt: 1, state: 'transcribing' }],
+    }),
+    ['0 / 1 segments complete', 'Segment 1: 9:06.3–9:06.524 · transcribing'],
+  )
+})
