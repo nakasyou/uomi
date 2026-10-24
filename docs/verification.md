@@ -678,3 +678,43 @@ Sites source `37334f7b88b068073a70afdf9670cdef00d1cda6`, owner-private deploymen
 `appgdep_6adc4e8edd8c8191ab08c041e0b2f1fb`, environment revision 11, succeeded.
 Live API exposes long state/text, the original standard text remains 322 chars,
 and the actual production UI shows Long queued separately.
+
+
+## Independent provider queues (2026-10-24)
+
+Implementation `1c9249e238436755029ce61b31b2f6f1bc205cfa` separates the durable API
+claim lanes into Chrome (standard/long) and Codex (detailed), while retaining the
+combined claim behavior for older callers. Modes are validated and selected from
+fixed constants. Migration 0011 adds per-mode partial ready/expired indexes; each
+candidate scan is bounded before the final merge. Ready order and fenced lease
+recovery remain independent within each lane. No transcript or job reset.
+
+The daemon has independent abort-aware execution queues: FluidAudio=1, Chrome=2,
+Codex=2. Default admission is three Chrome recordings, including one prefetch
+slot, plus two Codex recordings. A Chrome wait cannot occupy a Codex recognition
+slot or prevent its claim. FluidAudio cache is rechecked after acquiring its slot,
+so standard/long jobs arriving together reuse one analysis. The existing Google
+600-second/Codex 300-second limits and ten-second Codex request-start pacing remain.
+`/health` exposes both admitted job counts and each local resource queue's
+active/waiting/maximum counts; waiting counts are local, not the database backlog.
+
+150 Node tests and 66 Bun tests passed, plus typechecks and full build. Tests hold
+both Chrome slots blocked and prove that Codex completes and another source is
+analyzed before Chrome is released. Concurrent standard/long analysis invokes the
+helper only once. Provider-specific claims/reclaims retain FIFO and fencing. A
+20k-recording EXPLAIN regression verifies per-mode ready/expired index seeks and
+bounded candidate counts. Existing provider progress testing now uses explicit
+barriers instead of a timing-dependent delay.
+
+Sites source `7c670627e8820a48f46272c58318c58570a43bfd`, owner-private deployment
+`appgdep_6adc5489057c81919d5f68ea1521f4db`, environment revision 11, succeeded.
+API is deployed before the new filtered-claim worker is activated.
+Mac mini's source hash is
+`122yj42npx9lf2mz6h69blaf02bhwp4m68cqy43wg37585940lwa`, built closure
+`/nix/store/h90mlcrfbpg96jn1y5d7g7xsidaq1rn9-darwin-system-26.05.c3e90c8`.
+
+The generated user LaunchAgent was activated only after old work drained. Health
+reported `status: ok`, five admitted jobs (Chrome 3, Codex 2), FluidAudio active 1
+and Codex active 2 simultaneously, with no API errors. A detailed job completed
+on the new worker; the live API independently confirmed Completed and its saved
+text. Existing credentials/checkpoints and unrelated dirty dotfiles were retained.
