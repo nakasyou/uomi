@@ -595,3 +595,45 @@ and cannot receive an executable standard job. All **216 jobs** (212 standard,
 four detailed) are queued with zero attempt/progress, no error and no active
 lease. Local cleanup removed 249 current/legacy transcript checkpoint JSON files;
 114 speech-only plans were retained. The LaunchAgent is not loaded.
+
+## Detailed job progress and explicit Japan-time titles (2026-10-24 JST)
+
+The worker now reports completed/total speech intervals, up to two active
+intervals with original time ranges and local retry attempts, analysis audio time
+and download bytes. Waiting for the analysis slot, recognition capacity and Codex
+pacing are separate states. `0009_job_progress` adds a bounded JSON detail field;
+validated heartbeat updates and list/detail/status APIs preserve it. Failed jobs
+retain completed counts without presenting old intervals as still active.
+Counts describe completed intervals, not elapsed-time estimates. Subsecond ranges
+retain distinct endpoints. Recording headings, sidebar dates, update times and
+date filters explicitly use Asia/Tokyo; generated ISO titles are formatted while
+custom titles are preserved.
+
+The root build now includes `build:site`: production publication previously ran
+the capture-client/daemon build while reusing stale viewer output. Verification
+checks the actual built Worker/client for the progress field and display strings,
+and checks live API responses after publication rather than inferring content
+from deployment success.
+
+144 Node tests and 60 Bun tests passed, including persisted progress through all
+read routes, invalid count rejection, out-of-order parallel completion and UTC
+midnight title conversion. Subsecond display regressions also passed. Typechecks,
+full builds and scoped format/lint passed. The Impeccable detector returned no
+findings. The in-app browser was unavailable; Brave showed the real UI at desktop
+and 390px frame widths with synthetic progress, followed by live production
+verification. Production displayed `2026/10/23 09:24`, `68 / 290 segments complete`,
+active intervals 69/70, capacity wait and a JST update time. API verification also
+returned analyzed audio 470016/900000 ms. All 45 completed jobs from before
+publication remained completed; this update did not reset transcripts.
+
+Mac mini uses source `52926d505d10d4f88bceca7f545d71593dcebc4e` with source hash
+`14pnszvvap7z5sjvaq4f234cgmwwfmp4axpfdklqmwlmjpimzqgd` and closure
+`/nix/store/36rb433qxszrksrxfrsfa5zr1lxs8n69-darwin-system-26.05.c3e90c8`.
+Generated LaunchAgent activation replaced old PID 26660 after it exited. New PID
+40802 runs `/nix/store/aks46yyrmp0wwyqdjsj02sw9n27y18kq-uomi-transcriber-launch`
+and `/nix/store/xkyxyyrzk5m0lj04vd2k0ng7q6haw66x-uomi-transcriber-2026-10-24-52926d5`.
+Health is ok with two active jobs and unchanged 600/300-second limits. Original
+audio and valid checkpoints were retained.
+
+The final viewer source is `b77ec17f9d9c81f1acb0f44ed1f877b4ba09b3ff`, private
+Sites deployment `appgdep_6adc42bf4c448191aef119a396270ffd`, environment revision 11.
