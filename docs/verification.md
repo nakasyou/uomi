@@ -718,3 +718,8 @@ reported `status: ok`, five admitted jobs (Chrome 3, Codex 2), FluidAudio active
 and Codex active 2 simultaneously, with no API errors. A detailed job completed
 on the new worker; the live API independently confirmed Completed and its saved
 text. Existing credentials/checkpoints and unrelated dirty dotfiles were retained.
+A later live health sample showed FluidAudio active 1 and Chrome active 1 at the
+same time. One detailed recording returned provider HTTP 500 and is in durable
+retry (attempt 3); FluidAudio/Chrome continued independently. This provider error
+is not treated as a successful transcription. The live queue and results were
+retained, without resetting attempts or existing text.
