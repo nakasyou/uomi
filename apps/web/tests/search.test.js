@@ -93,7 +93,7 @@ test('identity required; discovery, tools and tool errors implement MCP', async 
   let res = await (await worker.fetch(request('server/discover'), {})).json()
   assert.deepEqual(res.result.supportedVersions, ['2026-07-28'])
   res = await (await worker.fetch(request('tools/list'), {})).json()
-  assert.equal(res.result.tools.length, 5)
+  assert.equal(res.result.tools.length, 7)
   res = await (
     await worker.fetch(request('tools/call', { name: 'sync_index' }), {
       DB: {},

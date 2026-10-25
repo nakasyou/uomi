@@ -18,6 +18,7 @@ import { ranges, overlappingRecordingsSql } from './source-ranges.ts'
 export { ranges } from './source-ranges.ts'
 import { enqueue, enqueueLongDefault, jobsApi, jobView, ApiError } from './jobs.ts'
 import { detailedTranscription } from './detailed-transcription.ts'
+import { transcriptionStatus } from './transcription-control.ts'
 import { resync, cachePage } from './notion-cache.ts'
 
 export const json = (value: unknown, status = 200) =>
@@ -590,6 +591,15 @@ async function api(request: Request, env: any, ctx: any, role: string) {
     const data = await body(request, 4096)
     return json(await resync(env, data.reset === true))
   }
+  if (path === '/api/transcriptions' && method === 'GET') {
+    const params = Object.fromEntries(url.searchParams)
+    return json(
+      await transcriptionStatus(env, {
+        ...params,
+        limit: params.limit === undefined ? undefined : Number(params.limit),
+      }),
+    )
+  }
   if (path === '/api/jobs' || path.startsWith('/api/jobs/')) {
     if (path === '/api/jobs/claim') ctx.waitUntil(resumeBackups(env))
     return json(
@@ -755,7 +765,8 @@ async function api(request: Request, env: any, ctx: any, role: string) {
       ['detailed-transcription', 'long-transcription'].includes(action) &&
       ['GET', 'POST'].includes(method)
     ) {
-      if (role !== 'owner') return json({ error: 'Owner access required' }, 403)
+      if (action === 'long-transcription' && role !== 'owner')
+        return json({ error: 'Owner access required' }, 403)
       const data = method === 'POST' && request.body ? await body(request, 4096) : {}
       if (data.retry !== undefined && typeof data.retry !== 'boolean')
         throw new ApiError('retry must be a boolean')
@@ -934,7 +945,18 @@ export default {
       }
       if (path === '/health') return json({ ok: true })
       if (path === '/mcp') {
-        if (request.method === 'POST' && visitor(request)) {
+        const role = await authorize(request, env)
+        if (!role) return json({ error: 'Authentication required' }, 401)
+        if (role === 'worker') return json({ error: 'Worker credentials cannot use MCP' }, 403)
+        const origin = request.headers.get('Origin')
+        if (
+          request.method !== 'GET' &&
+          visitor(request) &&
+          origin &&
+          origin !== new URL(request.url).origin
+        )
+          return json({ error: 'Cross-origin write rejected' }, 403)
+        if (request.method === 'POST') {
           const rpc: any = await request.clone().json()
           if (rpc.method === 'tools/call' && rpc.params?.name === 'search_transcripts')
             await requireSearchReady(env)
@@ -1025,7 +1047,7 @@ export default {
             }
           }
         }
-        return mcp.fetch(request, env)
+        return mcp.fetch(request, env, { role })
       }
       if (!path.startsWith('/api/'))
         return env.ASSETS ? env.ASSETS.fetch(request) : new Response('Not found', { status: 404 })

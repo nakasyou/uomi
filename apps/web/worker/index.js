@@ -1,3 +1,5 @@
+import { startDetailedTranscription, transcriptionStatus } from './transcription-control.ts'
+import { ApiError } from './jobs.ts'
 import { resync } from './notion-cache.ts'
 import { searchCondition } from './search.js'
 const VERSION = '2026-07-28'
@@ -49,6 +51,30 @@ const tools = [
     },
   },
   {
+    name: 'start_detailed_transcription',
+    description:
+      'Enqueue Codex detailed transcription for one recording with saved audio. Returns the durable job immediately; poll transcription_status for progress. Repeated calls reuse the job. retry=true reruns completed/failed jobs; active jobs are never duplicated. Previous text stays available until replacement.',
+    inputSchema: {
+      ...object({
+        id: { type: 'string', minLength: 1, maxLength: 100 },
+        retry: { type: 'boolean' },
+      }),
+      required: ['id'],
+    },
+  },
+  {
+    name: 'transcription_status',
+    description:
+      'Read durable transcription progress for one recording (id) or the whole queue. Includes standard/long/detailed status counts, stage, progress (0–1), detail with segment/chunk counters when available, attempt/max_attempts, errors, retry availability, lease expiry and last update (Unix milliseconds). Filter by mode/status; paginate jobs with next_cursor. Counts exclude pagination. No audio or full transcript bodies.',
+    inputSchema: object({
+      id: { type: 'string', minLength: 1, maxLength: 100 },
+      mode: { type: 'string', enum: ['standard', 'long', 'detailed'] },
+      status: { type: 'string', enum: ['queued', 'processing', 'retry', 'completed', 'failed'] },
+      limit: { type: 'integer', minimum: 1, maximum: 100 },
+      cursor: { type: 'string' },
+    }),
+  },
+  {
     name: 'index_status',
     description: 'Report index size, source configuration, sync progress and freshness.',
     inputSchema: object({}),
@@ -62,9 +88,9 @@ const tools = [
 ].map((t) => ({
   ...t,
   annotations: {
-    readOnlyHint: !['sync_index', 'index_status'].includes(t.name),
+    readOnlyHint: !['sync_index', 'index_status', 'start_detailed_transcription'].includes(t.name),
     destructiveHint: false,
-    idempotentHint: true,
+    idempotentHint: t.name !== 'start_detailed_transcription',
     openWorldHint: t.name === 'sync_index',
   },
 }))
@@ -124,6 +150,8 @@ export function searchPlan(a) {
 }
 async function call(env, name, a) {
   if (!env.DB) throw Error('D1 binding DB is unavailable.')
+  if (name === 'start_detailed_transcription') return startDetailedTranscription(env, a)
+  if (name === 'transcription_status') return transcriptionStatus(env, a)
   if (name === 'sync_index') return resync(env)
   if (name === 'index_status')
     return {
@@ -179,14 +207,17 @@ async function call(env, name, a) {
   throw Error('Unknown tool.')
 }
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, context) {
     const path = new URL(request.url).pathname
     if (path === '/health') return json({ ok: true })
-    if (!request.headers.get('oai-authenticated-user-id'))
+    if (
+      !['owner', 'client'].includes(context?.role) &&
+      !request.headers.get('oai-authenticated-user-id')
+    )
       return json({ error: 'Authentication required' }, 401)
     if (path !== '/mcp')
       return new Response(
-        'Uomi transcript API. POST /mcp exposes search_transcripts, recordings_in_range, read_transcript and index_status. Notion backup is optional.',
+        'Uomi transcript API. POST /mcp exposes search_transcripts, recordings_in_range, read_transcript, start_detailed_transcription, transcription_status and index_status. Notion backup is optional.',
         { headers: { 'Content-Type': 'text/plain; charset=utf-8' } },
       )
     if (request.method !== 'POST') return json({ error: 'POST required' }, 405)
@@ -244,6 +275,9 @@ export default {
       const message = String(error.message)
       return reply({
         isError: true,
+        ...(error instanceof ApiError
+          ? { structuredContent: { error: message, code: error.code, status: error.status } }
+          : {}),
         content: [
           {
             type: 'text',

@@ -26,8 +26,8 @@ Notion is an optional backup/import integration.
 
 Data routes accept a Sites-authenticated owner identity or a revocable device key
 in `X-Uomi-Secret`. Private Site service access additionally needs
-`OAI-Sites-Authorization: Bearer <token>`. Device creation/revocation and detailed-job requests
-require the owner. A dedicated `UOMI_WORKER_SECRET` (legacy fallback
+`OAI-Sites-Authorization: Bearer <token>`. Device key creation/revocation requires the owner. Detailed-job requests and
+MCP tools also accept a non-revoked device key in `X-Uomi-Secret`. A dedicated `UOMI_WORKER_SECRET` (legacy fallback
 `UOMI_WEBHOOK_SECRET`) grants only job/audio/manifest transport and bounded historical
 migration, not owner or capture privileges. Browser writes reject a different Origin. No provider tokens
 are returned to browser code.
@@ -53,8 +53,18 @@ are returned to browser code.
   Repeated requests do not duplicate work. Explicit `{retry:true}` requeues a
   completed/failed job and preserves the previous transcript until replacement.
   `/transcribe` remains an alias for older web clients.
-- `POST /api/recordings/:id/detailed-transcription`: owner-only durable detailed
-  job; no Notion dependency. `GET` reads its persisted result without network calls.
+- `POST /api/recordings/:id/detailed-transcription` `{retry?:boolean}`: durable
+  Codex detailed job, authenticated by owner login or device key; no Notion dependency.
+  Repeated calls reuse queued/active/completed jobs. `{retry:true}` reruns completed/failed
+  jobs and preserves previous text until replacement. `GET` reads its persisted result.
+- `GET /api/transcriptions?id=&mode=&status=&limit=&cursor=`: read transcription
+  progress for one recording or the entire queue. `mode` is `standard`, `long`, or
+  `detailed`; `status` is `queued`, `processing`, `retry`, `completed`, or `failed`.
+  Returns `as_of`, filtered `summary` counts by mode/status, bounded `jobs` (default
+  20, maximum 100), and `next_cursor`. Counts ignore pagination. Keep filters unchanged
+  when following cursors. Jobs are ordered by last update descending; this is a live
+  view, so ongoing jobs can move between pages. Poll the first page or a specific ID
+  for live progress. `GET /api/recordings/:id/status` also returns all three jobs.
 - `GET /api/jobs`: up to 100 recent durable jobs, including stage/progress,
   attempt, error, retry availability, lease expiry and last update time.
 - `POST /api/jobs/claim`: atomically claim up to eight jobs using `worker_id`,
@@ -86,6 +96,53 @@ Segments use `{start_ms,end_ms,text,speaker?:string|null}` in the original
 recording timeline. They preserve provider timing; plain-text providers return an
 empty array. Search currently uses the standard transcript. Full result text and
 both segment arrays are primary D1 data and are included in optional Notion backups.
+
+## Transcription MCP and API examples
+
+`POST /mcp` exposes these tools (in addition to transcript search/read/index tools):
+
+- `start_detailed_transcription({id,retry?})`: enqueue a detailed Codex job and return
+  its durable state immediately. Active jobs are reused even with `retry:true`.
+- `transcription_status({id?,mode?,status?,limit?,cursor?})`: same progress response
+  as `GET /api/transcriptions`. Omit `id` for queue-wide counts and recent jobs.
+
+Progress includes `stage`, `progress` (0–1), `detail` with segment/chunk counters
+when reported by the worker (`detail.completed` / `detail.total`, plus
+`detail.active` intervals with index/start/end/state), `attempt`, `max_attempts`, `error`, `available_at`,
+`lease_until`, and `updated_at` (Unix milliseconds). Queued jobs may not have
+segment counts yet. Lease expiry is diagnostic, not permission to claim or complete
+another worker's job; no lease token is returned. A terminal `failed` job requires
+manual retry; `retry` is scheduled automatically by the daemon. Starting work is
+asynchronous and requires a running Codex daemon.
+
+Use the existing Site service token and a revocable device API key; no provider
+credentials are needed. These environment variables must be set privately:
+
+```sh
+# Start (returns HTTP 202 and detailed_transcription).
+curl "$UOMI_API_URL/api/recordings/$RECORDING_ID/detailed-transcription" \
+  -H "OAI-Sites-Authorization: Bearer $SITES_ACCESS_TOKEN" \
+  -H "X-Uomi-Secret: $UOMI_CLIENT_SECRET" \
+  -H 'Content-Type: application/json' -d '{}'
+
+# Queue progress; append &id=<recording-id> to inspect just one recording.
+curl "$UOMI_API_URL/api/transcriptions?mode=detailed&limit=20" \
+  -H "OAI-Sites-Authorization: Bearer $SITES_ACCESS_TOKEN" \
+  -H "X-Uomi-Secret: $UOMI_CLIENT_SECRET"
+```
+
+Equivalent MCP `tools/call` bodies:
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"start_detailed_transcription","arguments":{"id":"<recording-id>"}}}
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"transcription_status","arguments":{"mode":"detailed","limit":20}}}
+```
+
+Anonymous/revoked keys receive HTTP 401; worker transport keys cannot invoke MCP
+or the capture/control API (HTTP 403). Cross-origin authenticated browser writes
+are rejected. Invalid arguments use HTTP 400 or MCP `isError:true`; missing recording
+IDs use 404 (`structuredContent.status` for MCP). Results and progress are stored
+in D1, independently of optional Notion backup.
 
 ## Migration and backup
 

@@ -2,7 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { fixture } from './helpers.js'
 import app from '../worker/app.ts'
-test('detailed transcription requires owner; cross-origin writes rejected before work', async () => {
+test('detailed transcription accepts device keys; cross-origin writes rejected before work', async () => {
   const f = fixture(),
     key = 'device-key-with-at-least-24-characters'
   const hash = Buffer.from(
@@ -23,7 +23,7 @@ test('detailed transcription requires owner; cross-origin writes rejected before
         f.ctx,
       )
     ).status,
-    403,
+    409,
   )
   assert.equal(
     (
