@@ -3,11 +3,13 @@ import { UomiClient, type JsonObject, type StatusOptions } from './client.ts'
 import { CliError } from './errors.ts'
 import {
   firstLine,
-  formatClock,
   formatDetail,
   formatDuration,
   formatLocal,
   formatPercent,
+  parseTime,
+  segmentLines,
+  type Segment,
 } from './format.ts'
 
 export interface IO {
@@ -17,11 +19,13 @@ export interface IO {
 
 export interface RunOptions extends ConfigOptions, Partial<IO> {
   fetch?: typeof fetch
+  now?: () => number
 }
 
 interface Context {
   io: IO
   client: UomiClient
+  now: () => number
 }
 
 const HELP = `usage: uomi <command> [options]
@@ -34,6 +38,15 @@ Commands:
 
   show ID                    Show metadata and a transcript
     --json                   Print the raw JSON response
+
+  transcripts                Stream transcripts in a time range, oldest first
+    --after TIME             Recordings that end after TIME
+    --before TIME            Recordings that start before TIME
+                             TIME: ISO 8601 (local time without a zone),
+                             epoch milliseconds, or an age like 30m, 2h, 1d
+                             At least one of --after or --before is required
+    --limit N                Newest N recordings in the range (default: no limit)
+    --json                   Print one JSON object per recording (JSON Lines)
 
   audio ID                   Download the original Ogg audio
     -o, --output FILE        Output file (default: <id>.ogg, - for stdout)
@@ -236,23 +249,11 @@ async function commandShow(context: Context, argv: string[]): Promise<number> {
   if (data.has_audio) context.io.out(`Audio:    available (./uomi audio ${data.id ?? id})\n`)
 
   const segments: JsonObject[] = Array.isArray(data.segments) ? data.segments : []
-  if (!segments.length && Array.isArray(data.detailed_segments)) {
-    for (const segment of data.detailed_segments) {
-      segments.push({
-        start_ms: segment.start_ms ?? segment.start ?? 0,
-        speaker: segment.speaker ?? segment.speaker_label ?? '-',
-        text: segment.text ?? '',
-      })
-    }
-  }
+  if (!segments.length && Array.isArray(data.detailed_segments))
+    segments.push(...normalizeDetailed(data.detailed_segments))
   context.io.out('\n')
   if (segments.length) {
-    const hourMode = segments.some((segment) => Number(segment.start_ms ?? 0) >= 3600000)
-    for (const segment of segments) {
-      let timestamp = formatClock(Number(segment.start_ms ?? 0))
-      if (!hourMode) timestamp = timestamp.padStart(5, '0')
-      context.io.out(`[${timestamp}] ${segment.speaker || '-'}: ${segment.text ?? ''}\n`)
-    }
+    for (const line of segmentLines(segments)) context.io.out(`${line}\n`)
   } else {
     const text = String(data.text ?? '').trim()
     if (text) {
@@ -262,6 +263,117 @@ async function commandShow(context: Context, argv: string[]): Promise<number> {
         data.transcription?.status ?? data.detailed_transcription?.status ?? data.status ?? ''
       context.io.out(`(no transcript available yet — ${note})\n`)
     }
+  }
+  return 0
+}
+
+function normalizeDetailed(segments: JsonObject[]): Segment[] {
+  return segments.map((segment) => ({
+    start_ms: segment.start_ms ?? segment.start ?? 0,
+    speaker: segment.speaker ?? segment.speaker_label ?? '-',
+    text: segment.text ?? '',
+  }))
+}
+
+type TranscriptKind = 'detailed' | 'standard' | 'long'
+
+interface Transcript {
+  kind: TranscriptKind
+  segments?: Segment[]
+  lines: string[]
+}
+
+function textLines(value: unknown): string[] {
+  const text = String(value ?? '').trim()
+  return text ? text.split(/\r?\n/) : []
+}
+
+function segmentsWithText(segments: Segment[]): Segment[] | undefined {
+  return segments.some((segment) => String(segment.text ?? '').trim()) ? segments : undefined
+}
+
+/** Detailed first, then standard, then the long text as a last resort. */
+export function pickTranscript(data: JsonObject): Transcript | null {
+  const detailed = segmentsWithText(
+    Array.isArray(data.detailed_segments) ? normalizeDetailed(data.detailed_segments) : [],
+  )
+  if (detailed) return { kind: 'detailed', segments: detailed, lines: segmentLines(detailed) }
+  const detailedText = textLines(data.detailed_text)
+  if (detailedText.length) return { kind: 'detailed', lines: detailedText }
+  const standard = segmentsWithText(Array.isArray(data.segments) ? data.segments : [])
+  if (standard) return { kind: 'standard', segments: standard, lines: segmentLines(standard) }
+  const standardText = textLines(data.text)
+  if (standardText.length) return { kind: 'standard', lines: standardText }
+  const longText = textLines(data.long_text)
+  if (longText.length) return { kind: 'long', lines: longText }
+  return null
+}
+
+async function commandTranscripts(context: Context, argv: string[]): Promise<number> {
+  const parsed = parseOptions(argv, { values: ['after', 'before', 'limit'], booleans: ['json'] })
+  const usage = 'usage: uomi transcripts [--after TIME] [--before TIME] [--limit N] [--json]'
+  if (parsed.positionals.length) throw new CliError(usage)
+  if (parsed.values.after === undefined && parsed.values.before === undefined)
+    throw new CliError(`at least one of --after or --before is required\n${usage}`)
+  const now = context.now()
+  const after =
+    parsed.values.after === undefined ? undefined : parseTime(parsed.values.after, 'after', now)
+  const before =
+    parsed.values.before === undefined ? undefined : parseTime(parsed.values.before, 'before', now)
+  if (after !== undefined && before !== undefined && after >= before)
+    throw new CliError('--after must be earlier than --before')
+  const limit = integerOption(parsed.values.limit, 'limit', undefined, 1, Number.MAX_SAFE_INTEGER)
+
+  // The list is newest first; collect only IDs, then fetch details oldest first.
+  const ids: string[] = []
+  let cursor: string | undefined
+  scan: while (true) {
+    const page = await context.client.search({
+      limit: 50,
+      cursor,
+      from: after === undefined ? undefined : new Date(after).toISOString(),
+      to: before === undefined ? undefined : new Date(before).toISOString(),
+    })
+    const results: JsonObject[] = Array.isArray(page.results) ? page.results : []
+    for (const recording of results) {
+      const startedAt = Number(recording.recorded_at ?? 0)
+      if (before !== undefined && startedAt >= before) continue
+      const endedAt = Number(
+        recording.finished_at ?? startedAt + Number(recording.duration_ms ?? 0),
+      )
+      if (after !== undefined && endedAt <= after) break scan
+      if (typeof recording.id === 'string') ids.push(recording.id)
+      if (limit !== undefined && ids.length >= limit) break scan
+    }
+    if (!results.length || !page.next_cursor) break
+    cursor = String(page.next_cursor)
+  }
+
+  const json = parsed.flags.has('json')
+  for (const id of ids.reverse()) {
+    const data = await context.client.recording(id)
+    const transcript = pickTranscript(data)
+    if (!transcript) continue
+    if (json) {
+      context.io.out(
+        `${JSON.stringify({
+          id: data.id ?? id,
+          title: data.title ?? null,
+          recorded_at: data.recorded_at ?? null,
+          duration_ms: data.duration_ms ?? null,
+          source: transcript.kind,
+          ...(transcript.segments ? { segments: transcript.segments } : {}),
+          text: transcript.segments
+            ? transcript.segments.map((segment) => segment.text ?? '').join('\n')
+            : transcript.lines.join('\n'),
+        })}\n`,
+      )
+      continue
+    }
+    context.io.out(
+      `=== ${data.id ?? id} ${formatLocal(data.recorded_at)} ${formatDuration(data.duration_ms)} [${transcript.kind}] ===\n`,
+    )
+    context.io.out(`${transcript.lines.join('\n')}\n`)
   }
   return 0
 }
@@ -489,12 +601,14 @@ export async function run(argv: string[], options: RunOptions = {}): Promise<num
   try {
     const config = loadConfig(options)
     const client = new UomiClient(config, options.fetch)
-    const context: Context = { io, client }
+    const context: Context = { io, client, now: options.now ?? Date.now }
     switch (command) {
       case 'search':
         return await commandSearch(context, rest)
       case 'show':
         return await commandShow(context, rest)
+      case 'transcripts':
+        return await commandTranscripts(context, rest)
       case 'audio':
         return await commandAudio(context, rest)
       case 'transcribe':
@@ -513,6 +627,8 @@ export async function run(argv: string[], options: RunOptions = {}): Promise<num
         throw new CliError(`unknown command: ${command}\n\n${HELP}`)
     }
   } catch (error) {
+    // A closed pipe (e.g. `| head`) is a normal way to stop reading output.
+    if ((error as NodeJS.ErrnoException)?.code === 'EPIPE') return 0
     if (error instanceof CliError) {
       io.err(`uomi: error: ${error.message}\n`)
       return error.exitCode

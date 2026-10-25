@@ -48,6 +48,43 @@ limit is 20 and the API maximum is 50. `show` prints metadata followed by lines
 in the form `[MM:SS] speaker_N: text`, using detailed segments when standard
 segments are absent. `show --json` returns the full recording response.
 
+### Stream transcripts
+
+```sh
+uomi transcripts [--after TIME] [--before TIME] [--limit N] [--json]
+```
+
+`transcripts` prints every transcript in a time range to stdout, oldest first.
+At least one of `--after` or `--before` is required. `--after` keeps recordings
+that end after TIME and `--before` keeps recordings that start before TIME, so
+a recording overlapping either edge is included; `--after` must be earlier than
+`--before`. TIME is ISO 8601 (`2026-10-25`, `2026-10-25T09:30`, or with `Z` /
+`+09:00`; no zone means local time), epoch milliseconds, or a relative age
+(`30m`, `2h`, `1d`, also `s` and `w`).
+
+The CLI pages through `GET /api/recordings` (50 per page, newest first) with
+the `from` / `to` filters, then fetches each recording oldest first and prints
+it as soon as it arrives. Each recording uses the best transcript available:
+detailed segments or text, then standard segments or text, then the long text.
+Recordings with none of them are skipped silently. `--limit N` caps the scan at
+the newest N recordings in the range; there is no limit by default.
+
+```text
+=== RECORDING_ID 2026-10-25 10:56 3m 8s [detailed] ===
+[00:05] speaker_1: ...
+```
+
+`--json` prints one JSON object per recording (JSON Lines) with `id`, `title`,
+`recorded_at`, `duration_ms`, `source` (`detailed`, `standard` or `long`),
+`segments` when available, and `text`. Errors go to stderr, and a closed pipe
+such as `| head` ends the command quietly.
+
+```sh
+uomi transcripts --after 2h
+uomi transcripts --after 2026-10-24 --before 2026-10-25 | grep TODO
+uomi transcripts --before 1d --limit 10 --json
+```
+
 `audio` downloads the original Ogg audio. The default output is `<id>.ogg`; pass
 `-o -` to write bytes to stdout.
 
