@@ -195,6 +195,18 @@ test('control API/MCP validate inputs and reject anonymous, revoked, worker and 
       assert.equal((await f.rpc(name, args)).body.result.isError, true)
     assert.equal((await f.api('/api/transcriptions?id=missing')).status, 404)
     assert.equal((await f.api('/api/transcriptions?mode=bad')).status, 400)
+    const alias = await f.api('/api/mcp', {
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'tools/call',
+      params: { name: 'transcription_status', arguments: {} },
+    })
+    assert.equal(alias.status, 200)
+    assert.equal((await alias.json()).result.isError, undefined)
+    assert.equal(
+      (await f.api('/api/mcp', { jsonrpc: '2.0', id: 1, method: 'tools/list' }, {})).status,
+      401,
+    )
     const list = await (await f.api('/mcp', { jsonrpc: '2.0', id: 1, method: 'tools/list' })).json()
     const start = list.result.tools.find((t) => t.name === 'start_detailed_transcription')
     assert.equal(start.annotations.readOnlyHint, false)

@@ -944,7 +944,7 @@ export default {
         return json(await refreshTranscript(env, data.pageId))
       }
       if (path === '/health') return json({ ok: true })
-      if (path === '/mcp') {
+      if (path === '/mcp' || path === '/api/mcp') {
         const role = await authorize(request, env)
         if (!role) return json({ error: 'Authentication required' }, 401)
         if (role === 'worker') return json({ error: 'Worker credentials cannot use MCP' }, 403)

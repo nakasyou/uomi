@@ -99,7 +99,7 @@ both segment arrays are primary D1 data and are included in optional Notion back
 
 ## Transcription MCP and API examples
 
-`POST /mcp` exposes these tools (in addition to transcript search/read/index tools):
+`POST /mcp` (Sites OAuth) and `POST /api/mcp` (device-key API alias) expose these tools (in addition to transcript search/read/index tools):
 
 - `start_detailed_transcription({id,retry?})`: enqueue a detailed Codex job and return
   its durable state immediately. Active jobs are reused even with `retry:true`.
@@ -130,6 +130,11 @@ curl "$UOMI_API_URL/api/transcriptions?mode=detailed&limit=20" \
   -H "OAI-Sites-Authorization: Bearer $SITES_ACCESS_TOKEN" \
   -H "X-Uomi-Secret: $UOMI_CLIENT_SECRET"
 ```
+
+For an external script, send the same two headers to `POST /api/mcp` with
+`Content-Type: application/json`. The canonical `/mcp` path is protected by Sites
+OAuth before reaching the Worker; `OAI-Sites-Authorization` alone does not bypass
+that MCP gateway. ChatGPT/Codex connections use the canonical OAuth endpoint.
 
 Equivalent MCP `tools/call` bodies:
 

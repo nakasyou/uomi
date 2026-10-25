@@ -215,7 +215,7 @@ export default {
       !request.headers.get('oai-authenticated-user-id')
     )
       return json({ error: 'Authentication required' }, 401)
-    if (path !== '/mcp')
+    if (path !== '/mcp' && path !== '/api/mcp')
       return new Response(
         'Uomi transcript API. POST /mcp exposes search_transcripts, recordings_in_range, read_transcript, start_detailed_transcription, transcription_status and index_status. Notion backup is optional.',
         { headers: { 'Content-Type': 'text/plain; charset=utf-8' } },
