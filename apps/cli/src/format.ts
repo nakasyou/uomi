@@ -1,3 +1,5 @@
+import { CliError } from './errors.ts'
+
 export function formatLocal(ms: number | null | undefined): string {
   if (!ms) return '?'
   const date = new Date(ms)
@@ -49,4 +51,65 @@ export function formatDetail(detail: unknown): string {
     else parts.push(`${key}=${String(value[key])}`)
   }
   return parts.join(' ')
+}
+
+export interface Segment {
+  start_ms?: number
+  speaker?: string
+  text?: string
+}
+
+export function segmentLines(segments: Segment[]): string[] {
+  const hourMode = segments.some((segment) => Number(segment.start_ms ?? 0) >= 3600000)
+  return segments.map((segment) => {
+    let timestamp = formatClock(Number(segment.start_ms ?? 0))
+    if (!hourMode) timestamp = timestamp.padStart(5, '0')
+    return `[${timestamp}] ${segment.speaker || '-'}: ${segment.text ?? ''}`
+  })
+}
+
+export function parseTime(value: string, name: string, now: number): number {
+  const raw = value.trim()
+  const relative = raw.match(/^(\d+)([smhdw])$/)
+  if (relative) {
+    const unit = { s: 1000, m: 60000, h: 3600000, d: 86400000, w: 604800000 }[
+      relative[2] as 's' | 'm' | 'h' | 'd' | 'w'
+    ]
+    return now - Number(relative[1]) * unit
+  }
+  if (/^\d+$/.test(raw)) {
+    const epoch = Number(raw)
+    if (Number.isSafeInteger(epoch)) return epoch
+  }
+  const local = raw.match(
+    /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?)?$/,
+  )
+  if (local) {
+    const [, y, mo, d, h = '0', mi = '0', sec = '0', frac = '0'] = local
+    const date = new Date(
+      Number(y),
+      Number(mo) - 1,
+      Number(d),
+      Number(h),
+      Number(mi),
+      Number(sec),
+      Number(frac.padEnd(3, '0')),
+    )
+    if (
+      date.getFullYear() === Number(y) &&
+      date.getMonth() === Number(mo) - 1 &&
+      date.getDate() === Number(d) &&
+      date.getHours() === Number(h) &&
+      date.getMinutes() === Number(mi)
+    )
+      return date.getTime()
+  } else if (
+    /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})$/i.test(raw)
+  ) {
+    const parsed = Date.parse(raw.replace(' ', 'T').replace(/([+-]\d{2})(\d{2})$/, '$1:$2'))
+    if (Number.isFinite(parsed)) return parsed
+  }
+  throw new CliError(
+    `--${name} must be an ISO 8601 time, epoch milliseconds or a relative age like 30m, 2h or 1d`,
+  )
 }

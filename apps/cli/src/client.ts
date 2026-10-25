@@ -10,6 +10,10 @@ export interface SearchOptions {
   term?: string
   limit?: number
   cursor?: string
+  /** ISO time; the API keeps recordings that finished after it. */
+  from?: string
+  /** ISO time; the API keeps recordings that started before it. */
+  to?: string
 }
 
 export interface StatusOptions {
@@ -78,8 +82,8 @@ export class UomiClient {
     })
   }
 
-  search({ term, limit, cursor }: SearchOptions = {}): Promise<JsonObject> {
-    return this.requestJson(queryPath('/api/recordings', { q: term, limit, cursor }))
+  search({ term, limit, cursor, from, to }: SearchOptions = {}): Promise<JsonObject> {
+    return this.requestJson(queryPath('/api/recordings', { q: term, limit, cursor, from, to }))
   }
 
   recording(id: string): Promise<JsonObject> {
