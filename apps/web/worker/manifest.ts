@@ -1,4 +1,5 @@
 import { Buffer } from 'buffer'
+import { putObject } from './object-storage.ts'
 import type { AudioManifest } from '@uomi/notion'
 export function compactManifest(manifest: AudioManifest) {
   const runs: (string | [string, number, number])[] = []
@@ -43,7 +44,7 @@ export async function saveManifest(env: any, manifest: AudioManifest) {
   ).arrayBuffer()
   const hash = Buffer.from(await crypto.subtle.digest('SHA-256', data)).toString('hex')
   const key = `manifests/${hash}.json.gz`
-  await env.BUCKET.put(key, data, { httpMetadata: { contentType: 'application/gzip' } })
+  await putObject(env.BUCKET, key, data, { httpMetadata: { contentType: 'application/gzip' } })
   return key
 }
 export async function loadManifest(env: any, row: any) {
