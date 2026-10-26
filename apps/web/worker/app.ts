@@ -1,4 +1,5 @@
 import { backupState } from './backup-state.ts'
+import { putObject } from './object-storage.ts'
 import { storageDiagnostics } from './storage-diagnostics.ts'
 import { refreshTranscript, webhookAuthorized } from './transcriber.ts'
 import { searchCondition } from './search.js'
@@ -291,7 +292,7 @@ async function ingest(request: Request, env: any, ctx: any) {
   const capturedAt = manifest.capturedAt
   const manifestKey = await saveManifest(env, manifest)
   const key = `audio/${sha}.ogg`
-  await env.BUCKET.put(key, audio, {
+  await putObject(env.BUCKET, key, audio, {
     httpMetadata: { contentType: 'audio/ogg' },
     customMetadata: { sha256: sha },
   })

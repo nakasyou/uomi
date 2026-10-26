@@ -35,6 +35,98 @@ function request(path, method = 'GET', data, headers = {}) {
     ...(method !== 'GET' && data ? { body: JSON.stringify(data) } : {}),
   })
 }
+for (const prefix of ['manifests/', 'audio/']) {
+  test(`transient ${prefix} R2 failure retries identical bytes before acknowledging upload`, async () => {
+    const f = fixture(),
+      v = await chunk(),
+      put = f.env.BUCKET.put.bind(f.env.BUCKET)
+    const attempts = []
+    f.env.BUCKET.put = async (key, data, options) => {
+      if (key.startsWith(prefix)) {
+        attempts.push({ key, bytes: Buffer.from(data), options })
+        // R2 may have saved the object before its response failed.
+        await put(key, data, options)
+        if (attempts.length <= 2)
+          throw Error('put: We encountered an internal error. Please try again. (10001)')
+      } else await put(key, data, options)
+    }
+    try {
+      const response = await app.fetch(
+        request('/api/chunks', 'POST', v, { 'Idempotency-Key': v.segmentId }),
+        f.env,
+        f.ctx,
+      )
+      assert.equal(response.status, 201)
+      assert.equal((await response.json()).saved, true)
+      assert.equal(attempts.length, 3)
+      assert.deepEqual(attempts[0], attempts[1])
+      assert.deepEqual(attempts[1], attempts[2])
+      assert.equal(f.sqlite.prepare('SELECT count(*) n FROM recordings').get().n, 1)
+      assert.equal(f.files.size, 2)
+    } finally {
+      await Promise.all(f.tasks)
+      f.sqlite.close()
+    }
+  })
+}
+test('persistent R2 failure never acknowledges audio; a later sync safely resumes', async () => {
+  const f = fixture(),
+    v = await chunk(),
+    put = f.env.BUCKET.put.bind(f.env.BUCKET)
+  let attempts = 0
+  f.env.BUCKET.put = async (key, data, options) => {
+    if (key.startsWith('audio/')) {
+      attempts++
+      throw Error('put: We encountered an internal error. Please try again. (10001)')
+    }
+    return put(key, data, options)
+  }
+  const upload = () =>
+    app.fetch(request('/api/chunks', 'POST', v, { 'Idempotency-Key': v.segmentId }), f.env, f.ctx)
+  try {
+    const failed = await upload()
+    assert.equal(failed.status, 503)
+    assert.equal((await failed.json()).code, 'storage_unavailable')
+    assert.equal(attempts, 4)
+    assert.equal(f.sqlite.prepare('SELECT count(*) n FROM recordings').get().n, 0)
+    assert.equal(f.sqlite.prepare('SELECT count(*) n FROM transcription_jobs').get().n, 0)
+    const status = await app.fetch(
+      request('/api/chunks/status', 'POST', { ids: [v.segmentId] }),
+      f.env,
+      f.ctx,
+    )
+    assert.equal((await status.json()).uploads[0].status, 'missing')
+    f.env.BUCKET.put = put
+    assert.equal((await upload()).status, 201)
+    assert.equal((await upload()).status, 200)
+    assert.equal(f.sqlite.prepare('SELECT count(*) n FROM recordings').get().n, 1)
+  } finally {
+    await Promise.all(f.tasks)
+    f.sqlite.close()
+  }
+})
+test('non-transient storage failures are not retried or acknowledged', async () => {
+  const f = fixture(),
+    v = await chunk()
+  let attempts = 0
+  f.env.BUCKET.put = async () => {
+    attempts++
+    throw Error('put: permission denied')
+  }
+  try {
+    const r = await app.fetch(
+      request('/api/chunks', 'POST', v, { 'Idempotency-Key': v.segmentId }),
+      f.env,
+      f.ctx,
+    )
+    assert.equal(r.status, 500)
+    assert.equal(attempts, 1)
+    assert.equal(f.sqlite.prepare('SELECT count(*) n FROM recordings').get().n, 0)
+  } finally {
+    await Promise.all(f.tasks)
+    f.sqlite.close()
+  }
+})
 test('stage, retry, canonical acknowledgement, fast search and audio are separate', async () => {
   const f = fixture(),
     v = await chunk(),

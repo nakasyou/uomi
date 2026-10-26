@@ -1,4 +1,5 @@
 import { enqueue, enqueueLongDefault, validateSegments } from './jobs.ts'
+import { putObject } from './object-storage.ts'
 import { normalizeSearch } from './search.js'
 import { saveManifest } from './manifest.ts'
 import { Buffer } from 'buffer'
@@ -98,7 +99,7 @@ async function hydrateMissingAudio(env: any, store: NotionStore, page: any, old:
     throw Error('Notion audio hash does not match its manifest')
   const key = `audio/${manifest.sha256}.ogg`,
     manifestKey = await saveManifest(env, manifest)
-  await env.BUCKET.put(key, audio, {
+  await putObject(env.BUCKET, key, audio, {
     httpMetadata: { contentType: 'audio/ogg' },
     customMetadata: { sha256: manifest.sha256 },
   })
@@ -206,7 +207,7 @@ export async function cachePage(env: any, page: any) {
       throw Error('Notion audio hash does not match its manifest')
     sha = manifest.sha256
     audioKey = `audio/${sha}.ogg`
-    await env.BUCKET.put(audioKey, audio, {
+    await putObject(env.BUCKET, audioKey, audio, {
       httpMetadata: { contentType: 'audio/ogg' },
       customMetadata: { sha256: sha },
     })
