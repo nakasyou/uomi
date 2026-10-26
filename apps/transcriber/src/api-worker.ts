@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -12,6 +12,7 @@ import { validateManifest } from '@uomi/notion'
 import { saveCheckpoint } from './checkpoint'
 export { saveCheckpoint } from './checkpoint'
 import { audioProcess, WorkSlots } from './process'
+import { nonEmptyAudioSegments } from './audio-segments'
 import { transcribeSpeech } from './speech-transcription'
 import type { ProgressDetail } from './progress'
 
@@ -425,11 +426,11 @@ export class ApiWorker {
           ],
           controller.signal,
         )
-        const files = (await readdir(directory))
-          .filter((name) => /^chunk-\d+\.flac$/.test(name))
-          .sort()
+        const files = await nonEmptyAudioSegments(directory, controller.signal)
         if (!files.length || chunks.length > files.length)
           throw Error('Audio split does not match transcription checkpoint.')
+        detail = { completed: chunks.length, total: files.length, active: [] }
+        progress = chunks.length / files.length
         for (let i = chunks.length; i < files.length; i++) {
           stage = 'waiting_recognition'
           progress = i / files.length

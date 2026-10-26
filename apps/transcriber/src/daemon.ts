@@ -1,3 +1,4 @@
+import { nonEmptyAudioSegments } from './audio-segments'
 import { errorDetail } from './api-worker'
 import { CompletionOutbox, type SitesCallback } from './callbacks'
 import { stripSyntheticGaps } from '@uomi/audio'
@@ -5,7 +6,12 @@ import { createHash, timingSafeEqual } from 'node:crypto'
 import { mkdir, readFile, writeFile, mkdtemp, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { transcribe, type Provider, type Transcription } from '@nakasyou/ntranscribe'
+import {
+  getProvider,
+  type transcribe,
+  type Provider,
+  type Transcription,
+} from '@nakasyou/ntranscribe'
 import { ReservationCoordinator } from './coordinator'
 import {
   NotionStore,
@@ -51,7 +57,8 @@ export class Daemon {
   constructor(
     readonly store: NotionStore,
     readonly config: Config,
-    private recognize: typeof transcribe = transcribe,
+    private recognize: typeof transcribe = (path, options = {}) =>
+      getProvider(options.provider).transcribeFile(path, options),
   ) {
     this.callbacks = new CompletionOutbox(
       join(config.stateDir, 'completion-outbox'),
@@ -402,11 +409,9 @@ export class Daemon {
       const diagnostics = await new Response(split.stderr).text()
       const exitCode = await split.exited
       if (exitCode !== 0) throw Error(`ffmpeg exited ${exitCode}: ${diagnostics.slice(-2000)}`)
-      const { readdir } = await import('node:fs/promises')
-      const files = (await readdir(directory))
-        .filter((name) => /^chunk-\d+\.flac$/.test(name))
-        .sort()
-      if (!files.length) throw Error('No audio chunks.')
+      const files = await nonEmptyAudioSegments(directory, new AbortController().signal)
+      if (previous.chunks.length > files.length)
+        throw Error('Audio split does not match transcription checkpoint.')
       for (let i = previous.chunks.length; i < files.length; i++) {
         const wait = this.nextRequest - Date.now()
         if (wait > 0) await Bun.sleep(wait)

@@ -7,6 +7,7 @@ export async function audioProcess(
 ) {
   signal.throwIfAborted()
   const process = Bun.spawn(command, { stdout: 'pipe', stderr: 'pipe' })
+  let output = ''
   let diagnostic = '',
     pending = '',
     timedOut = false
@@ -30,6 +31,7 @@ export async function audioProcess(
         if (next.done) break
         const text = decoder.decode(next.value, { stream: true })
         diagnostic = (diagnostic + text).slice(-4000)
+        if (progress) output = (output + text).slice(-4000)
         if (progress && onProgress) {
           pending = (pending + text).slice(-8192)
           let newline: number
@@ -59,6 +61,7 @@ export async function audioProcess(
     signal.throwIfAborted()
     if (timedOut) throw Error(`${command[0]} exceeded ${Math.round(timeoutMs / 1000)} seconds`)
     if (code !== 0) throw Error(`${command[0]} exited ${code}: ${diagnostic}`)
+    return output
   } finally {
     clearTimeout(timeout)
     if (forceKill) clearTimeout(forceKill)

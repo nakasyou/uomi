@@ -559,3 +559,48 @@ test('Chrome saturation does not block Codex, and the analysis prefetch lane sta
     await rm(extra.dir, { recursive: true, force: true })
   }
 }, 10000)
+
+test('exact fifteen-minute Codex recordings exclude header-only tails and resume all three saved chunks', async () => {
+  const f = await fixture(900)
+  const job = { ...f.job, mode: 'detailed' as const }
+  let recognized = 0
+  let rejectSave = true
+  const completions: any[] = []
+  const failures: string[] = []
+  const http = (async (url: any, options: any) => {
+    const path = new URL(url).pathname
+    if (path === '/api/jobs/claim') return Response.json({ jobs: claimJobs(options, [job]) })
+    if (path === '/audio') return new Response(f.audio)
+    if (path === '/manifest') return Response.json(f.manifest)
+    if (path.endsWith('/complete')) {
+      completions.push(JSON.parse(options.body))
+      if (rejectSave) return Response.json({ error: 'test save failure' }, { status: 400 })
+    }
+    if (path.endsWith('/fail')) failures.push(JSON.parse(options.body).error)
+    return Response.json({ saved: true })
+  }) as typeof fetch
+  try {
+    const worker = new ApiWorker(f.config, async () => ({ text: `chunk ${++recognized}` }), http)
+    await worker.poll()
+    await worker.close()
+    expect(recognized).toBe(3)
+    expect(completions[0].text).toBe('chunk 1\nchunk 2\nchunk 3')
+    expect(failures).toHaveLength(1)
+    rejectSave = false
+    const restarted = new ApiWorker(
+      f.config,
+      async () => {
+        throw Error('Must reuse completed chunks')
+      },
+      http,
+    )
+    await restarted.poll()
+    await restarted.close()
+    expect(restarted.lastError).toBeNull()
+    expect(completions).toHaveLength(2)
+    expect(completions[1].text).toBe(completions[0].text)
+    expect((await readdir(f.config.stateDir)).filter((name) => name.startsWith('api-'))).toEqual([])
+  } finally {
+    await rm(f.dir, { recursive: true, force: true })
+  }
+}, 60000)
