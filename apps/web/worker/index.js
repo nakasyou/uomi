@@ -40,7 +40,7 @@ const tools = [
   {
     name: 'read_transcript',
     description:
-      'Read a bounded slice of one indexed transcript. Offset is a JavaScript UTF-16 text offset, not an audio timestamp.',
+      'Read a bounded slice of one indexed transcript, preferring Long Chrome when available. Offset is a JavaScript UTF-16 text offset, not an audio timestamp.',
     inputSchema: {
       ...object({
         id: { type: 'string' },
@@ -143,7 +143,7 @@ export function searchPlan(a) {
     args.push(c.time ?? 0, c.id)
   }
   return {
-    sql: `SELECT r.id,r.recorded_at,r.finished_at,r.device,r.status,r.url,substr(r.text,1,1200) AS preview FROM recordings r${join} ${clauses.length ? 'WHERE ' + clauses.join(' AND ') : ''} ORDER BY r.sort_time,r.id LIMIT ?`,
+    sql: `SELECT r.id,r.recorded_at,r.finished_at,r.device,coalesce(r.long_status,r.status) AS status,r.url,substr(coalesce(nullif(r.long_text,''),r.text),1,1200) AS preview FROM recordings r${join} ${clauses.length ? 'WHERE ' + clauses.join(' AND ') : ''} ORDER BY r.sort_time,r.id LIMIT ?`,
     args: [...args, limit + 1],
     limit,
   }
@@ -168,7 +168,9 @@ async function call(env, name, a) {
     if (typeof a.id !== 'string' || a.id.length > 100) throw Error('Invalid recording ID.')
     const offset = integer(a.offset, 0, 0, 10000000),
       length = integer(a.length, 8000, 1, 16000)
-    const row = await env.DB.prepare('SELECT id,text,url FROM recordings WHERE id=?')
+    const row = await env.DB.prepare(
+      "SELECT id,coalesce(nullif(long_text,''),text) AS text,url FROM recordings WHERE id=?",
+    )
       .bind(a.id)
       .first()
     if (!row) throw Error('Recording is not indexed.')

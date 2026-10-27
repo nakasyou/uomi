@@ -1,0 +1,1 @@
+ALTER TABLE transcription_jobs ADD COLUMN requested INTEGER NOT NULL DEFAULT 0;

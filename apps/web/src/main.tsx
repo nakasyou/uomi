@@ -160,7 +160,7 @@ function App() {
     [light, setLight] = useState(false),
     [notice, updateNotice] = useState(''),
     [noticeTone, setNoticeTone] = useState<'error' | 'success'>('error'),
-    [view, setView] = useState<TranscriptionMode>('standard'),
+    [view, setView] = useState<TranscriptionMode>('long'),
     [busy, setBusy] = useState(''),
     [playing, setPlaying] = useState(false),
     [position, setPosition] = useState(0),
@@ -251,7 +251,7 @@ function App() {
     selectedRef.current = r
     setSelected(r)
     setDrawer(false)
-    setView('standard')
+    setView('long')
     setRename(null)
     setPosition(0)
     setDuration(durationOf(r))
@@ -822,7 +822,7 @@ function App() {
                         aria-pressed={view === 'standard'}
                         onClick={() => setView('standard')}
                       >
-                        Transcript
+                        Standard · Chrome
                       </button>
                       <button aria-pressed={view === 'long'} onClick={() => setView('long')}>
                         Long · Chrome
@@ -843,7 +843,9 @@ function App() {
                         error={view === 'standard' ? undefined : selected[`${view}_error`]}
                         fallback={
                           view === 'standard'
-                            ? selected.status
+                            ? selected.text || currentJob
+                              ? selected.status
+                              : 'Not requested'
                             : (selected[`${view}_status`] ?? 'Not requested')
                         }
                       />

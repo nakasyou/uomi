@@ -15,6 +15,11 @@ function database() {
     '0005_jobs.sql',
     '0006_query_performance.sql',
     '0007_notion_cutover.sql',
+    '0008_reset_transcripts.sql',
+    '0009_job_progress.sql',
+    '0010_long_transcription.sql',
+    '0011_provider_queues.sql',
+    '0012_optional_standard.sql',
   ])
     db.exec(readFileSync(new URL('../drizzle/' + name, import.meta.url), 'utf8'))
   return db

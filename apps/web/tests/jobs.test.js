@@ -4,6 +4,7 @@ import { fixture } from './helpers.js'
 import app from '../worker/app.ts'
 import { enqueue, enqueueLongDefault } from '../worker/jobs.ts'
 import { cachePage } from '../worker/notion-cache.ts'
+import { transcriptionStatus } from '../worker/transcription-control.ts'
 const request = (path, data, method = data ? 'POST' : 'GET') =>
   new Request('https://uomi.test' + path, {
     method,
@@ -404,7 +405,7 @@ test('detailed progress persists through heartbeat, status and list reads while 
       (await call(f, '/api/recordings/recording/status')).transcription.detail,
       detail,
     )
-    assert.deepEqual((await call(f, '/api/recordings')).results[0].transcription.detail, detail)
+    assert.equal((await call(f, '/api/recordings')).results[0].transcription, null)
     assert.deepEqual((await call(f, '/api/recordings/recording')).transcription.detail, detail)
     const invalid = await call(f, '/api/jobs/' + job.id + '/heartbeat', {
       lease_token: job.lease_token,
@@ -555,6 +556,107 @@ test('provider queues claim independently, retain FIFO within each lane and recl
       400,
     )
   } finally {
+    f.sqlite.close()
+  }
+})
+
+test('old automatic standard work stays dormant until explicitly requested; long uses the freed queue', async () => {
+  const f = fixture()
+  try {
+    recording(f, 'optional')
+    f.sqlite
+      .prepare(
+        "INSERT INTO transcription_jobs(id,recording_id,mode,created_at,updated_at) VALUES('optional:standard','optional','standard',0,0)",
+      )
+      .run()
+    await enqueueLongDefault(f.env, 'optional')
+    assert.equal((await call(f, '/api/recordings/optional')).transcription, null)
+    assert.equal((await call(f, '/api/recordings/optional/status')).transcription, null)
+    const status = await transcriptionStatus(f.env, {})
+    assert.deepEqual(
+      status.summary.map((s) => s.mode),
+      ['long'],
+    )
+    const first = (
+      await call(f, '/api/jobs/claim', { worker_id: 'mac', queue: 'chrome', limit: 3 })
+    ).jobs
+    assert.deepEqual(
+      first.map((j) => j.mode),
+      ['long'],
+    )
+    assert.equal(
+      (await call(f, '/api/jobs/claim', { worker_id: 'mac', queue: 'chrome' })).jobs.length,
+      0,
+    )
+    assert.equal(
+      f.sqlite.prepare("SELECT requested FROM transcription_jobs WHERE mode='standard'").get()
+        .requested,
+      0,
+    )
+    const start = await call(f, '/api/recordings/optional/transcription', {})
+    assert.equal(start.transcription.status, 'queued')
+    const second = (
+      await call(f, '/api/jobs/claim', { worker_id: 'mac', queue: 'chrome', limit: 3 })
+    ).jobs
+    assert.deepEqual(
+      second.map((j) => j.mode),
+      ['standard'],
+    )
+    assert.equal(
+      (await call(f, '/api/recordings/optional/transcription', {})).transcription.id,
+      second[0].id,
+    )
+    assert.equal(
+      f.sqlite.prepare("SELECT count(*) n FROM transcription_jobs WHERE mode='standard'").get().n,
+      1,
+    )
+  } finally {
+    await Promise.all(f.tasks)
+    f.sqlite.close()
+  }
+})
+
+test('long-only completion supplies the default preview and searchable transcript', async () => {
+  const f = fixture()
+  try {
+    recording(f, 'long-default')
+    await enqueueLongDefault(f.env, 'long-default')
+    const job = (await call(f, '/api/jobs/claim', { worker_id: 'mac', queue: 'chrome' })).jobs[0]
+    await call(f, `/api/jobs/${job.id}/complete`, {
+      lease_token: job.lease_token,
+      text: '長文のみで検索できます',
+      segments: [],
+    })
+    const results = (await call(f, '/api/recordings?q=' + encodeURIComponent('検索'))).results
+    assert.equal(results.length, 1)
+    assert.equal(results[0].preview, '長文のみで検索できます')
+    assert.equal(results[0].status, 'Completed')
+    assert.equal(results[0].transcription.status, 'completed')
+    const full = await call(f, '/api/recordings/long-default')
+    assert.equal(full.text, '')
+    assert.equal(full.transcription, null)
+    assert.equal(full.long_text, '長文のみで検索できます')
+    const read = await call(f, '/api/mcp', {
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'tools/call',
+      params: { name: 'read_transcript', arguments: { id: 'long-default' } },
+    })
+    assert.equal(JSON.parse(read.result.content[0].text).text, full.long_text)
+    await call(f, '/api/recordings/long-default/transcription', {})
+    const standard = (await call(f, '/api/jobs/claim', { worker_id: 'mac', queue: 'chrome' }))
+      .jobs[0]
+    await call(f, `/api/jobs/${standard.id}/complete`, {
+      lease_token: standard.lease_token,
+      text: '標準版の結果',
+      segments: [],
+    })
+    assert.equal(
+      (await call(f, '/api/recordings?q=' + encodeURIComponent('検索'))).results.length,
+      1,
+    )
+  } finally {
+    await Promise.all(f.tasks)
     f.sqlite.close()
   }
 })

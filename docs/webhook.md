@@ -98,3 +98,15 @@ result, then remove obsolete daemon public port/webhook configuration.
 older daemon during rollout. It authenticates the old shared secret and cannot
 overwrite primary-owned recordings. New capture and transcription never call it.
 `transcriber_notifications` is retained only as historical migration state.
+
+## Long Chrome is the default (2026-10-27)
+
+New uploads and audio imports automatically enqueue only `long`. Standard Chrome
+and detailed Codex are optional per recording. The viewer opens Long first; use
+Standard · Chrome → Transcribe for speaker/segment output. Existing completed
+results and active leases are preserved. Previously automatic standard jobs in
+queued/retry state remain dormant until the recording's Transcribe button is
+pressed; their checkpoints are retained. Explicit requests set `requested=1`.
+The shared Chrome recognition and analysis capacity can therefore serve long
+jobs without competing with automatic standard jobs. Concurrency limits remain
+unchanged. Apply migration 0012 with this API version; no daemon update is needed.

@@ -31,7 +31,9 @@ export async function startDetailedTranscription(env: any, args: any) {
 /** Bounded metadata only: never return audio, transcript bodies or worker lease tokens. */
 export async function transcriptionStatus(env: any, args: any = {}) {
   validateArguments(args)
-  const clauses: string[] = [],
+  const clauses: string[] = [
+      "(j.mode!='standard' OR j.requested=1 OR j.status NOT IN ('queued','retry'))",
+    ],
     values: any[] = []
   if (args.id !== undefined) {
     const id = recordingId(args.id)
