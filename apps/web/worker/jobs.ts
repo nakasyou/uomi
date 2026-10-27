@@ -10,25 +10,28 @@ export class ApiError extends Error {
   }
 }
 export const jobView = (row: any) =>
-  row && {
-    id: row.id,
-    recording_id: row.recording_id,
-    mode: row.mode,
-    status: row.status,
-    stage: row.stage,
-    progress: row.progress,
-    detail: JSON.parse(row.progress_detail ?? '{}'),
-    attempt: row.attempt,
-    error: row.error,
-    lease_until: row.lease_until,
-    updated_at: row.updated_at,
-    available_at: row.available_at,
-  }
+  row &&
+  !(row.mode === 'standard' && row.requested === 0 && ['queued', 'retry'].includes(row.status))
+    ? {
+        id: row.id,
+        recording_id: row.recording_id,
+        mode: row.mode,
+        status: row.status,
+        stage: row.stage,
+        progress: row.progress,
+        detail: JSON.parse(row.progress_detail ?? '{}'),
+        attempt: row.attempt,
+        error: row.error,
+        lease_until: row.lease_until,
+        updated_at: row.updated_at,
+        available_at: row.available_at,
+      }
+    : null
 export async function enqueue(env: any, recordingId: string, mode = 'standard', retry = false) {
   const now = Date.now(),
     id = `${recordingId}:${mode}`
-  await env.DB.prepare(`INSERT INTO transcription_jobs(id,recording_id,mode,created_at,updated_at)
-    SELECT ?,?,?,?,? FROM recordings WHERE id=? AND (?!='standard' OR status!='Completed' OR ?=1) ON CONFLICT(recording_id,mode) DO NOTHING`)
+  await env.DB.prepare(`INSERT INTO transcription_jobs(id,recording_id,mode,created_at,updated_at,requested)
+    SELECT ?,?,?,?,?,1 FROM recordings WHERE id=? AND (?!='standard' OR status!='Completed' OR ?=1) ON CONFLICT(recording_id,mode) DO UPDATE SET requested=1`)
     .bind(id, recordingId, mode, now, now, recordingId, mode, Number(retry))
     .run()
   if (retry)
@@ -83,7 +86,7 @@ export async function jobsApi(request: Request, env: any, data: any) {
     const results = await env.DB.prepare(
       'SELECT * FROM transcription_jobs ORDER BY updated_at DESC,id DESC LIMIT 100',
     ).all()
-    return { results: results.results.map(jobView) }
+    return { results: results.results.map(jobView).filter(Boolean) }
   }
   if (url.pathname === '/api/jobs/claim' && request.method === 'POST') {
     if (typeof data.worker_id !== 'string' || !data.worker_id.trim() || data.worker_id.length > 200)
@@ -124,7 +127,9 @@ export async function jobsApi(request: Request, env: any, data: any) {
     // Each indexed mode contributes at most limit ready and expired candidates.
     // Literal mode filters come only from the fixed list above, never request text.
     const candidates = modes.flatMap((mode) => {
-      const filter = mode === null ? '' : `AND j.mode='${mode}'`
+      const filter =
+        (mode === null ? '' : `AND j.mode='${mode}'`) +
+        " AND (j.mode!='standard' OR j.requested=1 OR j.status='processing')"
       return [
         `SELECT * FROM (SELECT j.id,j.recording_id,j.available_at AS ready_at,j.created_at FROM transcription_jobs j
           JOIN recordings r ON r.id=j.recording_id WHERE j.status IN ('queued','retry') AND j.attempt<j.max_attempts
@@ -282,16 +287,17 @@ export async function jobsApi(request: Request, env: any, data: any) {
   const segments = JSON.stringify(validateSegments(data.segments, recording.duration_ms))
   const update =
     job.mode === 'standard'
-      ? "status='Completed',text=?,search_text=?,search_version=1,transcript_segments=?"
+      ? "status='Completed',text=?,search_text=CASE WHEN long_status='Completed' AND long_text!='' THEN search_text ELSE ? END,search_version=1,transcript_segments=?"
       : job.mode === 'long'
-        ? "long_status='Completed',long_text=?,long_error=''"
+        ? "long_status='Completed',long_text=?,long_error='',search_text=CASE WHEN ?!='' THEN ? ELSE search_text END,search_version=1"
         : "detailed_status='Completed',detailed_text=?,detailed_error='',detailed_segments=?"
   const result = await env.DB.batch([
     env.DB.prepare(
       `UPDATE recordings SET ${update},primary_owned=1,revision=revision+1,edited_at=? WHERE id=? AND EXISTS(SELECT 1 FROM transcription_jobs WHERE id=? AND lease_token=? AND status='processing' AND lease_until>?)`,
     ).bind(
       data.text,
-      ...(job.mode === 'standard' ? [normalizeSearch(data.text)] : []),
+      ...(job.mode === 'long' ? [data.text] : []),
+      ...(['standard', 'long'].includes(job.mode) ? [normalizeSearch(data.text)] : []),
       ...(job.mode === 'long' ? [] : [segments]),
       new Date(now).toISOString(),
       job.recording_id,

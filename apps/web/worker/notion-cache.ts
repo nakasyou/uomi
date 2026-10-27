@@ -1,4 +1,4 @@
-import { enqueue, enqueueLongDefault, validateSegments } from './jobs.ts'
+import { enqueueLongDefault, validateSegments } from './jobs.ts'
 import { putObject } from './object-storage.ts'
 import { normalizeSearch } from './search.js'
 import { saveManifest } from './manifest.ts'
@@ -122,7 +122,6 @@ async function hydrateMissingAudio(env: any, store: NotionStore, page: any, old:
     ).bind(key, manifest.sha256, manifestKey, id),
   ])
   const hydrated = !!result[2].meta.changes
-  if (hydrated && old.status !== 'Completed') await enqueue(env, id)
   if (hydrated) await enqueueLongDefault(env, id)
   return {
     id,
@@ -252,7 +251,7 @@ export async function cachePage(env: any, page: any) {
       starred,
       page.id,
       page.last_edited_time,
-      normalizeSearch(transcript),
+      normalizeSearch(long.text || transcript),
     ),
     env.DB.prepare(
       'UPDATE recordings SET detailed_status=?,detailed_text=?,detailed_error=?,transcript_segments=?,detailed_segments=?,long_status=?,long_text=?,long_error=? WHERE id=? AND (primary_owned=0 OR (notion_edited IS NOT NULL AND revision=0 AND notion_import_version=0))',
@@ -285,7 +284,6 @@ export async function cachePage(env: any, page: any) {
       'UPDATE recordings SET primary_owned=1,notion_import_version=1,backup_revision=revision WHERE id=? AND (primary_owned=0 OR (notion_edited IS NOT NULL AND revision=0 AND notion_import_version=0))',
     ).bind(id),
   ])
-  if (audioKey && status !== 'Completed') await enqueue(env, id)
   if (audioKey) await enqueueLongDefault(env, id)
   return {
     id,

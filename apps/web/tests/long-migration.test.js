@@ -35,3 +35,36 @@ test('adding long mode preserves existing job leases, progress and claim indexes
     db.close()
   }
 })
+
+test('optional standard migration preserves queued work, active leases and saved results', () => {
+  const db = new DatabaseSync(':memory:')
+  try {
+    const directory = new URL('../drizzle/', import.meta.url)
+    for (const name of readdirSync(directory)
+      .filter((n) => n.endsWith('.sql') && n < '0012')
+      .sort())
+      db.exec(readFileSync(new URL(name, directory), 'utf8'))
+    db.exec(
+      "INSERT INTO recordings(id,edited_at,device,status,url,text) VALUES('r','now','phone','Completed','','saved text')",
+    )
+    db.exec(
+      "INSERT INTO transcription_jobs(id,recording_id,mode,status,lease_token,lease_until,created_at,updated_at) VALUES('r:standard','r','standard','processing','lease',12345678,1,2),('r:long','r','long','queued',NULL,0,1,2)",
+    )
+    const before = db
+      .prepare('SELECT * FROM transcription_jobs ORDER BY id')
+      .all()
+      .map((row) => ({ ...row }))
+    db.exec(readFileSync(new URL('0012_optional_standard.sql', directory), 'utf8'))
+    assert.deepEqual(
+      db
+        .prepare('SELECT * FROM transcription_jobs ORDER BY id')
+        .all()
+        .map(({ requested: _requested, ...row }) => row),
+      before,
+    )
+    assert.equal(db.prepare('SELECT text FROM recordings').get().text, 'saved text')
+    assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(), [])
+  } finally {
+    db.close()
+  }
+})

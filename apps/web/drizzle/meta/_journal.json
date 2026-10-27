@@ -85,6 +85,13 @@
       "when": 1792824023659,
       "tag": "0011_provider_queues",
       "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "6",
+      "when": 1793062800000,
+      "tag": "0012_optional_standard",
+      "breakpoints": true
     }
   ]
 }

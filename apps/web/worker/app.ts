@@ -195,7 +195,6 @@ async function ingest(request: Request, env: any, ctx: any) {
     .first()
   if (old) {
     if (old.audio_sha !== sha) return json({ error: 'Chunk ID has different audio' }, 409)
-    await enqueue(env, old.recording_id)
     await enqueueLongDefault(env, old.recording_id)
     ctx.waitUntil(backup(env, old.recording_id))
     return json(
@@ -209,7 +208,7 @@ async function ingest(request: Request, env: any, ctx: any) {
         duplicate: true,
         transcription: jobView(
           await env.DB.prepare(
-            "SELECT * FROM transcription_jobs WHERE recording_id=? AND mode='standard'",
+            "SELECT * FROM transcription_jobs WHERE recording_id=? AND mode='long'",
           )
             .bind(old.recording_id)
             .first(),
@@ -315,7 +314,7 @@ async function ingest(request: Request, env: any, ctx: any) {
       ),
       env.DB.prepare(
         `INSERT OR IGNORE INTO transcription_jobs(id,recording_id,mode,created_at,updated_at)
-         SELECT ?||':'||value,?,value,?,? FROM json_each('["standard","long"]')`,
+         SELECT ?||':'||value,?,value,?,? FROM json_each('["long"]')`,
       ).bind(id, id, Date.now(), Date.now()),
       // One statement keeps all claims atomic without a statement per source packet.
       env.DB.prepare(`INSERT INTO source_ranges
@@ -337,7 +336,11 @@ async function ingest(request: Request, env: any, ctx: any) {
       .first()
     if (winner?.audio_sha !== sha) throw e
   }
-  const transcription = jobView(await enqueue(env, id))
+  const transcription = jobView(
+    await env.DB.prepare("SELECT * FROM transcription_jobs WHERE recording_id=? AND mode='long'")
+      .bind(id)
+      .first(),
+  )
   ctx.waitUntil(backup(env, id))
   return json(
     {
@@ -624,7 +627,7 @@ async function api(request: Request, env: any, ctx: any, role: string) {
       .all()
     const rows = new Map<string, any>(results.map((r: any) => [r.id, r]))
     const jobs = await env.DB.prepare(
-      "SELECT * FROM transcription_jobs WHERE mode='standard' AND recording_id IN (SELECT value FROM json_each(?1) UNION SELECT recording_id FROM chunk_aliases WHERE id IN (SELECT value FROM json_each(?1)))",
+      "SELECT * FROM transcription_jobs WHERE mode='long' AND recording_id IN (SELECT value FROM json_each(?1) UNION SELECT recording_id FROM chunk_aliases WHERE id IN (SELECT value FROM json_each(?1)))",
     )
       .bind(JSON.stringify(ids))
       .all()
@@ -699,7 +702,7 @@ async function api(request: Request, env: any, ctx: any, role: string) {
       args.push(c.time, c.id)
     }
     const { results } = await env.DB.prepare(
-      `SELECT r.id,r.title,r.recorded_at,r.finished_at,r.duration_ms,r.status,r.starred,r.revision,r.backup_revision,r.backup_until,r.backup_step,r.backup_error,r.audio_key IS NOT NULL AS has_audio,(SELECT json_object('id',j.id,'status',j.status,'stage',j.stage,'progress',j.progress,'detail',json(j.progress_detail),'attempt',j.attempt,'error',j.error,'updated_at',j.updated_at) FROM transcription_jobs j WHERE j.recording_id=r.id AND j.mode='standard') AS transcription_json,substr(r.text,1,240) AS preview FROM recordings r${join}${clauses.length ? ' WHERE ' + clauses.join(' AND ') : ''} ORDER BY r.sort_time DESC,r.id DESC LIMIT ?`,
+      `SELECT r.id,r.title,r.recorded_at,r.finished_at,r.duration_ms,coalesce(r.long_status,r.status) AS status,r.starred,r.revision,r.backup_revision,r.backup_until,r.backup_step,r.backup_error,r.audio_key IS NOT NULL AS has_audio,(SELECT json_object('id',j.id,'status',j.status,'stage',j.stage,'progress',j.progress,'detail',json(j.progress_detail),'attempt',j.attempt,'error',j.error,'updated_at',j.updated_at) FROM transcription_jobs j WHERE j.recording_id=r.id AND j.mode='long') AS transcription_json,substr(coalesce(nullif(r.long_text,''),r.text),1,240) AS preview FROM recordings r${join}${clauses.length ? ' WHERE ' + clauses.join(' AND ') : ''} ORDER BY r.sort_time DESC,r.id DESC LIMIT ?`,
     )
       .bind(...args, limit + 1)
       .all()
@@ -725,7 +728,7 @@ async function api(request: Request, env: any, ctx: any, role: string) {
     if (action === 'status' && method === 'GET') {
       const status =
         await env.DB.prepare(`SELECT r.id,r.revision,r.status,r.detailed_status,r.long_status,r.backup_revision,r.backup_until,r.backup_step,r.backup_error,r.audio_key IS NOT NULL AS has_audio,r.edited_at AS updated_at,
-        (SELECT json_object('id',j.id,'recording_id',j.recording_id,'mode',j.mode,'status',j.status,'stage',j.stage,'progress',j.progress,'detail',json(j.progress_detail),'attempt',j.attempt,'error',j.error,'lease_until',j.lease_until,'updated_at',j.updated_at,'available_at',j.available_at) FROM transcription_jobs j WHERE j.recording_id=r.id AND mode='standard') AS transcription_json,
+        (SELECT json_object('id',j.id,'recording_id',j.recording_id,'mode',j.mode,'status',j.status,'stage',j.stage,'progress',j.progress,'detail',json(j.progress_detail),'attempt',j.attempt,'error',j.error,'lease_until',j.lease_until,'updated_at',j.updated_at,'available_at',j.available_at) FROM transcription_jobs j WHERE j.recording_id=r.id AND mode='standard' AND (j.requested=1 OR j.status NOT IN ('queued','retry'))) AS transcription_json,
         (SELECT json_object('id',j.id,'recording_id',j.recording_id,'mode',j.mode,'status',j.status,'stage',j.stage,'progress',j.progress,'detail',json(j.progress_detail),'attempt',j.attempt,'error',j.error,'lease_until',j.lease_until,'updated_at',j.updated_at,'available_at',j.available_at) FROM transcription_jobs j WHERE j.recording_id=r.id AND mode='detailed') AS detailed_json,
         (SELECT json_object('id',j.id,'recording_id',j.recording_id,'mode',j.mode,'status',j.status,'stage',j.stage,'progress',j.progress,'detail',json(j.progress_detail),'attempt',j.attempt,'error',j.error,'lease_until',j.lease_until,'updated_at',j.updated_at,'available_at',j.available_at) FROM transcription_jobs j WHERE j.recording_id=r.id AND mode='long') AS long_json
         FROM recordings r WHERE r.id=?`)
